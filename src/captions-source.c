@@ -37,6 +37,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <util/bmem.h>
+#include <util/threading.h>
 #include <graphics/graphics.h>
 #include <string.h>
 
@@ -79,7 +80,72 @@ struct tea_captions_source {
 	 * video_tick() only calls obs_source_update() when the composed
 	 * caption text actually changed. */
 	char *last_rendered_text;
+
+	/* Intrusive singly-linked list node for g_registry_head below, so the
+	 * Tools-menu settings dialog can enumerate every live instance (it has
+	 * no other way to reach per-source state: this plugin has no global
+	 * service object, see the architecture comment at the top of this
+	 * file). Guarded by g_registry_lock, not ctx-specific. */
+	struct tea_captions_source *registry_next;
 };
+
+/* --- registry of live instances, for the Tools-menu settings dialog --- */
+
+static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct tea_captions_source *g_registry_head = NULL;
+
+static void tea_registry_add(struct tea_captions_source *ctx)
+{
+	pthread_mutex_lock(&g_registry_lock);
+	ctx->registry_next = g_registry_head;
+	g_registry_head = ctx;
+	pthread_mutex_unlock(&g_registry_lock);
+}
+
+static void tea_registry_remove(struct tea_captions_source *ctx)
+{
+	pthread_mutex_lock(&g_registry_lock);
+	struct tea_captions_source **link = &g_registry_head;
+	while (*link) {
+		if (*link == ctx) {
+			*link = ctx->registry_next;
+			break;
+		}
+		link = &(*link)->registry_next;
+	}
+	pthread_mutex_unlock(&g_registry_lock);
+}
+
+void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *info, void *user), void *user)
+{
+	pthread_mutex_lock(&g_registry_lock);
+	for (struct tea_captions_source *ctx = g_registry_head; ctx; ctx = ctx->registry_next) {
+		if (!ctx->client)
+			continue;
+		char *status_text = tea_asr_client_status_text(ctx->client);
+		tea_captions_source_info_t info = {
+			.source_name = ctx->source ? obs_source_get_name(ctx->source) : NULL,
+			.status_text = status_text,
+			.dropped_frames = tea_asr_client_dropped_audio_frames(ctx->client),
+			.connected = tea_asr_client_is_connected(ctx->client),
+			.capabilities_known = tea_asr_client_capabilities_known(ctx->client),
+			.supports_partial_transcripts = tea_asr_client_supports_partial_transcripts(ctx->client),
+		};
+		cb(&info, user);
+		bfree(status_text);
+	}
+	pthread_mutex_unlock(&g_registry_lock);
+}
+
+void tea_captions_source_reconnect_all(void)
+{
+	pthread_mutex_lock(&g_registry_lock);
+	for (struct tea_captions_source *ctx = g_registry_head; ctx; ctx = ctx->registry_next) {
+		if (ctx->client)
+			tea_asr_client_start(ctx->client);
+	}
+	pthread_mutex_unlock(&g_registry_lock);
+}
 
 /* There is no portable public API to just ask "is source id X registered"
  * across the OBS versions this plugin targets, so we try to actually create
@@ -192,12 +258,15 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	ctx->client = tea_asr_client_create(ctx->tap, ctx->captions);
 
 	tea_captions_source_update(ctx, settings);
+	tea_registry_add(ctx);
 	return ctx;
 }
 
 static void tea_captions_source_destroy(void *data)
 {
 	struct tea_captions_source *ctx = data;
+
+	tea_registry_remove(ctx);
 
 	if (ctx->client) {
 		tea_asr_client_stop(ctx->client);
