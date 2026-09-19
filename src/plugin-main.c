@@ -37,7 +37,7 @@ bool obs_module_load(void)
 	tea_captions_source_register();
 
 	obs_frontend_add_tools_menu_item(obs_module_text("TeaLiveSubtitle.Menu.SettingsTitle"),
-					  tea_on_tools_menu_clicked, NULL);
+					 tea_on_tools_menu_clicked, NULL);
 
 	obs_log(LOG_INFO, "loaded version %s", PLUGIN_VERSION);
 	return true;

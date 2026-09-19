@@ -54,11 +54,17 @@ struct tea_captions_source {
 	int padding;
 };
 
-static const char *tea_pick_text_ft2_id(void)
+/* There is no portable public API to just ask "is source id X registered"
+ * across the OBS versions this plugin targets, so we try to actually create
+ * a private instance of each candidate id in turn. obs_source_create_private()
+ * returns NULL (and logs its own warning) when the id isn't registered, which
+ * is exactly the fallback signal we need. */
+static obs_source_t *tea_create_text_child(void)
 {
 	for (size_t i = 0; i < sizeof(k_text_ft2_ids) / sizeof(k_text_ft2_ids[0]); i++) {
-		if (obs_is_source_registered(k_text_ft2_ids[i]))
-			return k_text_ft2_ids[i];
+		obs_source_t *child = obs_source_create_private(k_text_ft2_ids[i], "tea-live-subtitle-text", NULL);
+		if (child)
+			return child;
 	}
 	return NULL;
 }
@@ -103,16 +109,10 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	struct tea_captions_source *ctx = bzalloc(sizeof(struct tea_captions_source));
 	ctx->source = source;
 
-	const char *text_id = tea_pick_text_ft2_id();
-	if (!text_id) {
-		obs_log(LOG_ERROR,
-			"neither 'text_ft2_source_v2' nor 'text_ft2_source' is registered; "
-			"is the text-freetype2 plugin missing? Captions will not render.");
-	} else {
-		ctx->text_source = obs_source_create_private(text_id, "tea-live-subtitle-text", NULL);
-		if (!ctx->text_source) {
-			obs_log(LOG_ERROR, "obs_source_create_private('%s') failed", text_id);
-		}
+	ctx->text_source = tea_create_text_child();
+	if (!ctx->text_source) {
+		obs_log(LOG_ERROR, "neither 'text_ft2_source_v2' nor 'text_ft2_source' could be created; "
+				   "is the text-freetype2 plugin missing? Captions will not render.");
 	}
 
 	tea_captions_source_update(ctx, settings);
@@ -169,8 +169,8 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 	obs_properties_add_int(props, "max_lines", obs_module_text("TeaLiveSubtitle.Prop.MaxLines"), 1, 10, 1);
 
 	obs_property_t *align_list = obs_properties_add_list(props, "caption_align",
-							       obs_module_text("TeaLiveSubtitle.Prop.Align"),
-							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+							     obs_module_text("TeaLiveSubtitle.Prop.Align"),
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(align_list, obs_module_text("TeaLiveSubtitle.Prop.Align.Left"), 0);
 	obs_property_list_add_int(align_list, obs_module_text("TeaLiveSubtitle.Prop.Align.Center"), 1);
 	obs_property_list_add_int(align_list, obs_module_text("TeaLiveSubtitle.Prop.Align.Right"), 2);

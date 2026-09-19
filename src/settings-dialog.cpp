@@ -23,7 +23,7 @@ TeaSettingsDialog::TeaSettingsDialog(QWidget *parent) : QDialog(parent)
 	serverAddressEdit = new QLineEdit(this);
 	serverAddressEdit->setText(QStringLiteral("127.0.0.1"));
 	formLayout->addRow(QString::fromUtf8(obs_module_text("TeaLiveSubtitle.Dialog.ServerAddress")),
-			    serverAddressEdit);
+			   serverAddressEdit);
 
 	portSpinBox = new QSpinBox(this);
 	portSpinBox->setRange(1, 65535);
@@ -35,8 +35,7 @@ TeaSettingsDialog::TeaSettingsDialog(QWidget *parent) : QDialog(parent)
 	/* Phase 1 does not connect to anything yet, so the status label is
 	 * always the "not connected" placeholder. The WebSocket client that
 	 * updates this live is phase 2. */
-	statusLabel = new QLabel(QString::fromUtf8(obs_module_text("TeaLiveSubtitle.Dialog.StatusNotConnected")),
-				  this);
+	statusLabel = new QLabel(QString::fromUtf8(obs_module_text("TeaLiveSubtitle.Dialog.StatusNotConnected")), this);
 	mainLayout->addWidget(statusLabel);
 }
 
