@@ -36,9 +36,21 @@ endif()
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c src/captions-source.c src/captions-source.h src/settings-dialog.cpp
-          src/settings-dialog.hpp src/settings-dialog.h src/ring-buffer.h src/audio-tap.c src/audio-tap.h
-          src/caption-state.c src/caption-state.h src/asr-client.cpp src/asr-client.hpp src/asr-client.h
+  PRIVATE
+    src/plugin-main.c
+    src/captions-source.c
+    src/captions-source.h
+    src/settings-dialog.cpp
+    src/settings-dialog.hpp
+    src/settings-dialog.h
+    src/ring-buffer.h
+    src/audio-tap.c
+    src/audio-tap.h
+    src/caption-state.c
+    src/caption-state.h
+    src/asr-client.cpp
+    src/asr-client.hpp
+    src/asr-client.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

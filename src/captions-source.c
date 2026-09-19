@@ -164,13 +164,14 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	/* Forward the freetype2 appearance keys (font/color1/color2/outline/
 	 * drop_shadow/word_wrap/custom_width) byte-for-byte to the child.
 	 * obs_data_apply() copies every key from `settings`, so our own extra
-	 * keys (max_lines/caption_align/padding/audio_source_name/server_*/
-	 * token_path) simply ride along and are ignored by text_ft2_source. */
+	 * keys (max_lines, caption_align, padding, audio_source_name, the
+	 * server connection keys and token_path) simply ride along and are
+	 * ignored by text_ft2_source. */
 	obs_data_t *child_settings = obs_data_create();
-	 obs_data_apply(child_settings, settings);
-	 obs_data_set_string(child_settings, "text", ctx->last_rendered_text ? ctx->last_rendered_text : "");
-	 obs_source_update(ctx->text_source, child_settings);
-	 obs_data_release(child_settings);
+	obs_data_apply(child_settings, settings);
+	obs_data_set_string(child_settings, "text", ctx->last_rendered_text ? ctx->last_rendered_text : "");
+	obs_source_update(ctx->text_source, child_settings);
+	obs_data_release(child_settings);
 }
 
 static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *source)

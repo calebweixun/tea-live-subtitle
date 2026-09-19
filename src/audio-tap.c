@@ -198,7 +198,7 @@ size_t tea_audio_tap_pull_pcm16(tea_audio_tap_t *tap, int16_t *out, size_t max_s
 	return n;
 }
 
-uint64_t tea_audio_tap_dropped_samples(const tea_audio_tap_t *tap)
+uint64_t tea_audio_tap_dropped_samples(tea_audio_tap_t *tap)
 {
 	return tea_ring_buffer_dropped_samples(&tap->ring);
 }

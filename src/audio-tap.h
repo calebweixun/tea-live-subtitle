@@ -37,7 +37,7 @@ size_t tea_audio_tap_pull_pcm16(tea_audio_tap_t *tap, int16_t *out, size_t max_s
 
 /* Samples dropped because the worker thread could not keep up with the
  * audio callback. Surfaced in the settings dialog; never reset silently. */
-uint64_t tea_audio_tap_dropped_samples(const tea_audio_tap_t *tap);
+uint64_t tea_audio_tap_dropped_samples(tea_audio_tap_t *tap);
 
 #ifdef __cplusplus
 }
