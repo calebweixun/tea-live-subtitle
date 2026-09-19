@@ -55,6 +55,18 @@ public:
 	bool isConnected() const;
 	QString statusText() const;
 
+	/* Samples/frames known to have been lost: the audio-tap ring buffer's
+	 * overflow/contention drops (audio thread couldn't keep up) plus this
+	 * client's own pendingPcm_ queue overflow (network thread couldn't
+	 * keep up with flow control / a slow server). Never fabricated -- see
+	 * tea_asr_client_dropped_audio_frames(). */
+	uint64_t droppedFrames() const;
+
+	/* For the Tools-menu settings dialog's capabilities display
+	 * (docs/08 section 5). Safe to read from any thread. */
+	bool capabilitiesKnown() const;
+	bool supportsPartialTranscripts() const;
+
 public slots:
 	void doStart();
 	void doStop();
@@ -120,8 +132,11 @@ private:
 	QByteArray fragPayload_;
 
 	bool capabilitiesRequested_ = false;
-	bool capabilitiesKnown_ = false;
-	bool serverSupportsPartial_ = false;
+	/* Both read from capabilitiesKnown()/supportsPartialTranscripts() on
+	 * whatever thread the settings dialog lives on, written only from
+	 * this client's own worker thread in onCapabilitiesReply(). */
+	std::atomic<bool> capabilitiesKnown_{false};
+	std::atomic<bool> serverSupportsPartial_{false};
 
 	bool helloReceived_ = false;
 	bool sessionStartSent_ = false;
@@ -135,9 +150,34 @@ private:
 	static const size_t kMaxFramePcmBytes = 6400; /* docs/04 hard limit */
 	std::deque<QByteArray> pendingPcm_;
 	static const size_t kMaxPendingPcmChunks = 512; /* ~a few seconds of audio */
-	uint64_t droppedPcmChunks_ = 0;
+	/* Count of individual PCM samples (not chunks) evicted from
+	 * pendingPcm_ because the network thread couldn't send fast enough.
+	 * std::atomic because droppedFrames() is read from whatever thread
+	 * calls tea_asr_client_dropped_audio_frames() (e.g. the OBS UI
+	 * thread), while pumpAudio() writes it on this client's own thread. */
+	std::atomic<uint64_t> droppedPcmSamples_{0};
+
+	/* Upper bound on a single incoming WS frame's declared payload length
+	 * (RFC 6455 allows up to 2^63-1). This server only ever sends small
+	 * JSON text events, so anything beyond a generous margin is treated as
+	 * a protocol violation rather than buffered indefinitely -- otherwise
+	 * a misbehaving/compromised server could claim a huge length and make
+	 * recvBuffer_ grow without bound while we wait for bytes that may
+	 * never come. */
+	static const uint64_t kMaxIncomingFramePayloadBytes = 16u * 1024u * 1024u;
 
 	int reconnectAttempt_ = 0;
+
+	/* Set once the server (or the WS layer) has told us this connection is
+	 * not worth retrying -- currently: an `error` event with
+	 * retryable=false, an `error` event with code "session_limit" (server
+	 * enforces docs/04's max_continuous_sessions=1), or a close frame with
+	 * code 1013 (over capacity). scheduleReconnect() honors this instead
+	 * of retrying forever against a server that will keep refusing us.
+	 * Cleared on the next explicit start() so the user can always force a
+	 * fresh attempt (e.g. after closing the other caption source). */
+	bool fatalNonRetryable_ = false;
+	QString fatalReason_;
 
 	mutable QMutex statusMutex_;
 	QString statusText_;

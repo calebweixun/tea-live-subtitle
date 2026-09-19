@@ -14,11 +14,21 @@ extern "C" {
  * Plain-C facade over the Qt/C++ WebSocket client (asr-client.cpp) so
  * plugin-main.c / captions-source.c never need to include Qt headers.
  *
- * There is exactly one of these per plugin instance (owned by
- * tea-service.c), talking to one local TEA ASR server and feeding one
- * shared tea_caption_state_t. Multiple caption sources in a scene collection
- * all render from that same shared state, matching docs/08's "global
- * connection settings, per-source appearance only" split.
+ * NOTE on architecture (see captions-source.c's own top-of-file comment for
+ * the full rationale/tradeoff writeup): docs/08-obs-plugin.md sketches a
+ * single *global* connection shared by every caption source ("global
+ * connection settings, per-source appearance only"). This codebase does NOT
+ * do that -- there is one `tea_asr_client_t` per `tea_live_subtitle_source`
+ * instance, each opening its own TCP+WebSocket connection to the server.
+ * There is no `tea-service.c` file; do not assume one exists.
+ *
+ * This matters operationally: docs/04's capabilities response advertises
+ * `max_continuous_sessions=1`, so a *second* concurrently-active caption
+ * source will have its `session.start` rejected (or its connection closed)
+ * by the server. The client detects the server's `session_limit` error code
+ * and WS close code 1013 (over-capacity) and reports a clear, non-retrying
+ * status instead of retrying forever -- see TeaAsrClient::handleJsonMessage
+ * and TeaAsrClient::scheduleReconnect in asr-client.cpp.
  *
  * The client itself lives on its own Qt worker thread: none of these calls
  * do blocking network I/O, they just hand off to that thread.
@@ -45,6 +55,13 @@ bool tea_asr_client_is_connected(tea_asr_client_t *client);
 char *tea_asr_client_status_text(tea_asr_client_t *client);
 
 uint64_t tea_asr_client_dropped_audio_frames(tea_asr_client_t *client);
+
+/* True once the HTTP GET /v1/capabilities probe (or its failure/timeout
+ * fallback) has completed, i.e. it's safe to trust
+ * tea_asr_client_supports_partial_transcripts()'s answer for this
+ * connection attempt. */
+bool tea_asr_client_capabilities_known(tea_asr_client_t *client);
+bool tea_asr_client_supports_partial_transcripts(tea_asr_client_t *client);
 
 #ifdef __cplusplus
 }

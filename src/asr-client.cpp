@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QStandardPaths>
 #include <QMetaObject>
 #include <QNetworkRequest>
+#include <QEventLoop>
 
 #include <util/bmem.h>
 
@@ -55,9 +56,52 @@ TeaAsrClient::TeaAsrClient(tea_audio_tap_t *tap, tea_caption_state_t *captions) 
 
 TeaAsrClient::~TeaAsrClient()
 {
-	QMetaObject::invokeMethod(this, "doStop", Qt::BlockingQueuedConnection);
+	/* Qt::BlockingQueuedConnection has no timeout: if thread_'s event loop
+	 * is ever not pumping (edge cases only, e.g. object teardown ordering
+	 * during OBS shutdown), the caller -- typically the OBS main thread,
+	 * via tea_captions_source_destroy() -- would block forever. Instead,
+	 * run our own event loop on the calling thread so it can both receive
+	 * the "doStop finished" notification AND time out. */
+	wantRunning_ = false;
+
+	bool stoppedInTime = false;
+	{
+		QEventLoop loop;
+		QTimer timeoutTimer;
+		timeoutTimer.setSingleShot(true);
+		connect(&timeoutTimer, &QTimer::timeout, &loop, &QEventLoop::quit);
+
+		bool posted = QMetaObject::invokeMethod(
+			this,
+			[this, &loop, &stoppedInTime]() {
+				doStop();
+				stoppedInTime = true;
+				loop.quit();
+			},
+			Qt::QueuedConnection);
+
+		if (posted) {
+			timeoutTimer.start(2000);
+			loop.exec();
+		}
+	}
+
+	if (!stoppedInTime) {
+		obs_log(LOG_WARNING, "asr-client: doStop() did not complete within 2s during teardown; "
+				     "forcing the worker thread down instead of blocking the calling thread");
+	}
+
 	thread_.quit();
-	thread_.wait(2000);
+	if (!thread_.wait(2000)) {
+		/* Last resort: a QThread that never quit its event loop cannot be
+		 * destroyed safely (Qt explicitly warns about this), but blocking
+		 * the caller (likely OBS's main thread) indefinitely is worse.
+		 * terminate() is blunt, but only reached once we already know
+		 * something is stuck. */
+		obs_log(LOG_WARNING, "asr-client: worker thread did not quit within 2s; terminating it");
+		thread_.terminate();
+		thread_.wait();
+	}
 }
 
 void TeaAsrClient::setServer(const QString &host, int port)
@@ -99,6 +143,22 @@ QString TeaAsrClient::statusText() const
 	return statusText_;
 }
 
+uint64_t TeaAsrClient::droppedFrames() const
+{
+	uint64_t ringDrops = tap_ ? tea_audio_tap_dropped_samples(tap_) : 0;
+	return ringDrops + droppedPcmSamples_.load(std::memory_order_relaxed);
+}
+
+bool TeaAsrClient::capabilitiesKnown() const
+{
+	return capabilitiesKnown_.load(std::memory_order_relaxed);
+}
+
+bool TeaAsrClient::supportsPartialTranscripts() const
+{
+	return serverSupportsPartial_.load(std::memory_order_relaxed);
+}
+
 void TeaAsrClient::setStatus(const QString &text)
 {
 	{
@@ -135,6 +195,13 @@ void TeaAsrClient::doStart()
 	resetProtocolStateLocked();
 	connected_ = false;
 	reconnectAttempt_ = 0;
+	/* An explicit (re)start -- whether from the source's own settings
+	 * changing or a user-initiated "reconnect" -- always deserves a fresh
+	 * attempt, even if a previous connection gave up permanently (e.g. a
+	 * session_limit rejection because another caption source was using
+	 * the server's one allowed continuous session). */
+	fatalNonRetryable_ = false;
+	fatalReason_.clear();
 	setStatus(QStringLiteral("connecting"));
 
 	socket_ = new QTcpSocket(this);
@@ -189,6 +256,18 @@ void TeaAsrClient::scheduleReconnect()
 {
 	if (!wantRunning_)
 		return;
+
+	if (fatalNonRetryable_) {
+		/* Retrying against a server that has told us in no uncertain
+		 * terms it will keep refusing this connection just burns one
+		 * of docs/04's max_total_connections=5 slots every ~16s
+		 * forever, while leaving the user staring at an opaque
+		 * "reconnecting" label. Stop and say why instead. */
+		setStatus(fatalReason_.isEmpty() ? QStringLiteral("stopped: server rejected this connection")
+						 : fatalReason_);
+		return;
+	}
+
 	int delayMs = 1000 << qMin(reconnectAttempt_, 4); /* 1,2,4,8,16s cap */
 	reconnectAttempt_++;
 	setStatus(QStringLiteral("reconnecting in %1ms").arg(delayMs));
@@ -429,6 +508,26 @@ void TeaAsrClient::processIncomingWsBytes()
 			pos += 8;
 		}
 
+		if (len > kMaxIncomingFramePayloadBytes) {
+			/* A server we trust (local TEA ASR service) should never
+			 * send anything close to this, but not checking at all
+			 * means a misbehaving/compromised server can make
+			 * recvBuffer_ grow without bound simply by claiming a
+			 * huge length and never finishing the frame. Treat it as
+			 * a protocol violation: stop parsing and drop the
+			 * connection (a normal reconnect will follow). */
+			obs_log(LOG_WARNING,
+				"asr-client: incoming WS frame declares %llu byte payload (max %llu); "
+				"dropping connection",
+				(unsigned long long)len, (unsigned long long)kMaxIncomingFramePayloadBytes);
+			recvBuffer_.clear();
+			fragmentActive_ = false;
+			fragPayload_.clear();
+			if (socket_)
+				socket_->disconnectFromHost();
+			return;
+		}
+
 		uint8_t maskKey[4] = {0, 0, 0, 0};
 		if (masked) {
 			if (recvBuffer_.size() < pos + 4)
@@ -487,10 +586,33 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 	case 0x2:
 		/* Server never sends binary in this protocol; ignore. */
 		break;
-	case 0x8: /* close */
-		obs_log(LOG_INFO, "asr-client: server closed the WebSocket");
+	case 0x8: { /* close */
+		uint16_t code = 0;
+		if (payload.size() >= 2)
+			code = (uint16_t(uint8_t(payload[0])) << 8) | uint16_t(uint8_t(payload[1]));
+		obs_log(LOG_INFO, "asr-client: server closed the WebSocket (code=%u)", (unsigned)code);
+
+		/* RFC 6455 5.5.1: a peer that receives a close frame must send
+		 * one back (unless it already initiated the close itself). We
+		 * never initiate our own close except from doStop(), which
+		 * tears down the socket right after -- so any close we *receive*
+		 * here is server-initiated and needs the echo. */
+		if (handshakeDone_ && socket_ && socket_->state() == QAbstractSocket::ConnectedState)
+			sendCloseFrame(code != 0 ? code : 1000);
+
+		if (code == 1013) {
+			/* docs/04: close 1013 == over-capacity (queue_full /
+			 * session_limit). Not something a reconnect fixes on its
+			 * own -- another source/process is holding the server's
+			 * one allowed continuous session. */
+			fatalNonRetryable_ = true;
+			fatalReason_ = QStringLiteral(
+				"stopped: server is at capacity (only one live-subtitle connection allowed at a time)");
+		}
+
 		socket_->disconnectFromHost();
 		break;
+	}
 	case 0x9: { /* ping -> pong */
 		sendWsFrame(0xA, payload.constData(), payload.size());
 		break;
@@ -583,11 +705,29 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		bool retryable = obj.value(QStringLiteral("retryable")).toBool(true);
 		obs_log(LOG_WARNING, "asr-client: server error code=%s retryable=%d", code.toUtf8().constData(),
 			retryable ? 1 : 0);
-		setStatus(QStringLiteral("server error: %1").arg(code));
+
+		if (code == QLatin1String("session_limit")) {
+			/* docs/04 limits.max_continuous_sessions=1: the server only
+			 * allows one continuous session at a time. Retrying will
+			 * just get rejected again until the other source/process
+			 * disconnects, so say that plainly instead of looping. */
+			fatalNonRetryable_ = true;
+			fatalReason_ = QStringLiteral("stopped: another live-subtitle source is already connected "
+						      "(server allows only one at a time)");
+			setStatus(fatalReason_);
+		} else if (!retryable) {
+			fatalNonRetryable_ = true;
+			fatalReason_ = QStringLiteral("stopped: server error (%1)").arg(code);
+			setStatus(fatalReason_);
+		} else {
+			setStatus(QStringLiteral("server error: %1").arg(code));
+		}
 		/* timeline_gap and other protocol errors close the socket on the
 		 * server side right after this; onSocketDisconnected() is what
 		 * actually tears down session state and reconnects with a brand
-		 * new session, per docs/04 (v0.1 never resumes). */
+		 * new session, per docs/04 (v0.1 never resumes) -- unless the
+		 * error above was marked fatal, in which case scheduleReconnect()
+		 * will stop instead of looping. */
 		return;
 	}
 
@@ -655,8 +795,9 @@ void TeaAsrClient::pumpAudio()
 
 		QByteArray chunk((const char *)chunkBuf, (int)(got * sizeof(int16_t)));
 		if (pendingPcm_.size() >= kMaxPendingPcmChunks) {
+			uint64_t evictedSamples = (uint64_t)pendingPcm_.front().size() / sizeof(int16_t);
 			pendingPcm_.pop_front();
-			droppedPcmChunks_++;
+			droppedPcmSamples_.fetch_add(evictedSamples, std::memory_order_relaxed);
 		}
 		pendingPcm_.push_back(chunk);
 	}
@@ -767,6 +908,17 @@ extern "C" char *tea_asr_client_status_text(tea_asr_client_t *client)
 
 extern "C" uint64_t tea_asr_client_dropped_audio_frames(tea_asr_client_t *client)
 {
-	(void)client;
-	return 0; /* TODO: expose droppedPcmChunks_ once the settings dialog has a place to show it */
+	if (!client)
+		return 0;
+	return client->impl->droppedFrames();
+}
+
+extern "C" bool tea_asr_client_capabilities_known(tea_asr_client_t *client)
+{
+	return client && client->impl->capabilitiesKnown();
+}
+
+extern "C" bool tea_asr_client_supports_partial_transcripts(tea_asr_client_t *client)
+{
+	return client && client->impl->supportsPartialTranscripts();
 }
