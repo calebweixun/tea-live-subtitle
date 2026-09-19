@@ -48,6 +48,9 @@ target_sources(
     src/audio-tap.h
     src/caption-state.c
     src/caption-state.h
+    src/caption-layout.h
+    src/font-default-policy.h
+    src/asr-error-policy.hpp
     src/asr-client.cpp
     src/asr-client.hpp
     src/asr-client.h

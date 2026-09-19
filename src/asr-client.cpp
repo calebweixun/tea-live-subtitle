@@ -165,8 +165,6 @@ void TeaAsrClient::setStatus(const QString &text)
 		QMutexLocker lock(&statusMutex_);
 		statusText_ = text;
 	}
-	if (captions_)
-		tea_caption_state_set_status(captions_, text.toUtf8().constData());
 }
 
 void TeaAsrClient::resetProtocolStateLocked()
@@ -199,9 +197,7 @@ void TeaAsrClient::doStart()
 	 * changing or a user-initiated "reconnect" -- always deserves a fresh
 	 * attempt, even if a previous connection gave up permanently (e.g. a
 	 * non-retryable server error). */
-	fatalNonRetryable_ = false;
-	fatalReason_.clear();
-	lastErrorSummary_.clear();
+	errorPolicy_.reset();
 	setStatus(QStringLiteral("connecting"));
 
 	socket_ = new QTcpSocket(this);
@@ -257,14 +253,15 @@ void TeaAsrClient::scheduleReconnect()
 	if (!wantRunning_)
 		return;
 
-	if (fatalNonRetryable_) {
+	if (errorPolicy_.fatal()) {
 		/* The server told us -- via the `error` event's own `retryable`
 		 * field -- that this will keep failing. Retrying would just burn
 		 * one of docs/04's max_total_connections=5 slots every ~16s
 		 * forever, while leaving the user staring at an opaque
 		 * "reconnecting" label. Stop and say why instead. */
-		setStatus(fatalReason_.isEmpty() ? QStringLiteral("stopped: server rejected this connection")
-						 : fatalReason_);
+		const QString fatalReason = QString::fromStdString(errorPolicy_.fatalReason());
+		setStatus(fatalReason.isEmpty() ? QStringLiteral("stopped: server rejected this connection")
+						: fatalReason);
 		return;
 	}
 
@@ -276,9 +273,7 @@ void TeaAsrClient::scheduleReconnect()
 	 * transient (e.g. this session's own pending-segment queue was
 	 * temporarily full) and are expected to clear on their own, so we keep
 	 * retrying rather than giving up -- but we never retry silently. */
-	setStatus(lastErrorSummary_.isEmpty()
-			  ? QStringLiteral("reconnecting in %1ms").arg(delayMs)
-			  : QStringLiteral("reconnecting in %1ms (reason: %2)").arg(delayMs).arg(lastErrorSummary_));
+	setStatus(QString::fromStdString(errorPolicy_.reconnectStatus(delayMs)));
 	reconnectTimer_->start(delayMs);
 }
 
@@ -608,15 +603,30 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 		if (handshakeDone_ && socket_ && socket_->state() == QAbstractSocket::ConnectedState)
 			sendCloseFrame(code != 0 ? code : 1000);
 
+		/* tea-asr-service reserves 4029 for admission rejection when the
+		 * configured continuous-session limit is already in use. Normally an
+		 * `error` event with code `concurrent_session_limit` arrives first and
+		 * supplies the server's exact message. Keep that richer reason when it
+		 * exists, but also classify the close code itself so a dropped/missing
+		 * text frame never degrades into an unexplained reconnect loop. This is
+		 * deliberately retryable: another source may disconnect at any time. */
+		const bool hadMatchingError = errorPolicy_.hasConcurrentSessionError();
+		errorPolicy_.observeClose(code);
+		if (code == 4029 && !hadMatchingError) {
+			setStatus(QStringLiteral("server error: %1")
+					  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary())));
+		}
+
 		/* Close code 1013 alone does NOT mean "fatal, don't retry": per
 		 * tea-asr-service's errors.py, it covers `queue_full`,
 		 * `session_limit` (both server-marked retryable=true -- transient
 		 * backlog) and `slow_client` (retryable=false). The preceding
 		 * `error` JSON event (handled in handleJsonMessage() below) already
 		 * carried the real code, message and retryable flag and is what
-		 * decides fatalNonRetryable_/lastErrorSummary_ -- this close frame
+		 * decides the error policy's fatal/reason state -- this close frame
 		 * is just the transport-level teardown that follows it. Do not
-		 * duplicate or override that decision here. */
+		 * duplicate or override that decision here. Code 4029 is handled
+		 * separately above because it has one unambiguous meaning. */
 		socket_->disconnectFromHost();
 		break;
 	}
@@ -716,21 +726,16 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 
 		/* Trust the server's own `retryable` flag exclusively -- do not
 		 * hardcode any particular `code` (e.g. "session_limit") as fatal.
-		 * Cross-checked against tea-asr-service (docs/m2-reverification.md):
-		 * the server does not enforce max_continuous_sessions at all, and
-		 * "session_limit" actually means this session's own pending-segment
-		 * queue filled up (a transient backlog), which the server itself
-		 * marks retryable=true. Inventing a diagnosis the server never sent
-		 * (e.g. "another source is connected") would just mislead the user
-		 * when the real cause is unrelated. Always show the server's own
-		 * code + message verbatim instead. */
-		QString summary = message.isEmpty() ? code : QStringLiteral("%1: %2").arg(code, message);
-		lastErrorSummary_ = summary;
+		 * Cross-checked against tea-asr-service: "session_limit" means this
+		 * session's own pending-segment queue filled up (a transient backlog),
+		 * while "concurrent_session_limit" is admission rejection for an
+		 * already-full continuous-session pool. Always preserve the server's
+		 * code + message instead of inventing a diagnosis. */
+		errorPolicy_.observeError(code.toStdString(), message.toStdString(), retryable);
+		QString summary = QString::fromStdString(errorPolicy_.lastErrorSummary());
 
 		if (!retryable) {
-			fatalNonRetryable_ = true;
-			fatalReason_ = QStringLiteral("stopped: server error (%1)").arg(summary);
-			setStatus(fatalReason_);
+			setStatus(QString::fromStdString(errorPolicy_.fatalReason()));
 		} else {
 			setStatus(QStringLiteral("server error: %1").arg(summary));
 		}

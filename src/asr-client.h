@@ -22,20 +22,15 @@ extern "C" {
  * instance, each opening its own TCP+WebSocket connection to the server.
  * There is no `tea-service.c` file; do not assume one exists.
  *
- * NOTE on `max_continuous_sessions=1`: docs/04's capabilities response
- * advertises this limit, but as of this writing the server (see
- * tea-asr-service's app.py `/v1/stream` handler) does not actually enforce
- * it -- a second concurrently-active caption source connects and gets its
- * own session with no rejection. Do not treat `session_limit` or WS close
- * code 1013 as signaling that condition: `session_limit` means *this*
- * session's own pending-segment queue filled up (a transient backlog the
- * server itself marks `retryable=true`, unrelated to other sources), and
- * close 1013 is shared by that code, `queue_full`, and `slow_client`. The
- * client honors only the server's own `retryable` flag on `error` events to
- * decide whether to keep retrying -- see TeaAsrClient::handleJsonMessage and
- * TeaAsrClient::scheduleReconnect in asr-client.cpp. If the server later
- * adds real multi-session enforcement, expect a distinct error code that
- * will need its own handling then.
+ * NOTE on `max_continuous_sessions`: the server now enforces this advertised
+ * capability (default 2) when processing `session.start`. An excess source
+ * receives an `error` event with `code="concurrent_session_limit"`,
+ * `retryable=true`, followed by the dedicated WebSocket close code 4029.
+ * The client shows the server's reason (or an actionable fallback derived
+ * from 4029) and keeps retrying because a slot may become available. Do not
+ * confuse that admission error with `session_limit`, which means *this*
+ * session's own pending-segment queue filled up, or with close code 1013,
+ * which is shared by `queue_full`, `session_limit`, and `slow_client`.
  *
  * The client itself lives on its own Qt worker thread: none of these calls
  * do blocking network I/O, they just hand off to that thread.

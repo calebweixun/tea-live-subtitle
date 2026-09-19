@@ -54,15 +54,11 @@ void tea_caption_state_on_segment_dropped(tea_caption_state_t *state, const char
  * already shown are left alone (they're already immutable text). */
 void tea_caption_state_on_session_cancelled(tea_caption_state_t *state, const char *session_id);
 
-/* Non-transcript connectivity/status text (e.g. "connecting...",
- * "server unavailable", "model loading"). Shown as the sole line whenever
- * there is no finalized or partial text yet, so the source never looks
- * silently dead. Pass NULL/empty to clear once real captions arrive. */
-void tea_caption_state_set_status(tea_caption_state_t *state, const char *status_text);
-
-/* Returns a newly bfree()-able (plain malloc, see .c) UTF-8 string with
- * the composed multi-line caption text ready to hand to text_ft2_source's
- * "text" setting. Never returns NULL (returns an empty string instead). */
+/* Returns a newly bfree()-able UTF-8 string containing transcript text only,
+ * ready to hand to text_ft2_source's "text" setting. Connectivity, model,
+ * token, reconnect and server-error text deliberately never enters this
+ * state machine; those diagnostics belong in the Tools/source status UI.
+ * Never returns NULL (returns an empty string when there is no transcript). */
 char *tea_caption_state_render(tea_caption_state_t *state);
 
 /* True while the last-rendered line is a partial (not yet final), so the

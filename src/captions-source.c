@@ -44,7 +44,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "captions-source.h"
 #include "audio-tap.h"
 #include "caption-state.h"
+#include "caption-layout.h"
 #include "asr-client.h"
+#include "font-default-policy.h"
 #include "plugin-support.h"
 
 /* The freetype2 text source id changed across OBS releases; on this
@@ -63,6 +65,9 @@ struct tea_captions_source {
 	int max_lines;
 	int caption_align; /* 0 = left, 1 = center, 2 = right */
 	int padding;
+	int layout_mode;      /* TEA_LAYOUT_MODE_AUTO or TEA_LAYOUT_MODE_FIXED */
+	int caption_width_px; /* fixed outer width, including horizontal padding */
+	bool show_placeholder;
 
 	tea_audio_tap_t *tap;
 	tea_caption_state_t *captions;
@@ -182,10 +187,19 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	ctx->max_lines = (int)obs_data_get_int(settings, "max_lines");
 	ctx->caption_align = (int)obs_data_get_int(settings, "caption_align");
 	ctx->padding = (int)obs_data_get_int(settings, "padding");
+	ctx->layout_mode = (int)obs_data_get_int(settings, "layout_mode");
+	ctx->caption_width_px = (int)obs_data_get_int(settings, "caption_width_px");
+	ctx->show_placeholder = obs_data_get_bool(settings, "show_placeholder");
 	if (ctx->padding < 0)
 		ctx->padding = 0;
 	if (ctx->max_lines < 1)
 		ctx->max_lines = 1;
+	const bool has_schema_marker = obs_data_has_user_value(settings, TEA_LAYOUT_SCHEMA_KEY);
+	const bool has_explicit_layout_mode = obs_data_has_user_value(settings, "layout_mode");
+	ctx->layout_mode =
+		tea_caption_layout_mode_from_settings(ctx->layout_mode, has_schema_marker, has_explicit_layout_mode);
+	if (has_explicit_layout_mode && !has_schema_marker)
+		obs_data_set_int(settings, TEA_LAYOUT_SCHEMA_KEY, TEA_LAYOUT_SCHEMA_VERSION);
 
 	if (ctx->captions)
 		tea_caption_state_set_max_lines(ctx->captions, ctx->max_lines);
@@ -228,13 +242,26 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 		return;
 
 	/* Forward the freetype2 appearance keys (font/color1/color2/outline/
-	 * drop_shadow/word_wrap/custom_width) byte-for-byte to the child.
-	 * obs_data_apply() copies every key from `settings`, so our own extra
-	 * keys (max_lines, caption_align, padding, audio_source_name, the
-	 * server connection keys and token_path) simply ride along and are
-	 * ignored by text_ft2_source. */
-	obs_data_t *child_settings = obs_data_create();
+	 * drop_shadow/word_wrap/custom_width) to the child. In legacy/auto mode,
+	 * custom_width and word_wrap retain their old semantics. Fixed mode owns
+	 * the child content width and forces native word wrapping so a caption can
+	 * never grow the outer source beyond caption_width_px.
+	 * The effective-default object and the user-value overlay include our own
+	 * extra keys (max_lines, caption_align, padding, layout_mode,
+	 * layout_schema_version, caption_width_px, show_placeholder,
+	 * audio_source_name, the server connection keys and token_path); these
+	 * simply ride along and are ignored by text_ft2_source. */
+	/* obs_data_apply() copies user values only. Start with the effective
+	 * defaults so a platform CJK font (and all other plugin defaults) actually
+	 * reaches the private text_ft2_source, then overlay the user's values. */
+	obs_data_t *child_settings = obs_data_get_defaults(settings);
 	obs_data_apply(child_settings, settings);
+	tea_caption_layout_t layout = tea_caption_layout_resolve(ctx->layout_mode, ctx->caption_width_px, ctx->padding,
+								 obs_source_get_width(ctx->text_source));
+	if (layout.mode == TEA_LAYOUT_MODE_FIXED) {
+		obs_data_set_int(child_settings, "custom_width", (long long)layout.content_width);
+		obs_data_set_bool(child_settings, "word_wrap", true);
+	}
 	obs_data_set_string(child_settings, "text", ctx->last_rendered_text ? ctx->last_rendered_text : "");
 	obs_source_update(ctx->text_source, child_settings);
 	obs_data_release(child_settings);
@@ -253,7 +280,6 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	}
 
 	ctx->captions = tea_caption_state_create();
-	tea_caption_state_set_status(ctx->captions, obs_module_text("TeaLiveSubtitle.PlaceholderText"));
 	ctx->tap = tea_audio_tap_create();
 	ctx->client = tea_asr_client_create(ctx->tap, ctx->captions);
 
@@ -296,9 +322,29 @@ static void tea_captions_source_destroy(void *data)
 
 static void tea_captions_source_get_defaults(obs_data_t *settings)
 {
+	/* OBS calls get_defaults once while building the defaults object and again
+	 * while creating a source from that object. The second call can be
+	 * distinguished by the existing defaults from the first call. A loaded
+	 * legacy scene has user values but no defaults at this point, so it stays
+	 * unmarked and is migrated to Auto by tea_captions_source_update(). */
+	const bool from_new_source_defaults = obs_data_has_default_value(settings, "max_lines") ||
+					      obs_data_has_default_value(settings, "font");
+
 	obs_data_set_default_int(settings, "max_lines", 2);
 	obs_data_set_default_int(settings, "caption_align", 1);
 	obs_data_set_default_int(settings, "padding", 10);
+	/* New sources use a stable 960px outer box. Legacy scenes are identified by
+	 * the absence of a user layout marker in update(), so their effective mode
+	 * remains Auto even though this is the current UI default. */
+	obs_data_set_default_int(settings, "layout_mode", TEA_LAYOUT_MODE_FIXED);
+	obs_data_set_default_int(settings, "caption_width_px", TEA_LAYOUT_DEFAULT_WIDTH_PX);
+	obs_data_set_default_int(settings, TEA_LAYOUT_SCHEMA_KEY, TEA_LAYOUT_SCHEMA_VERSION);
+	obs_data_set_default_bool(settings, "show_placeholder", true);
+	if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_LAYOUT_SCHEMA_KEY)) {
+		obs_data_set_int(settings, TEA_LAYOUT_SCHEMA_KEY, TEA_LAYOUT_SCHEMA_VERSION);
+		if (!obs_data_has_user_value(settings, "layout_mode"))
+			obs_data_set_int(settings, "layout_mode", TEA_LAYOUT_MODE_FIXED);
+	}
 
 	obs_data_set_default_string(settings, "audio_source_name", "");
 	obs_data_set_default_string(settings, "server_host", "127.0.0.1");
@@ -306,9 +352,10 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "token_path", "");
 
 	obs_data_t *font_obj = obs_data_create();
-	obs_data_set_string(font_obj, "face", "Arial");
-	obs_data_set_int(font_obj, "size", 48);
-	obs_data_set_int(font_obj, "flags", 0);
+	obs_data_set_default_string(font_obj, "face", TEA_DEFAULT_FONT_FACE);
+	obs_data_set_default_string(font_obj, "style", TEA_DEFAULT_FONT_STYLE);
+	obs_data_set_default_int(font_obj, "size", 48);
+	obs_data_set_default_int(font_obj, "flags", 0);
 	obs_data_set_default_obj(settings, "font", font_obj);
 	obs_data_release(font_obj);
 
@@ -356,6 +403,17 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 	obs_properties_add_bool(props, "word_wrap", obs_module_text("TeaLiveSubtitle.Prop.WordWrap"));
 	obs_properties_add_int(props, "custom_width", obs_module_text("TeaLiveSubtitle.Prop.CustomWidth"), 0, 8192, 1);
 
+	obs_property_t *layout_list = obs_properties_add_list(props, "layout_mode",
+							      obs_module_text("TeaLiveSubtitle.Prop.LayoutMode"),
+							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(layout_list, obs_module_text("TeaLiveSubtitle.Prop.LayoutMode.Auto"),
+				  TEA_LAYOUT_MODE_AUTO);
+	obs_property_list_add_int(layout_list, obs_module_text("TeaLiveSubtitle.Prop.LayoutMode.Fixed"),
+				  TEA_LAYOUT_MODE_FIXED);
+	obs_properties_add_int(props, "caption_width_px", obs_module_text("TeaLiveSubtitle.Prop.CaptionWidth"),
+			       TEA_LAYOUT_MIN_WIDTH_PX, TEA_LAYOUT_MAX_WIDTH_PX, 1);
+	obs_properties_add_bool(props, "show_placeholder", obs_module_text("TeaLiveSubtitle.Prop.ShowPlaceholder"));
+
 	/* This plugin's own settings. Deliberately no x/y/position controls --
 	 * that is left to the scene item transform, like a native source. */
 	obs_properties_add_int(props, "max_lines", obs_module_text("TeaLiveSubtitle.Prop.MaxLines"), 1, 10, 1);
@@ -376,7 +434,9 @@ static uint32_t tea_captions_source_get_width(void *data)
 {
 	struct tea_captions_source *ctx = data;
 	uint32_t child_w = ctx->text_source ? obs_source_get_width(ctx->text_source) : 0;
-	return child_w + (uint32_t)(ctx->padding * 2);
+	tea_caption_layout_t layout =
+		tea_caption_layout_resolve(ctx->layout_mode, ctx->caption_width_px, ctx->padding, child_w);
+	return layout.outer_width;
 }
 
 static uint32_t tea_captions_source_get_height(void *data)
@@ -398,7 +458,11 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 	if (!ctx->captions || !ctx->text_source)
 		return;
 
-	char *text = tea_caption_state_render(ctx->captions);
+	char *transcript = tea_caption_state_render(ctx->captions);
+	const char *display_text = tea_caption_select_display_text(transcript, ctx->show_placeholder,
+								   obs_module_text("TeaLiveSubtitle.PlaceholderText"));
+	char *text = bstrdup(display_text);
+	bfree(transcript);
 	if (ctx->last_rendered_text && strcmp(ctx->last_rendered_text, text) == 0) {
 		bfree(text);
 		return;
@@ -409,6 +473,12 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 
 	obs_data_t *update = obs_data_create();
 	obs_data_set_string(update, "text", ctx->last_rendered_text);
+	if (ctx->layout_mode == TEA_LAYOUT_MODE_FIXED) {
+		tea_caption_layout_t layout =
+			tea_caption_layout_resolve(ctx->layout_mode, ctx->caption_width_px, ctx->padding, 0);
+		obs_data_set_int(update, "custom_width", (long long)layout.content_width);
+		obs_data_set_bool(update, "word_wrap", true);
+	}
 	obs_source_update(ctx->text_source, update);
 	obs_data_release(update);
 }
@@ -420,18 +490,20 @@ static void tea_captions_source_video_render(void *data, gs_effect_t *effect)
 	if (!ctx->text_source)
 		return;
 
-	/* Our own bounding box always hugs the child source plus padding, so
-	 * left/center/right currently collapse to the same padding offset.
-	 * Alignment becomes meaningful once the source gets a fixed canvas
-	 * width independent of the current caption length. */
+	/* In fixed mode the outer box is stable while the child owns only the
+	 * inner content width. In auto mode this reduces to the legacy
+	 * child-width-plus-padding geometry. */
 	uint32_t own_w = tea_captions_source_get_width(data);
 	uint32_t child_w = obs_source_get_width(ctx->text_source);
-	float offset_x = (float)ctx->padding;
-	if (ctx->caption_align == 1) {
-		offset_x = (float)(own_w - child_w) / 2.0f;
-	} else if (ctx->caption_align == 2) {
-		offset_x = (float)(own_w - child_w) - (float)ctx->padding;
-	}
+	uint32_t padding = (uint32_t)tea_caption_layout_clamp_padding(ctx->padding);
+	uint32_t horizontal_padding = padding <= UINT32_MAX / 2 ? padding * 2 : UINT32_MAX;
+	uint32_t available = own_w > horizontal_padding ? own_w - horizontal_padding : 0;
+	uint32_t slack = available > child_w ? available - child_w : 0;
+	float offset_x = (float)padding;
+	if (ctx->caption_align == 1)
+		offset_x += (float)slack / 2.0f;
+	else if (ctx->caption_align == 2)
+		offset_x += (float)slack;
 
 	gs_matrix_push();
 	gs_matrix_translate3f(offset_x, (float)ctx->padding, 0.0f);

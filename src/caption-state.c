@@ -62,8 +62,6 @@ struct tea_caption_state {
 
 	char *preview_text; /* NULL when no open preview */
 	char preview_segment_id[TEA_ID_BUF];
-
-	char *status_text; /* NULL when nothing to show */
 };
 
 tea_caption_state_t *tea_caption_state_create(void)
@@ -89,7 +87,6 @@ void tea_caption_state_destroy(tea_caption_state_t *state)
 		return;
 	tea_clear_finalized_locked(state);
 	bfree(state->preview_text);
-	bfree(state->status_text);
 	pthread_mutex_destroy(&state->lock);
 	bfree(state);
 }
@@ -274,20 +271,14 @@ void tea_caption_state_on_session_cancelled(tea_caption_state_t *state, const ch
 	pthread_mutex_unlock(&state->lock);
 }
 
-void tea_caption_state_set_status(tea_caption_state_t *state, const char *status_text)
-{
-	pthread_mutex_lock(&state->lock);
-	bfree(state->status_text);
-	state->status_text = (status_text && status_text[0]) ? bstrdup(status_text) : NULL;
-	pthread_mutex_unlock(&state->lock);
-}
-
 char *tea_caption_state_render(tea_caption_state_t *state)
 {
 	pthread_mutex_lock(&state->lock);
 
 	if (state->finalized_count == 0 && !state->preview_text) {
-		char *out = bstrdup(state->status_text ? state->status_text : "");
+		/* The caller may choose a neutral placeholder for this empty state,
+		 * but connection diagnostics must never be rendered as captions. */
+		char *out = bstrdup("");
 		pthread_mutex_unlock(&state->lock);
 		return out;
 	}
