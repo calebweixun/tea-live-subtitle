@@ -1,59 +1,57 @@
-# OBS Plugin Template
+# tea-live-subtitle
 
-## Introduction
+OBS Studio 外掛：把本機 [TEA ASR](https://github.com/calebweixun) 服務的即時語音辨識結果，
+以原生 OBS 來源的方式疊在直播畫面上（字體、顏色、描邊、位置都用 OBS 原生機制調整，而不是
+一個外掛硬塞的浮動視窗）。
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+完整的產品規格與協定細節記錄在 TEA ASR server 專案的
+[`docs/08-obs-plugin.md`](https://github.com/calebweixun/tea-asr-service) 交接文件中。
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## 目前狀態：Phase 1（骨架）
 
-## Supported Build Environments
+這個 repo 目前只做「讓外掛能被 OBS 實際載入」這件事，用來壓掉 C++/CMake/Qt/libobs
+建置與載入流程的風險。**還沒有**音訊擷取、WebSocket 連線、字幕狀態機——這些留給 Phase 2。
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+Phase 1 完成的部分：
 
-## Quick Start
+* 註冊一個「TEA 即時字幕」影像來源型別（`tea_live_subtitle_source`）。它用
+  `obs_source_create_private()` 建立一個私有的 `text_ft2_source`（freetype2 文字來源）
+  子來源來實際算繪文字，不重寫字型排版邏輯。屬性面板暴露該子來源的
+  字型／顏色／描邊／陰影／自動換行／自訂寬度，外加外掛自己的最大行數／對齊／內距。
+  位置一律交給 OBS 原生的 scene item transform。
+  來源目前顯示一段佔位文字（「TEA ASR 尚未連線」），加入場景後就看得到東西。
+* 在 Tools 選單掛一個「TEA ASR 字幕設定…」項目，開一個最小的 Qt 對話框
+  （伺服器位址、連接埠、狀態列），證明 Qt 與 `obs-frontend-api` 有正確連結。
+  這一步**還不接網路**。
+* 所有面向使用者的字串走 `obs_module_text()` 與 `data/locale/{en-US,zh-TW}.ini`。
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+## 建置
 
-## Documentation
+**不要在本機執行 `cmake`。** 本機沒有配置完整的 OBS SDK，`cmake -S . -B build` 會把整包
+OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目錄。
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+所有建置都交給 GitHub Actions（`.github/workflows/push.yaml` → `build-project.yaml`），
+在 push 到 `master` 時會自動跑 macOS / Windows / Ubuntu 三個平台。用
+`gh run list --repo calebweixun/tea-live-subtitle` 追蹤結果。
 
-Suggested reading to get up and running:
+## 架構（規劃中，見交接規格）
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+```
+src/
+  plugin-main.c            # obs_module_load：註冊 source、Tools 選單
+  captions-source.c/.h     # obs_source_info：屬性、render（Phase 1 已完成骨架）
+  settings-dialog.cpp/.hpp # QDialog：server 位址、port、連線狀態（Phase 1 僅 UI 骨架）
+  audio-tap.c/.h           # Phase 2：從指定音訊源取樣、resample、進 ring buffer
+  asr-client.cpp/.hpp      # Phase 2：WebSocket client，協定狀態機、重連
+```
 
-## GitHub Actions & CI
-
-Default GitHub Actions workflows are available for the following repository actions:
-
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
-
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
-
-### Retrieving build artifacts
-
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
+本機環境事實：OBS Studio 32.2.1（macOS, Apple Silicon）；`buildspec.json` 目前沿用
+`obs-plugintemplate` 預設的 `obs-studio` 版本 31.1.1 ——這個版本只影響 CI 建置環境下載
+的 OBS 標頭檔/函式庫版本，跟本機安裝的 OBS 執行期版本無關，且 API（`obs_register_source`、
+`text_ft2_source`、`obs_frontend_add_tools_menu_item` 等）在兩個版本間相容，因此沿用同一位
+使用者已發布過的 [osc-mapper](https://github.com/calebweixun/osc-mapper) 外掛驗證過的配置。
 
 ## Signing and Notarizing on macOS
 
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+Basic concepts of codesigning and notarization on macOS are explained in the
+[obs-plugintemplate Wiki](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS).

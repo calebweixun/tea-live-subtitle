@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.calebweixun.tea-live-subtitle"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
+    "name": "tea-live-subtitle",
+    "displayName": "TEA Live Subtitle",
+    "version": "0.1.0",
+    "author": "Caleb Weixun",
+    "website": "https://github.com/calebweixun/tea-live-subtitle",
     "email": "me@example.com"
 }

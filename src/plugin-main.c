@@ -1,6 +1,6 @@
 /*
-Plugin Name
-Copyright (C) <Year> <Developer> <Email Address>
+tea-live-subtitle
+Copyright (C) 2026 Caleb Weixun
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -17,14 +17,29 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
+#include <obs-frontend-api.h>
 #include <plugin-support.h>
+
+#include "captions-source.h"
+#include "settings-dialog.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+static void tea_on_tools_menu_clicked(void *private_data)
+{
+	(void)private_data;
+	tea_show_settings_dialog();
+}
+
 bool obs_module_load(void)
 {
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	tea_captions_source_register();
+
+	obs_frontend_add_tools_menu_item(obs_module_text("TeaLiveSubtitle.Menu.SettingsTitle"),
+					  tea_on_tools_menu_clicked, NULL);
+
+	obs_log(LOG_INFO, "loaded version %s", PLUGIN_VERSION);
 	return true;
 }
 
