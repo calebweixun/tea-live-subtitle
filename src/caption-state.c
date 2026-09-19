@@ -26,7 +26,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <stdio.h>
 
 #define TEA_MAX_FINALIZED_LINES 10
-#define TEA_MAX_TRACKED_SEGMENTS 16
+/* docs/04's max_segment_ms=14000 means a continuous session produces a new
+ * segment roughly every ~14s; the M2 verification report (docs/m2-
+ * verification.md, defect 6) flagged that the old value of 16 only covered
+ * ~3-4 minutes of a session before the round-robin table started
+ * overwriting still-relevant (already-finalized) segment tracking entries.
+ * 256 covers roughly an hour (docs/08's acceptance criterion #4) at a
+ * trivial ~20KB memory cost. This is still a fixed-size table, not true
+ * whole-session dedup -- it just pushes the failure window from minutes to
+ * well beyond what v0.1's once-only, TCP-ordered wire protocol is expected
+ * to need. */
+#define TEA_MAX_TRACKED_SEGMENTS 256
 #define TEA_ID_BUF 64
 
 typedef struct {
