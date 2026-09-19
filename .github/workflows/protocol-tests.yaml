@@ -1,0 +1,39 @@
+name: Protocol Tests
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches:
+      - master
+      - main
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asr-client-policy:
+    name: ASR client admission policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile and run policy tests
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+            tests/asr-client-policy-test.cpp \
+            -o "$RUNNER_TEMP/asr-client-policy-test"
+          "$RUNNER_TEMP/asr-client-policy-test"
+          c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+            tests/caption-layout-test.cpp \
+            -o "$RUNNER_TEMP/caption-layout-test"
+          "$RUNNER_TEMP/caption-layout-test"
+          cc -std=c11 -Wall -Wextra -Werror -pthread -Itests/stubs -Isrc \
+            src/caption-state.c tests/caption-state-test.c \
+            -o "$RUNNER_TEMP/caption-state-test"
+          "$RUNNER_TEMP/caption-state-test"
+          python3 tests/test_font_defaults.py
+          python3 tests/test_caption_contract.py
+          python3 tests/test_layout_migration.py
