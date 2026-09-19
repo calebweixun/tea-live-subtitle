@@ -1,0 +1,147 @@
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QByteArray>
+#include <QTcpSocket>
+#include <QTimer>
+#include <QThread>
+#include <QMutex>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QJsonObject>
+
+#include <atomic>
+#include <cstdint>
+#include <deque>
+
+#include "audio-tap.h"
+#include "caption-state.h"
+
+/*
+ * Hand-rolled RFC 6455 client over QTcpSocket.
+ *
+ * Why not a WebSocket library: OBS's bundled Qt6 has no QtWebSockets
+ * module (confirmed against the installed OBS.app/Contents/Frameworks),
+ * and vendoring a third-party WS library (e.g. IXWebSocket) means getting
+ * it to build cleanly across the macOS/Windows/Linux CI matrix used by
+ * this repo's GitHub Actions workflows, on top of codesign/notarize
+ * concerns on macOS. QTcpSocket + QCryptographicHash (for the handshake's
+ * SHA-1) are already linked in via Qt6::Network/Qt6::Core, so this adds
+ * zero new external dependencies and zero new toolchain surface for CI to
+ * get wrong. The wire protocol we need (docs/04) is a single unmasked
+ * server -> client stream, masked client -> server text/binary frames, and
+ * server-initiated pings -- small enough to implement and keep correct by
+ * hand.
+ *
+ * Runs entirely on its own QThread (created in the constructor, all Qt
+ * network objects created lazily on that thread) so a stalled/slow server
+ * never touches OBS's audio or graphics threads. External callers only
+ * ever post cross-thread signals/queued invokes into this object.
+ */
+class TeaAsrClient : public QObject {
+	Q_OBJECT
+
+public:
+	TeaAsrClient(tea_audio_tap_t *tap, tea_caption_state_t *captions);
+	~TeaAsrClient() override;
+
+	void setServer(const QString &host, int port);
+	void setTokenPath(const QString &path);
+
+	void start();
+	void stop();
+
+	bool isConnected() const;
+	QString statusText() const;
+
+public slots:
+	void doStart();
+	void doStop();
+
+private slots:
+	void onSocketConnected();
+	void onSocketReadyRead();
+	void onSocketDisconnected();
+	void onSocketError(QAbstractSocket::SocketError error);
+	void onPumpTimer();
+	void onReconnectTimer();
+	void onCapabilitiesReply();
+
+private:
+	/* --- setup / lifecycle --- */
+	void resetProtocolStateLocked();
+	void scheduleReconnect();
+	void setStatus(const QString &text);
+
+	/* --- HTTP capabilities probe (for partial_transcripts) --- */
+	void fetchCapabilities();
+
+	/* --- WebSocket handshake --- */
+	void sendHandshakeRequest();
+	bool tryConsumeHandshakeResponse();
+
+	/* --- WS framing --- */
+	void sendWsFrame(uint8_t opcode, const char *payload, qint64 len);
+	void sendTextFrame(const QByteArray &utf8Json);
+	void sendBinaryFrame(const QByteArray &bytes);
+	void sendCloseFrame(uint16_t code);
+	void processIncomingWsBytes();
+	void handleWsFrame(uint8_t opcode, const QByteArray &payload);
+
+	/* --- protocol (docs/04) --- */
+	void handleJsonMessage(const QJsonObject &obj);
+	void maybeSendSessionStart();
+	void sendSessionStart();
+	void pumpAudio();
+	QString readToken() const;
+
+	tea_audio_tap_t *tap_;
+	tea_caption_state_t *captions_;
+
+	QThread thread_;
+
+	QString host_ = QStringLiteral("127.0.0.1");
+	int port_ = 8327;
+	QString tokenPath_;
+
+	QTcpSocket *socket_ = nullptr;
+	QTimer *pumpTimer_ = nullptr;
+	QTimer *reconnectTimer_ = nullptr;
+	QNetworkAccessManager *nam_ = nullptr;
+
+	QByteArray recvBuffer_;
+	bool handshakeDone_ = false;
+	QByteArray wsAcceptExpected_;
+
+	/* RFC6455 fragmentation reassembly (server -> client). */
+	bool fragmentActive_ = false;
+	uint8_t fragOpcode_ = 0;
+	QByteArray fragPayload_;
+
+	bool capabilitiesRequested_ = false;
+	bool capabilitiesKnown_ = false;
+	bool serverSupportsPartial_ = false;
+
+	bool helloReceived_ = false;
+	bool sessionStartSent_ = false;
+	bool sessionStarted_ = false;
+	QString sessionId_;
+
+	uint64_t nextSeq_ = 0;
+	uint64_t nextSample_ = 0;
+	uint64_t sendUntilSample_ = 0;
+
+	static const size_t kMaxFramePcmBytes = 6400; /* docs/04 hard limit */
+	std::deque<QByteArray> pendingPcm_;
+	static const size_t kMaxPendingPcmChunks = 512; /* ~a few seconds of audio */
+	uint64_t droppedPcmChunks_ = 0;
+
+	int reconnectAttempt_ = 0;
+
+	mutable QMutex statusMutex_;
+	QString statusText_;
+	std::atomic<bool> connected_{false};
+
+	std::atomic<bool> wantRunning_{false};
+};

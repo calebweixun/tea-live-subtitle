@@ -17,23 +17,33 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 /*
- * Phase 1 skeleton: registers a video source type that draws captions by
- * driving a *private* text-freetype2 child source. This deliberately does
- * NOT reimplement font rasterization/layout -- OBS already ships that in
- * the text-freetype2 plugin, and duplicating it would fight OBS's own text
- * rendering instead of feeling native.
+ * Registers a video source type that draws captions by driving a *private*
+ * text-freetype2 child source. This deliberately does NOT reimplement font
+ * rasterization/layout -- OBS already ships that in the text-freetype2
+ * plugin, and duplicating it would fight OBS's own text rendering instead
+ * of feeling native.
  *
- * No audio capture, no WebSocket client and no caption state machine live
- * here yet; that is phase 2. For now the child text source always shows a
- * placeholder string so the source is visibly alive as soon as it is added
- * to a scene.
+ * M2: each source instance owns its own audio tap + WebSocket client +
+ * caption state machine (audio-tap.h/caption-state.h/asr-client.h). This is
+ * a deliberate simplification versus docs/08-obs-plugin.md's sketch of a
+ * single *global* connection managed from the Tools-menu settings dialog:
+ * doing it per-source keeps ownership/lifetime trivial (no shared global to
+ * synchronize against scene collection load/unload, multiple independent
+ * captions sources "just work" with different audio sources or even
+ * different servers) at the cost of one WS connection per source instance
+ * instead of one for the whole app. Revisit if that connection-count cost
+ * turns out to matter in practice.
  */
 
 #include <obs-module.h>
 #include <util/bmem.h>
 #include <graphics/graphics.h>
+#include <string.h>
 
 #include "captions-source.h"
+#include "audio-tap.h"
+#include "caption-state.h"
+#include "asr-client.h"
 #include "plugin-support.h"
 
 /* The freetype2 text source id changed across OBS releases; on this
@@ -52,6 +62,23 @@ struct tea_captions_source {
 	int max_lines;
 	int caption_align; /* 0 = left, 1 = center, 2 = right */
 	int padding;
+
+	tea_audio_tap_t *tap;
+	tea_caption_state_t *captions;
+	tea_asr_client_t *client;
+
+	/* Cache of the connection settings we last applied, so update() (which
+	 * OBS calls on every settings-dialog keystroke) only tears down and
+	 * reconnects the WebSocket when something actually changed. */
+	char *applied_audio_source_name;
+	char *applied_server_host;
+	int applied_server_port;
+	char *applied_token_path;
+
+	/* Cache of the last string pushed into the child text source, so
+	 * video_tick() only calls obs_source_update() when the composed
+	 * caption text actually changed. */
+	char *last_rendered_text;
 };
 
 /* There is no portable public API to just ask "is source id X registered"
@@ -75,6 +102,13 @@ static const char *tea_captions_source_get_name(void *type_data)
 	return obs_module_text("TeaLiveSubtitle.SourceName");
 }
 
+static bool tea_str_eq(const char *a, const char *b)
+{
+	if (!a || !b)
+		return a == b;
+	return strcmp(a, b) == 0;
+}
+
 static void tea_captions_source_update(void *data, obs_data_t *settings)
 {
 	struct tea_captions_source *ctx = data;
@@ -84,6 +118,45 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	ctx->padding = (int)obs_data_get_int(settings, "padding");
 	if (ctx->padding < 0)
 		ctx->padding = 0;
+	if (ctx->max_lines < 1)
+		ctx->max_lines = 1;
+
+	if (ctx->captions)
+		tea_caption_state_set_max_lines(ctx->captions, ctx->max_lines);
+
+	/* --- connection settings: only reconnect if something changed --- */
+	const char *audio_source_name = obs_data_get_string(settings, "audio_source_name");
+	const char *server_host = obs_data_get_string(settings, "server_host");
+	int server_port = (int)obs_data_get_int(settings, "server_port");
+	const char *token_path = obs_data_get_string(settings, "token_path");
+
+	bool audio_changed = !tea_str_eq(ctx->applied_audio_source_name, audio_source_name);
+	bool server_changed = !tea_str_eq(ctx->applied_server_host, server_host) ||
+			      ctx->applied_server_port != server_port ||
+			      !tea_str_eq(ctx->applied_token_path, token_path);
+
+	if (audio_changed && ctx->tap) {
+		obs_source_t *audio_src =
+			(audio_source_name && audio_source_name[0]) ? obs_get_source_by_name(audio_source_name) : NULL;
+		tea_audio_tap_set_source(ctx->tap, audio_src);
+		if (audio_src)
+			obs_source_release(audio_src);
+
+		bfree(ctx->applied_audio_source_name);
+		ctx->applied_audio_source_name = bstrdup(audio_source_name);
+	}
+
+	if (server_changed && ctx->client) {
+		tea_asr_client_set_server(ctx->client, server_host, server_port);
+		tea_asr_client_set_token_path(ctx->client, token_path);
+		tea_asr_client_start(ctx->client); /* idempotent restart with the new settings */
+
+		bfree(ctx->applied_server_host);
+		ctx->applied_server_host = bstrdup(server_host);
+		ctx->applied_server_port = server_port;
+		bfree(ctx->applied_token_path);
+		ctx->applied_token_path = bstrdup(token_path);
+	}
 
 	if (!ctx->text_source)
 		return;
@@ -91,29 +164,31 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	/* Forward the freetype2 appearance keys (font/color1/color2/outline/
 	 * drop_shadow/word_wrap/custom_width) byte-for-byte to the child.
 	 * obs_data_apply() copies every key from `settings`, so our own extra
-	 * keys (max_lines/caption_align/padding) simply ride along and are
-	 * ignored by text_ft2_source. */
+	 * keys (max_lines/caption_align/padding/audio_source_name/server_*/
+	 * token_path) simply ride along and are ignored by text_ft2_source. */
 	obs_data_t *child_settings = obs_data_create();
-	obs_data_apply(child_settings, settings);
-
-	/* Phase 1 has no ASR client yet, so always show a placeholder string
-	 * rather than leaving the child source empty/invisible. */
-	obs_data_set_string(child_settings, "text", obs_module_text("TeaLiveSubtitle.PlaceholderText"));
-
-	obs_source_update(ctx->text_source, child_settings);
-	obs_data_release(child_settings);
+	 obs_data_apply(child_settings, settings);
+	 obs_data_set_string(child_settings, "text", ctx->last_rendered_text ? ctx->last_rendered_text : "");
+	 obs_source_update(ctx->text_source, child_settings);
+	 obs_data_release(child_settings);
 }
 
 static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct tea_captions_source *ctx = bzalloc(sizeof(struct tea_captions_source));
 	ctx->source = source;
+	ctx->applied_server_port = -1;
 
 	ctx->text_source = tea_create_text_child();
 	if (!ctx->text_source) {
 		obs_log(LOG_ERROR, "neither 'text_ft2_source_v2' nor 'text_ft2_source' could be created; "
 				   "is the text-freetype2 plugin missing? Captions will not render.");
 	}
+
+	ctx->captions = tea_caption_state_create();
+	tea_caption_state_set_status(ctx->captions, obs_module_text("TeaLiveSubtitle.PlaceholderText"));
+	ctx->tap = tea_audio_tap_create();
+	ctx->client = tea_asr_client_create(ctx->tap, ctx->captions);
 
 	tea_captions_source_update(ctx, settings);
 	return ctx;
@@ -122,10 +197,30 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 static void tea_captions_source_destroy(void *data)
 {
 	struct tea_captions_source *ctx = data;
+
+	if (ctx->client) {
+		tea_asr_client_stop(ctx->client);
+		tea_asr_client_destroy(ctx->client);
+		ctx->client = NULL;
+	}
+	if (ctx->tap) {
+		tea_audio_tap_destroy(ctx->tap);
+		ctx->tap = NULL;
+	}
+	if (ctx->captions) {
+		tea_caption_state_destroy(ctx->captions);
+		ctx->captions = NULL;
+	}
+
 	if (ctx->text_source) {
 		obs_source_release(ctx->text_source);
 		ctx->text_source = NULL;
 	}
+
+	bfree(ctx->applied_audio_source_name);
+	bfree(ctx->applied_server_host);
+	bfree(ctx->applied_token_path);
+	bfree(ctx->last_rendered_text);
 	bfree(ctx);
 }
 
@@ -134,6 +229,11 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "max_lines", 2);
 	obs_data_set_default_int(settings, "caption_align", 1);
 	obs_data_set_default_int(settings, "padding", 10);
+
+	obs_data_set_default_string(settings, "audio_source_name", "");
+	obs_data_set_default_string(settings, "server_host", "127.0.0.1");
+	obs_data_set_default_int(settings, "server_port", 8327);
+	obs_data_set_default_string(settings, "token_path", "");
 
 	obs_data_t *font_obj = obs_data_create();
 	obs_data_set_string(font_obj, "face", "Arial");
@@ -150,10 +250,32 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "custom_width", 0);
 }
 
+static bool tea_enum_audio_sources_cb(void *param, obs_source_t *source)
+{
+	obs_property_t *list = param;
+	uint32_t flags = obs_source_get_output_flags(source);
+	if (flags & OBS_SOURCE_AUDIO)
+		obs_property_list_add_string(list, obs_source_get_name(source), obs_source_get_name(source));
+	return true;
+}
+
 static obs_properties_t *tea_captions_source_get_properties(void *data)
 {
 	(void)data;
 	obs_properties_t *props = obs_properties_create();
+
+	/* --- connection settings --- */
+	obs_property_t *audio_list = obs_properties_add_list(props, "audio_source_name",
+							     obs_module_text("TeaLiveSubtitle.Prop.AudioSource"),
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(audio_list, obs_module_text("TeaLiveSubtitle.Prop.AudioSource.None"), "");
+	obs_enum_sources(tea_enum_audio_sources_cb, audio_list);
+
+	obs_properties_add_text(props, "server_host", obs_module_text("TeaLiveSubtitle.Prop.ServerHost"),
+				OBS_TEXT_DEFAULT);
+	obs_properties_add_int(props, "server_port", obs_module_text("TeaLiveSubtitle.Prop.ServerPort"), 1, 65535, 1);
+	obs_properties_add_text(props, "token_path", obs_module_text("TeaLiveSubtitle.Prop.TokenPath"),
+				OBS_TEXT_DEFAULT);
 
 	/* text_ft2_source's own appearance settings, exposed as-is. */
 	obs_properties_add_font(props, "font", obs_module_text("TeaLiveSubtitle.Prop.Font"));
@@ -194,6 +316,33 @@ static uint32_t tea_captions_source_get_height(void *data)
 	return child_h + (uint32_t)(ctx->padding * 2);
 }
 
+/* Pulls the composed caption string (see caption-state.h for the state
+ * machine) and, only when it actually changed, pushes it into the child
+ * text_ft2_source. Runs on OBS's graphics/video thread; the mutex inside
+ * tea_caption_state_render() is only ever held for a memcpy-sized amount of
+ * work, so this never blocks on network I/O. */
+static void tea_captions_source_video_tick(void *data, float seconds)
+{
+	(void)seconds;
+	struct tea_captions_source *ctx = data;
+	if (!ctx->captions || !ctx->text_source)
+		return;
+
+	char *text = tea_caption_state_render(ctx->captions);
+	if (ctx->last_rendered_text && strcmp(ctx->last_rendered_text, text) == 0) {
+		bfree(text);
+		return;
+	}
+
+	bfree(ctx->last_rendered_text);
+	ctx->last_rendered_text = text;
+
+	obs_data_t *update = obs_data_create();
+	obs_data_set_string(update, "text", ctx->last_rendered_text);
+	obs_source_update(ctx->text_source, update);
+	obs_data_release(update);
+}
+
 static void tea_captions_source_video_render(void *data, gs_effect_t *effect)
 {
 	(void)effect;
@@ -203,8 +352,8 @@ static void tea_captions_source_video_render(void *data, gs_effect_t *effect)
 
 	/* Our own bounding box always hugs the child source plus padding, so
 	 * left/center/right currently collapse to the same padding offset.
-	 * Alignment becomes meaningful once phase 2 gives the source a fixed
-	 * canvas width independent of the current caption length. */
+	 * Alignment becomes meaningful once the source gets a fixed canvas
+	 * width independent of the current caption length. */
 	uint32_t own_w = tea_captions_source_get_width(data);
 	uint32_t child_w = obs_source_get_width(ctx->text_source);
 	float offset_x = (float)ctx->padding;
@@ -228,6 +377,7 @@ static struct obs_source_info tea_captions_source_info = {
 	.create = tea_captions_source_create,
 	.destroy = tea_captions_source_destroy,
 	.update = tea_captions_source_update,
+	.video_tick = tea_captions_source_video_tick,
 	.get_defaults = tea_captions_source_get_defaults,
 	.get_properties = tea_captions_source_get_properties,
 	.get_width = tea_captions_source_get_width,
