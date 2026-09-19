@@ -168,16 +168,31 @@ private:
 
 	int reconnectAttempt_ = 0;
 
-	/* Set once the server (or the WS layer) has told us this connection is
-	 * not worth retrying -- currently: an `error` event with
-	 * retryable=false, an `error` event with code "session_limit" (server
-	 * enforces docs/04's max_continuous_sessions=1), or a close frame with
-	 * code 1013 (over capacity). scheduleReconnect() honors this instead
-	 * of retrying forever against a server that will keep refusing us.
+	/* Set once the server has told us -- via an `error` event's own
+	 * `retryable` field -- that this connection is not worth retrying.
+	 *
+	 * IMPORTANT: do not special-case `code == "session_limit"` or WS close
+	 * code 1013 as fatal. Cross-checked against the tea-asr-service source
+	 * (docs/m2-reverification.md): the server does not enforce
+	 * max_continuous_sessions at all (nothing in app.py's /v1/stream
+	 * handler rejects a second connection), and `session_limit` actually
+	 * means "this session's own pending-segment queue is full"
+	 * (stream.py's MAX_PENDING_SEGMENTS), which the server marks
+	 * `retryable=true` (errors.py RETRYABLE_CODES) because it clears on its
+	 * own once the backlog drains. Close code 1013 is shared by
+	 * `queue_full`, `session_limit` (both retryable) and `slow_client`
+	 * (not retryable) -- it does not by itself mean "fatal". Always defer
+	 * to the `retryable` flag the server sends with the `error` event.
 	 * Cleared on the next explicit start() so the user can always force a
-	 * fresh attempt (e.g. after closing the other caption source). */
+	 * fresh attempt. */
 	bool fatalNonRetryable_ = false;
 	QString fatalReason_;
+
+	/* Human-readable summary of the most recent server-reported error
+	 * (retryable or not), shown alongside "reconnecting in ...ms" so the
+	 * user always sees the real, server-supplied reason instead of a
+	 * generic "reconnecting" label. Empty until the first `error` event. */
+	QString lastErrorSummary_;
 
 	mutable QMutex statusMutex_;
 	QString statusText_;

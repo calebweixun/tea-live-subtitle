@@ -32,8 +32,8 @@ typedef struct {
 void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *info, void *user), void *user);
 
 /* Restarts every live instance's connection attempt, clearing any
- * "stopped, won't retry" state (e.g. after a session_limit rejection caused
- * by a second source) so it tries fresh. */
+ * "stopped, won't retry" state (e.g. after a server-reported
+ * `retryable=false` error) so it tries fresh. */
 void tea_captions_source_reconnect_all(void);
 
 #ifdef __cplusplus
