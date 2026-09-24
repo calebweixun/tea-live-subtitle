@@ -1,6 +1,7 @@
 #pragma once
 
 #include <obs.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,6 +29,11 @@ void tea_audio_tap_destroy(tea_audio_tap_t *tap);
  * (may be NULL to just detach). Safe to call repeatedly, e.g. whenever the
  * user picks a different audio source in the settings dialog. */
 void tea_audio_tap_set_source(tea_audio_tap_t *tap, obs_source_t *source);
+
+/* True while an OBS audio source is attached. Any thread. The ASR client
+ * uses it to avoid holding a server connection slot for a caption source
+ * that has no audio to send. */
+bool tea_audio_tap_has_source(tea_audio_tap_t *tap);
 
 /* Consumer side, call only from a single worker thread. Resamples whatever
  * is currently available in the ring buffer to 16 kHz mono PCM16 and writes

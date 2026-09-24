@@ -153,6 +153,16 @@ void tea_audio_tap_set_source(tea_audio_tap_t *tap, obs_source_t *source)
 	pthread_mutex_unlock(&tap->attach_lock);
 }
 
+bool tea_audio_tap_has_source(tea_audio_tap_t *tap)
+{
+	if (!tap)
+		return false;
+	pthread_mutex_lock(&tap->attach_lock);
+	bool attached = tap->attached_source != NULL;
+	pthread_mutex_unlock(&tap->attach_lock);
+	return attached;
+}
+
 size_t tea_audio_tap_pull_pcm16(tea_audio_tap_t *tap, int16_t *out, size_t max_samples)
 {
 	if (tap->native_rate == 0)

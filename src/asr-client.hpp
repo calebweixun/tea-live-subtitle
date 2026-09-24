@@ -6,6 +6,8 @@
 #include <QTcpSocket>
 #include <QTimer>
 #include <QThread>
+#include <QElapsedTimer>
+#include <QDateTime>
 #include <QMutex>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -79,20 +81,32 @@ private slots:
 	void onSocketError(QAbstractSocket::SocketError error);
 	void onPumpTimer();
 	void onReconnectTimer();
+	void onWatchTimer();
 	void onCapabilitiesReply();
 
 private:
 	/* --- setup / lifecycle --- */
 	void resetProtocolStateLocked();
+	/* One connection attempt: local checks (audio source, token file), then
+	 * the authenticated HTTP preflight, then -- only if that succeeded -- the
+	 * WebSocket. Reconnects call this, never doStart(), so backoff and
+	 * fatal state survive between attempts. */
+	void beginAttempt();
+	void openWebSocket();
+	void teardownSocket(bool sendClose);
+	/* Tears the current attempt down and schedules the next one. */
+	void failAttempt();
 	void scheduleReconnect();
 	void setStatus(const QString &text);
+	qint64 nowMs() const { return monotonic_.elapsed(); }
 
-	/* --- HTTP capabilities probe (for partial_transcripts) --- */
-	void fetchCapabilities();
+	/* --- HTTP preflight: authenticated GET /v1/capabilities --- */
+	void fetchCapabilities(const QString &token);
 
 	/* --- WebSocket handshake --- */
+	enum class HandshakeResult { NeedMore, Accepted, Rejected };
 	void sendHandshakeRequest();
-	bool tryConsumeHandshakeResponse();
+	HandshakeResult tryConsumeHandshakeResponse();
 
 	/* --- WS framing --- */
 	void sendWsFrame(uint8_t opcode, const char *payload, qint64 len);
@@ -107,7 +121,11 @@ private:
 	void maybeSendSessionStart();
 	void sendSessionStart();
 	void pumpAudio();
-	QString readToken() const;
+	QString tokenFilePath() const;
+	/* Reads the token and remembers the file's (mtime, size) so a change
+	 * (rotate/revoke/user fix) can be noticed without contacting the server. */
+	QString readToken();
+	bool tokenFileChanged() const;
 
 	tea_audio_tap_t *tap_;
 	tea_caption_state_t *captions_;
@@ -121,7 +139,32 @@ private:
 	QTcpSocket *socket_ = nullptr;
 	QTimer *pumpTimer_ = nullptr;
 	QTimer *reconnectTimer_ = nullptr;
+	/* Local-only polling while waiting for an audio source to be selected or
+	 * for the token file to change; never touches the network. */
+	QTimer *watchTimer_ = nullptr;
 	QNetworkAccessManager *nam_ = nullptr;
+
+	QElapsedTimer monotonic_;
+	/* Incremented per attempt; stale preflight replies are ignored. */
+	quint64 attemptGen_ = 0;
+	bool socketEverConnected_ = false;
+	qint64 connectStartMs_ = -1;
+	qint64 lastRxMs_ = -1;
+	qint64 sessionStartedMs_ = -1;
+	/* 45 s = the server's 15 s WS ping interval + its 30 s pong timeout:
+	 * past that, a live server would already have pinged us. */
+	static const qint64 kServerSilenceMs = 45000;
+	static const qint64 kHandshakeTimeoutMs = 10000;
+
+	QDateTime tokenMtime_;
+	qint64 tokenSize_ = -1;
+	bool tokenStampValid_ = false;
+
+	enum class WaitMode { None, AudioSource, TokenFile };
+	WaitMode waitMode_ = WaitMode::None;
+
+	int maxTotalConnections_ = 0;
+	std::atomic<bool> insecureLan_{false};
 
 	QByteArray recvBuffer_;
 	bool handshakeDone_ = false;
@@ -167,11 +210,10 @@ private:
 	 * never come. */
 	static const uint64_t kMaxIncomingFramePayloadBytes = 16u * 1024u * 1024u;
 
-	int reconnectAttempt_ = 0;
-
 	/* Error/reconnect policy is kept independent of Qt so its admission
-	 * semantics are covered by the standalone CI protocol test. */
+	 * and backoff semantics are covered by the standalone CI protocol test. */
 	tea_asr::ErrorPolicy errorPolicy_;
+	tea_asr::ReconnectBackoff backoff_;
 
 	mutable QMutex statusMutex_;
 	QString statusText_;

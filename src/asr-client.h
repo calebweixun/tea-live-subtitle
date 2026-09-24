@@ -28,9 +28,17 @@ extern "C" {
  * `retryable=true`, followed by the dedicated WebSocket close code 4029.
  * The client shows the server's reason (or an actionable fallback derived
  * from 4029) and keeps retrying because a slot may become available. Do not
- * confuse that admission error with `session_limit`, which means *this*
- * session's own pending-segment queue filled up, or with close code 1013,
- * which is shared by `queue_full`, `session_limit`, and `slow_client`.
+ * confuse that admission error with `session_limit` (this session's own
+ * pending-segment queue filled up, or -- rejected before accept() -- the
+ * server's max_total_connections cap), or with close code 1013, which is
+ * shared by `queue_full`, `session_limit`, `slow_client` and `rate_limited`.
+ *
+ * Every attempt starts with an authenticated GET /v1/capabilities preflight
+ * and only opens the WebSocket if that succeeds: the server rejects
+ * unauthenticated / rate_limited / forbidden_origin / session_limit upgrades
+ * before accept(), which a real client only ever sees as a reason-less HTTP
+ * 403. Reconnect backoff and the auth-failure budget live in
+ * asr-error-policy.hpp (ReconnectBackoff).
  *
  * The client itself lives on its own Qt worker thread: none of these calls
  * do blocking network I/O, they just hand off to that thread.

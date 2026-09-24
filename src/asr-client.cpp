@@ -24,6 +24,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QFile>
+#include <QFileInfo>
+#include <QList>
+#include <QVariant>
 #include <QDir>
 #include <QStandardPaths>
 #include <QMetaObject>
@@ -185,26 +188,27 @@ void TeaAsrClient::resetProtocolStateLocked()
 
 void TeaAsrClient::doStart()
 {
-	if (socket_) {
-		/* Already connecting/connected; a restart is just stop+start. */
-		doStop();
-	}
+	/* An explicit (re)start -- the source's own settings changing or the
+	 * user pressing "Reconnect All" -- always deserves a fresh attempt with
+	 * a fresh backoff, even if a previous connection gave up permanently
+	 * (e.g. a non-retryable server error or a spent auth budget).
+	 *
+	 * Tear the old attempt down *without* clearing wantRunning_: doStop()
+	 * clears it, and calling it here used to leave a restarted client that
+	 * never reconnected again after its next disconnect. */
+	wantRunning_ = true;
+	if (!monotonic_.isValid())
+		monotonic_.start();
+	if (reconnectTimer_)
+		reconnectTimer_->stop();
+	if (watchTimer_)
+		watchTimer_->stop();
+	teardownSocket(true);
+	if (captions_)
+		tea_caption_state_reset(captions_);
 
-	resetProtocolStateLocked();
-	connected_ = false;
-	reconnectAttempt_ = 0;
-	/* An explicit (re)start -- whether from the source's own settings
-	 * changing or a user-initiated "reconnect" -- always deserves a fresh
-	 * attempt, even if a previous connection gave up permanently (e.g. a
-	 * non-retryable server error). */
 	errorPolicy_.reset();
-	setStatus(QStringLiteral("connecting"));
-
-	socket_ = new QTcpSocket(this);
-	connect(socket_, &QTcpSocket::connected, this, &TeaAsrClient::onSocketConnected);
-	connect(socket_, &QTcpSocket::readyRead, this, &TeaAsrClient::onSocketReadyRead);
-	connect(socket_, &QTcpSocket::disconnected, this, &TeaAsrClient::onSocketDisconnected);
-	connect(socket_, &QTcpSocket::errorOccurred, this, &TeaAsrClient::onSocketError);
+	backoff_.reset();
 
 	if (!pumpTimer_) {
 		pumpTimer_ = new QTimer(this);
@@ -218,10 +222,12 @@ void TeaAsrClient::doStart()
 		reconnectTimer_->setSingleShot(true);
 		connect(reconnectTimer_, &QTimer::timeout, this, &TeaAsrClient::onReconnectTimer);
 	}
+	if (!watchTimer_) {
+		watchTimer_ = new QTimer(this);
+		connect(watchTimer_, &QTimer::timeout, this, &TeaAsrClient::onWatchTimer);
+	}
 
-	fetchCapabilities();
-
-	socket_->connectToHost(host_, (quint16)port_);
+	beginAttempt();
 }
 
 void TeaAsrClient::doStop()
@@ -229,23 +235,80 @@ void TeaAsrClient::doStop()
 	wantRunning_ = false;
 	if (reconnectTimer_)
 		reconnectTimer_->stop();
+	if (watchTimer_)
+		watchTimer_->stop();
 	if (pumpTimer_)
 		pumpTimer_->stop();
+	waitMode_ = WaitMode::None;
+	attemptGen_++; /* orphan any in-flight preflight reply */
 
-	if (socket_) {
-		if (socket_->state() == QAbstractSocket::ConnectedState && handshakeDone_)
-			sendCloseFrame(1000);
-		socket_->disconnect(this);
-		socket_->close();
-		socket_->deleteLater();
-		socket_ = nullptr;
-	}
-
-	connected_ = false;
-	resetProtocolStateLocked();
+	teardownSocket(true);
 	setStatus(QStringLiteral("stopped"));
 	if (captions_)
 		tea_caption_state_reset(captions_);
+}
+
+void TeaAsrClient::teardownSocket(bool sendClose)
+{
+	if (socket_) {
+		if (sendClose && socket_->state() == QAbstractSocket::ConnectedState && handshakeDone_)
+			sendCloseFrame(1000);
+		socket_->disconnect(this);
+		socket_->abort();
+		socket_->deleteLater();
+		socket_ = nullptr;
+	}
+	connected_ = false;
+	socketEverConnected_ = false;
+	connectStartMs_ = -1;
+	lastRxMs_ = -1;
+	sessionStartedMs_ = -1;
+	resetProtocolStateLocked();
+}
+
+void TeaAsrClient::beginAttempt()
+{
+	if (!wantRunning_)
+		return;
+	attemptGen_++;
+	teardownSocket(false);
+	errorPolicy_.beginAttempt();
+	capabilitiesKnown_ = false;
+	waitMode_ = WaitMode::None;
+	if (watchTimer_)
+		watchTimer_->stop();
+
+	/* A caption source with no audio source selected would only hold one of
+	 * the server's few connection / continuous-session slots
+	 * (max_total_connections, max_continuous_sessions) and then be ended by
+	 * its idle_timeout every 120 s. Wait locally instead. */
+	if (tap_ && !tea_audio_tap_has_source(tap_)) {
+		setStatus(QStringLiteral("waiting: no audio source selected for this caption source"));
+		waitMode_ = WaitMode::AudioSource;
+		watchTimer_->start(1000);
+		return;
+	}
+
+	/* A missing or empty (revoked) token can never authenticate; sending it
+	 * anyway would only spend the server's auth-failure budget. */
+	const QString token = readToken();
+	if (token.isEmpty()) {
+		errorPolicy_.observeNoToken(tokenFilePath().toStdString());
+		setStatus(QStringLiteral("waiting: %1 (will connect when the token file changes)")
+				  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary())));
+		waitMode_ = WaitMode::TokenFile;
+		watchTimer_->start(tea_asr::ReconnectBackoff::kNoTokenPollMs);
+		return;
+	}
+
+	setStatus(QStringLiteral("checking server (GET /v1/capabilities)"));
+	fetchCapabilities(token);
+}
+
+void TeaAsrClient::failAttempt()
+{
+	teardownSocket(false);
+	scheduleReconnect();
 }
 
 void TeaAsrClient::scheduleReconnect()
@@ -256,37 +319,85 @@ void TeaAsrClient::scheduleReconnect()
 	if (errorPolicy_.fatal()) {
 		/* The server told us -- via the `error` event's own `retryable`
 		 * field -- that this will keep failing. Retrying would just burn
-		 * one of docs/04's max_total_connections=5 slots every ~16s
-		 * forever, while leaving the user staring at an opaque
-		 * "reconnecting" label. Stop and say why instead. */
+		 * one of the server's max_total_connections slots forever while
+		 * leaving the user staring at an opaque "reconnecting" label. Stop
+		 * and say why instead. */
 		const QString fatalReason = QString::fromStdString(errorPolicy_.fatalReason());
 		setStatus(fatalReason.isEmpty() ? QStringLiteral("stopped: server rejected this connection")
 						: fatalReason);
 		return;
 	}
 
-	int delayMs = 1000 << qMin(reconnectAttempt_, 4); /* 1,2,4,8,16s cap */
-	reconnectAttempt_++;
-	/* Always surface the real, server-supplied reason (if we have one)
-	 * alongside the backoff countdown, instead of a bare "reconnecting"
-	 * label that gives the user nothing to act on. Most reasons here are
-	 * transient (e.g. this session's own pending-segment queue was
-	 * temporarily full) and are expected to clear on their own, so we keep
-	 * retrying rather than giving up -- but we never retry silently. */
+	const tea_asr::FailureClass cls = errorPolicy_.failureClass();
+	if (errorPolicy_.lastErrorSummary().empty())
+		errorPolicy_.observeTransport("connection lost");
+	int delayMs = backoff_.nextDelayMs(cls);
+
+	if (delayMs < 0) {
+		/* Auth budget spent: every further try would be one more failure
+		 * toward the server's rate limit, for a token that is known bad. */
+		setStatus(QStringLiteral("stopped: %1 -- fix the token file (%2) or press Reconnect All; "
+					 "retries automatically when the token file changes")
+				  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary()), tokenFilePath()));
+		waitMode_ = WaitMode::TokenFile;
+		watchTimer_->start(tea_asr::ReconnectBackoff::kNoTokenPollMs);
+		return;
+	}
+
+	if (cls == tea_asr::FailureClass::Transient) {
+		/* +-10% jitter so several caption sources that lost the same server
+		 * do not reconnect in lockstep. */
+		delayMs += int(QRandomGenerator::global()->bounded(delayMs / 5 + 1)) - delayMs / 10;
+	}
+
+	/* Always surface the real reason alongside the countdown, never a bare
+	 * "reconnecting" label that gives the user nothing to act on. */
 	setStatus(QString::fromStdString(errorPolicy_.reconnectStatus(delayMs)));
 	reconnectTimer_->start(delayMs);
+
+	if (cls == tea_asr::FailureClass::Auth) {
+		/* A fixed token should not have to wait out a 60 s backoff. */
+		waitMode_ = WaitMode::TokenFile;
+		watchTimer_->start(tea_asr::ReconnectBackoff::kNoTokenPollMs);
+	}
 }
 
 void TeaAsrClient::onReconnectTimer()
 {
 	if (!wantRunning_)
 		return;
-	doStart();
+	beginAttempt();
 }
 
-/* ---------------- capabilities probe ---------------- */
+void TeaAsrClient::onWatchTimer()
+{
+	if (!wantRunning_) {
+		watchTimer_->stop();
+		return;
+	}
+	switch (waitMode_) {
+	case WaitMode::AudioSource:
+		if (!tap_ || tea_audio_tap_has_source(tap_))
+			beginAttempt();
+		break;
+	case WaitMode::TokenFile:
+		if (tokenFileChanged()) {
+			obs_log(LOG_INFO, "asr-client: token file changed; reconnecting");
+			backoff_.resetAuth();
+			if (reconnectTimer_)
+				reconnectTimer_->stop();
+			beginAttempt();
+		}
+		break;
+	case WaitMode::None:
+		watchTimer_->stop();
+		break;
+	}
+}
 
-void TeaAsrClient::fetchCapabilities()
+/* ---------------- HTTP preflight ---------------- */
+
+void TeaAsrClient::fetchCapabilities(const QString &token)
 {
 	if (!nam_)
 		nam_ = new QNetworkAccessManager(this);
@@ -297,8 +408,14 @@ void TeaAsrClient::fetchCapabilities()
 	url.setPort(port_);
 	url.setPath(QStringLiteral("/v1/capabilities"));
 
+	/* /v1/capabilities requires the bearer token like every /v1 route. An
+	 * unauthenticated probe is answered 401 *and* counted as an auth failure
+	 * by the server's rate limiter. */
 	QNetworkRequest req(url);
+	req.setRawHeader("Authorization", "Bearer " + token.toUtf8());
+	req.setTransferTimeout(5000);
 	QNetworkReply *reply = nam_->get(req);
+	reply->setProperty("teaAttempt", QVariant::fromValue(attemptGen_));
 	connect(reply, &QNetworkReply::finished, this, &TeaAsrClient::onCapabilitiesReply);
 }
 
@@ -308,48 +425,102 @@ void TeaAsrClient::onCapabilitiesReply()
 	if (!reply)
 		return;
 	reply->deleteLater();
+	if (!wantRunning_ || reply->property("teaAttempt").value<quint64>() != attemptGen_)
+		return; /* superseded by a newer attempt or a stop */
 
-	if (reply->error() != QNetworkReply::NoError) {
-		capabilitiesKnown_ = true; /* don't block session.start forever */
-		serverSupportsPartial_ = false;
-		maybeSendSessionStart();
+	const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+	const QByteArray body = reply->readAll();
+
+	if (httpStatus == 0) {
+		errorPolicy_.observeTransport(QStringLiteral("server unreachable at %1:%2 (%3)")
+						      .arg(host_)
+						      .arg(port_)
+						      .arg(reply->errorString())
+						      .toStdString());
+		failAttempt();
 		return;
 	}
 
-	QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
-	QJsonObject obj = doc.object();
+	QJsonObject obj = QJsonDocument::fromJson(body).object();
+	if (httpStatus != 200) {
+		QJsonObject err = obj.value(QStringLiteral("error")).toObject();
+		const std::string code = err.value(QStringLiteral("code")).toString().toStdString();
+		const std::string message = err.value(QStringLiteral("message")).toString().toStdString();
+		obs_log(LOG_WARNING, "asr-client: preflight GET /v1/capabilities -> HTTP %d (%s)", httpStatus,
+			code.c_str());
+		errorPolicy_.observePreflightHttp(httpStatus, code, message);
+		failAttempt();
+		return;
+	}
+
 	QJsonObject features = obj.value(QStringLiteral("features")).toObject();
+	QJsonObject limits = obj.value(QStringLiteral("limits")).toObject();
 	serverSupportsPartial_ = features.value(QStringLiteral("partial_transcripts")).toBool(false);
+	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
+	/* W9 LAN mode: every response carries this header. Surface it; the
+	 * bearer token is travelling in cleartext. */
+	insecureLan_ = !reply->rawHeader("X-TEA-ASR-Security").isEmpty();
 	capabilitiesKnown_ = true;
-	maybeSendSessionStart();
+
+	openWebSocket();
 }
 
 /* ---------------- token ---------------- */
 
-QString TeaAsrClient::readToken() const
+QString TeaAsrClient::tokenFilePath() const
 {
-	QString path = tokenPath_;
-	if (path.isEmpty()) {
+	if (!tokenPath_.isEmpty())
+		return tokenPath_;
 #if defined(Q_OS_MAC)
-		path = QDir::homePath() + QStringLiteral("/Library/Application Support/TEA ASR/token");
+	return QDir::homePath() + QStringLiteral("/Library/Application Support/TEA ASR/token");
 #else
-		path = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) +
-		       QStringLiteral("/TEA ASR/token");
+	return QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) + QStringLiteral("/TEA ASR/token");
 #endif
-	}
+}
+
+QString TeaAsrClient::readToken()
+{
+	const QString path = tokenFilePath();
+	QFileInfo info(path);
+	tokenStampValid_ = info.exists();
+	tokenMtime_ = tokenStampValid_ ? info.lastModified() : QDateTime();
+	tokenSize_ = tokenStampValid_ ? info.size() : -1;
 
 	QFile f(path);
 	if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
 		return QString();
 	/* Never log file contents; a missing/unreadable token is only ever
-	 * surfaced as a connection failure, never as logged text. */
+	 * surfaced as a status, never as logged text. */
 	return QString::fromUtf8(f.readAll()).trimmed();
+}
+
+bool TeaAsrClient::tokenFileChanged() const
+{
+	QFileInfo info(tokenFilePath());
+	if (info.exists() != tokenStampValid_)
+		return true;
+	if (!info.exists())
+		return false;
+	return info.lastModified() != tokenMtime_ || info.size() != tokenSize_;
 }
 
 /* ---------------- WS handshake ---------------- */
 
+void TeaAsrClient::openWebSocket()
+{
+	setStatus(QStringLiteral("connecting (WebSocket)"));
+	socket_ = new QTcpSocket(this);
+	connect(socket_, &QTcpSocket::connected, this, &TeaAsrClient::onSocketConnected);
+	connect(socket_, &QTcpSocket::readyRead, this, &TeaAsrClient::onSocketReadyRead);
+	connect(socket_, &QTcpSocket::disconnected, this, &TeaAsrClient::onSocketDisconnected);
+	connect(socket_, &QTcpSocket::errorOccurred, this, &TeaAsrClient::onSocketError);
+	connectStartMs_ = nowMs();
+	socket_->connectToHost(host_, (quint16)port_);
+}
+
 void TeaAsrClient::onSocketConnected()
 {
+	socketEverConnected_ = true;
 	sendHandshakeRequest();
 }
 
@@ -362,14 +533,22 @@ void TeaAsrClient::sendHandshakeRequest()
 
 	wsAcceptExpected_ = QCryptographicHash::hash(key + QByteArray(kWsGuid), QCryptographicHash::Sha1).toBase64();
 
+	/* No Origin header: the server treats an absent Origin as a native
+	 * client, while any Origin must match its browser allowlist. The Host
+	 * header's port is ignored by the server's allowlist; IPv6 literals
+	 * need brackets to be a well-formed Host. */
+	const QByteArray hostHeader = host_.contains(QLatin1Char(':')) ? "[" + host_.toUtf8() + "]" : host_.toUtf8();
+
 	QByteArray req;
 	req += "GET /v1/stream HTTP/1.1\r\n";
-	req += "Host: " + host_.toUtf8() + ":" + QByteArray::number(port_) + "\r\n";
+	req += "Host: " + hostHeader + ":" + QByteArray::number(port_) + "\r\n";
 	req += "Upgrade: websocket\r\n";
 	req += "Connection: Upgrade\r\n";
 	req += "Sec-WebSocket-Key: " + key + "\r\n";
 	req += "Sec-WebSocket-Version: 13\r\n";
 
+	/* Re-read: the token may have been rotated since the preflight; the
+	 * server follows its token file live. */
 	QString token = readToken();
 	if (!token.isEmpty())
 		req += "Authorization: Bearer " + token.toUtf8() + "\r\n";
@@ -378,17 +557,23 @@ void TeaAsrClient::sendHandshakeRequest()
 	socket_->write(req);
 }
 
-bool TeaAsrClient::tryConsumeHandshakeResponse()
+TeaAsrClient::HandshakeResult TeaAsrClient::tryConsumeHandshakeResponse()
 {
 	int headerEnd = recvBuffer_.indexOf("\r\n\r\n");
 	if (headerEnd < 0)
-		return false; /* keep buffering */
+		return HandshakeResult::NeedMore;
 
 	QByteArray header = recvBuffer_.left(headerEnd);
 	recvBuffer_.remove(0, headerEnd + 4);
 
 	QByteArray headerLower = header.toLower();
-	bool is101 = header.startsWith("HTTP/1.1 101") || header.startsWith("HTTP/1.0 101");
+	int statusCode = 0;
+	{
+		int lineEnd = header.indexOf("\r\n");
+		QList<QByteArray> parts = header.left(lineEnd < 0 ? header.size() : lineEnd).split(' ');
+		if (parts.size() >= 2 && parts[0].startsWith("HTTP/"))
+			statusCode = parts[1].toInt();
+	}
 
 	int acceptIdx = headerLower.indexOf("sec-websocket-accept:");
 	QByteArray acceptValue;
@@ -401,18 +586,27 @@ bool TeaAsrClient::tryConsumeHandshakeResponse()
 		acceptValue = line.trimmed();
 	}
 
-	if (!is101 || acceptValue.isEmpty() || acceptValue != wsAcceptExpected_) {
-		obs_log(LOG_WARNING, "asr-client: WebSocket handshake rejected/invalid (status/accept mismatch)");
-		setStatus(QStringLiteral("handshake failed"));
-		socket_->disconnectFromHost();
-		return false;
+	if (statusCode != 101) {
+		/* Pre-accept rejections (session_limit, and in a race also
+		 * unauthenticated/rate_limited) arrive as a reason-less 403. */
+		obs_log(LOG_WARNING, "asr-client: WebSocket upgrade rejected with HTTP %d", statusCode);
+		errorPolicy_.observeHandshakeRejected(statusCode, maxTotalConnections_);
+		failAttempt();
+		return HandshakeResult::Rejected;
+	}
+	if (acceptValue.isEmpty() || acceptValue != wsAcceptExpected_) {
+		obs_log(LOG_WARNING, "asr-client: WebSocket handshake invalid (Sec-WebSocket-Accept mismatch)");
+		errorPolicy_.observeTransport("WebSocket handshake invalid (Sec-WebSocket-Accept mismatch)");
+		failAttempt();
+		return HandshakeResult::Rejected;
 	}
 
+	if (headerLower.contains("x-tea-asr-security:"))
+		insecureLan_ = true;
 	handshakeDone_ = true;
 	connected_ = true;
-	reconnectAttempt_ = 0;
 	setStatus(QStringLiteral("connected, awaiting hello"));
-	return true;
+	return HandshakeResult::Accepted;
 }
 
 /* ---------------- WS framing ---------------- */
@@ -471,12 +665,15 @@ void TeaAsrClient::sendCloseFrame(uint16_t code)
 
 void TeaAsrClient::onSocketReadyRead()
 {
+	if (!socket_)
+		return;
 	recvBuffer_.append(socket_->readAll());
+	lastRxMs_ = nowMs();
 
 	if (!handshakeDone_) {
-		if (!tryConsumeHandshakeResponse())
-			return;
-		/* fallthrough: any bytes left in recvBuffer_ after the header
+		if (tryConsumeHandshakeResponse() != HandshakeResult::Accepted)
+			return; /* need more bytes, or the attempt was already torn down */
+				/* fallthrough: any bytes left in recvBuffer_ after the header
 		 * are already WS frame data. */
 	}
 
@@ -610,10 +807,12 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 		 * exists, but also classify the close code itself so a dropped/missing
 		 * text frame never degrades into an unexplained reconnect loop. This is
 		 * deliberately retryable: another source may disconnect at any time. */
-		const bool hadMatchingError = errorPolicy_.hasConcurrentSessionError();
+		/* Likewise 4408 (idle_timeout) gets a synthesized, actionable reason
+		 * if its error event was lost; any other close code only describes
+		 * itself when no error event preceded it (see ErrorPolicy). */
 		errorPolicy_.observeClose(code);
-		if (code == 4029 && !hadMatchingError) {
-			setStatus(QStringLiteral("server error: %1")
+		if (!errorPolicy_.lastErrorSummary().empty() && !errorPolicy_.fatal()) {
+			setStatus(QStringLiteral("server closed: %1")
 					  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary())));
 		}
 
@@ -627,7 +826,8 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 		 * is just the transport-level teardown that follows it. Do not
 		 * duplicate or override that decision here. Code 4029 is handled
 		 * separately above because it has one unambiguous meaning. */
-		socket_->disconnectFromHost();
+		if (socket_)
+			socket_->disconnectFromHost();
 		break;
 	}
 	case 0x9: { /* ping -> pong */
@@ -662,7 +862,15 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		nextSeq_ = (uint64_t)obj.value(QStringLiteral("next_seq")).toDouble(0);
 		nextSample_ = (uint64_t)obj.value(QStringLiteral("next_sample")).toDouble(0);
 		sendUntilSample_ = (uint64_t)obj.value(QStringLiteral("send_until_sample")).toDouble(0);
-		setStatus(QStringLiteral("session active"));
+		sessionStartedMs_ = nowMs();
+		const QString mode = obj.value(QStringLiteral("transcript_mode")).toString();
+		QString status = QStringLiteral("session active");
+		if (!mode.isEmpty())
+			status += QStringLiteral(" (%1)").arg(mode);
+		if (insecureLan_)
+			status += QStringLiteral(
+				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
+		setStatus(status);
 		return;
 	}
 
@@ -755,15 +963,8 @@ void TeaAsrClient::maybeSendSessionStart()
 {
 	if (sessionStartSent_ || !helloReceived_)
 		return;
-	if (!capabilitiesKnown_) {
-		/* Give the local HTTP capabilities probe a brief moment; docs/04
-		 * gives us 5s total to send session.start, so waiting a few
-		 * hundred ms is safe and avoids guessing wrong about
-		 * transcript_mode on a server that actually supports revisable
-		 * previews. */
-		QTimer::singleShot(300, this, [this]() { sendSessionStart(); });
-		return;
-	}
+	/* The authenticated preflight completes before the WebSocket is even
+	 * opened, so transcript_mode is always chosen from real capabilities. */
 	sendSessionStart();
 }
 
@@ -793,6 +994,24 @@ void TeaAsrClient::sendSessionStart()
 void TeaAsrClient::onPumpTimer()
 {
 	pumpAudio();
+
+	if (!socket_)
+		return;
+	const qint64 now = nowMs();
+	if (!handshakeDone_ && connectStartMs_ >= 0 && now - connectStartMs_ > kHandshakeTimeoutMs) {
+		errorPolicy_.observeTransport("WebSocket connect/handshake timed out after 10 s");
+		failAttempt();
+		return;
+	}
+	if (handshakeDone_ && lastRxMs_ >= 0 && now - lastRxMs_ > kServerSilenceMs) {
+		/* The server pings every 15 s; this long without a single byte means
+		 * the peer is gone (sleep, network change) even though TCP has not
+		 * noticed yet. */
+		obs_log(LOG_WARNING, "asr-client: no data from server for %lld ms; dropping connection",
+			(long long)(now - lastRxMs_));
+		errorPolicy_.observeTransport("no data from server for 45 s (missed WebSocket heartbeat)");
+		failAttempt();
+	}
 }
 
 void TeaAsrClient::pumpAudio()
@@ -845,29 +1064,35 @@ void TeaAsrClient::pumpAudio()
 
 void TeaAsrClient::onSocketDisconnected()
 {
-	connected_ = false;
 	if (captions_) {
 		tea_caption_state_reset(captions_);
 	}
-	setStatus(QStringLiteral("disconnected"));
-	resetProtocolStateLocked();
 
-	if (socket_) {
-		socket_->deleteLater();
-		socket_ = nullptr;
-	}
+	/* A session that ran for a while resets the backoff; one that failed
+	 * quickly (or ended by idle_timeout, i.e. no audio) keeps escalating it,
+	 * so a server that accepts then immediately drops us is not hammered. */
+	if (sessionStartedMs_ >= 0 && tea_asr::ReconnectBackoff::sessionWasHealthy(nowMs() - sessionStartedMs_,
+										   errorPolicy_.lastServerErrorCode()))
+		backoff_.reset();
 
-	scheduleReconnect();
+	errorPolicy_.observeTransport(handshakeDone_ ? "connection closed" : "connection closed during handshake");
+	failAttempt();
 }
 
 void TeaAsrClient::onSocketError(QAbstractSocket::SocketError error)
 {
 	(void)error;
-	/* QTcpSocket emits disconnected() after most errors too; if the
-	 * connection never got established at all it still fires this and
-	 * we schedule a reconnect from here explicitly. */
-	if (socket_ && socket_->state() != QAbstractSocket::ConnectedState) {
-		setStatus(QStringLiteral("connection error: %1").arg(socket_->errorString()));
+	if (!socket_)
+		return;
+	/* A socket that never connected (refused, unreachable, DNS failure)
+	 * does not emit disconnected(), so the retry must be scheduled here --
+	 * otherwise one refused connect would end reconnecting for good. A
+	 * connected socket's error is followed by disconnected(), which
+	 * handles it. */
+	if (!socketEverConnected_) {
+		errorPolicy_.observeTransport(
+			QStringLiteral("WebSocket connect failed: %1").arg(socket_->errorString()).toStdString());
+		failAttempt();
 	}
 }
 
