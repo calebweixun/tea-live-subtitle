@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <util/bmem.h>
 
 static void expect(bool condition, const char *message)
 {
@@ -38,7 +39,7 @@ static void test_stable_append_only(void)
 	tea_caption_state_t *st = tea_caption_state_create();
 	tea_caption_state_set_stable_mode(st, true);
 	expect(tea_caption_state_stable_mode(st), "stable mode must be selectable");
-	char *prev = strdup("");
+	char *prev = bstrdup("");
 
 	tea_caption_state_on_partial(st, "s", "seg-a", 1, "我們需");
 	expect_render(st, "", "stable mode never renders a transcript.partial");
@@ -83,7 +84,7 @@ static void test_stable_segment_isolation(void)
 	tea_caption_state_t *st = tea_caption_state_create();
 	tea_caption_state_set_max_lines(st, 3);
 	tea_caption_state_set_stable_mode(st, true);
-	char *prev = strdup("");
+	char *prev = bstrdup("");
 
 	tea_caption_state_on_stable(st, "s", "seg-1", 0, 1, "第一段", "open");
 	expect_append_only(st, &prev, "segment 1 open");
@@ -180,7 +181,7 @@ static void test_stable_utf8_tails(void)
 {
 	tea_caption_state_t *st = tea_caption_state_create();
 	tea_caption_state_set_stable_mode(st, true);
-	char *prev = strdup("");
+	char *prev = bstrdup("");
 
 	/* 3-byte CJK, then U+2615 U+FE0F, a skin-tone modifier sequence and a
 	 * ZWJ family (4-byte code points joined by U+200D). */
