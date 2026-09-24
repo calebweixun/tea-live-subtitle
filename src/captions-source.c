@@ -1701,9 +1701,9 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 					    "press \"Apply connection settings\" or close this window. Everything "
 					    "else applies immediately."),
 				OBS_TEXT_INFO);
-	obs_properties_add_button(props, "apply_connection",
-				  tea_text_or("TeaLiveSubtitle.Prop.ApplyConnection", "Apply connection settings"),
-				  tea_apply_connection_clicked);
+	obs_properties_add_button2(props, "apply_connection",
+				   tea_text_or("TeaLiveSubtitle.Prop.ApplyConnection", "Apply connection settings"),
+				   tea_apply_connection_clicked, data);
 
 	/* --- text appearance (text_ft2's own settings, described as they behave) --- */
 	obs_properties_add_font(props, "font", obs_module_text("TeaLiveSubtitle.Prop.Font"));
