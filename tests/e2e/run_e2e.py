@@ -159,9 +159,10 @@ class Checker:
 
 def run_driver(driver: Path, port: int, token: Path, duration_ms: int, work: Path, *,
                host: str = "127.0.0.1", clients: int = 1, audio: str = "speech",
-               restart_at_ms: int | None = None, during=None) -> list[dict]:
+               restart_at_ms: int | None = None, during=None, stable: str = "on") -> list[dict]:
     cmd = [str(driver), "--host", host, "--port", str(port), "--token", str(token),
-           "--clients", str(clients), "--duration-ms", str(duration_ms), "--audio", audio]
+           "--clients", str(clients), "--duration-ms", str(duration_ms), "--audio", audio,
+           "--stable", stable]
     if restart_at_ms is not None:
         cmd += ["--restart-at-ms", str(restart_at_ms)]
     with (work / "driver.stderr").open("a") as err:
@@ -196,7 +197,9 @@ def gaps(times: list[float]) -> list[float]:
 def sc_happy(ctx) -> Checker:
     c = Checker("happy_revisable")
     srv = ctx.server(["--revisable"])
-    run = ctx.drive(srv, srv.token_file, 12000)
+    # The legacy partial-replace path (stable captions setting off); the
+    # stable path has its own scenarios below.
+    run = ctx.drive(srv, srv.token_file, 12000, stable="off")
     caps = [r for r in run.requests if r["event"] == "http" and r["path"] == "/v1/capabilities"]
     ws = [r for r in run.requests if r["event"] in ("ws_accept", "ws_reject")]
     c.check(bool(caps) and all(r["has_auth"] for r in caps) and caps[0]["status"] == 200,
@@ -393,6 +396,180 @@ def sc_no_audio_source(ctx) -> Checker:
     return c, run
 
 
+# ------------------------------------------------------------ stable captions
+
+
+GUESSES = "嗯啊"  # fake_asr_server.py --growing-text trailing guess characters
+
+
+DRIVER_MAX_LINES = 3  # driver.cpp: tea_caption_state_set_max_lines(..., 3)
+
+
+def caption_rewrites(lines: list[dict]) -> list[tuple[str, str]]:
+    """Consecutive caption snapshots where shown text was changed or removed.
+
+    Allowed between two snapshots (20 ms apart): every shown line keeps its
+    text and may only grow at its end, new lines appear at the bottom, and
+    once the window is full the top line may scroll off (one per snapshot).
+    Anything else -- a character replaced, a line shortened or removed, the
+    canvas cleared -- is a rewrite, i.e. visible flicker.
+    """
+    bad = []
+    prev: list[str] = []
+    for l in lines:
+        cur = l["caption"].split("\n") if l["caption"] else []
+        scrolls = [0, 1] if len(prev) >= DRIVER_MAX_LINES else [0]
+        ok = len(cur) >= len(prev) and any(
+            all(i < len(cur) and cur[i].startswith(p) for i, p in enumerate(prev[k:])) for k in scrolls)
+        if not ok:
+            bad.append(("\n".join(prev), l["caption"]))
+        prev = cur
+    return bad
+
+
+def partial_rewrites(requests: list[dict]) -> int:
+    """Server-side: partials that did not extend the previous partial of their segment."""
+    last: dict[str, str] = {}
+    n = 0
+    for r in requests:
+        if r["event"] == "ws_partial":
+            old = last.get(r["segment_id"])
+            if old is not None and not r["text"].startswith(old):
+                n += 1
+            last[r["segment_id"]] = r["text"]
+    return n
+
+
+def done_mismatches(run: Run) -> list:
+    return next((l.get("stable_mismatches") for l in run.lines if l.get("event") == "done"), None)
+
+
+def sc_stable_append_only(ctx) -> Checker:
+    c = Checker("stable_append_only")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    run = ctx.drive(srv, srv.token_file, 14000)
+    starts = [r for r in run.requests if r["event"] == "ws_session_start"]
+    c.check(bool(starts) and starts[0]["transcript_mode"] == "revisable" and starts[0]["stable"] == {"agreement": 2},
+            f"session.start asked for revisable + stable agreement 2: {[(r['transcript_mode'], r['stable']) for r in starts]}")
+    stables = [r for r in run.requests if r["event"] == "ws_stable"]
+    states = [r["state"] for r in stables]
+    c.check(states.count("open") >= 2 and "final" in states,
+            f"server sent transcript.stable open + closing events ({len(stables)}: {sorted(set(states))})")
+    grew = {}
+    for r in stables:
+        grew.setdefault(r["segment_id"], []).append(r["text"])
+    c.check(any(len(set(v)) >= 3 for v in grew.values()),
+            f"committed text grew over several stable events within a segment "
+            f"(max distinct per segment {max((len(set(v)) for v in grew.values()), default=0)})")
+    pr = partial_rewrites(run.requests)
+    c.check(pr > 0, f"the fixture's partials really rewrite characters ({pr} rewriting partials)")
+    caps = run.captions()
+    c.check(any(l["caption"] for l in caps), f"captions rendered ({len(caps)} snapshots)")
+    bad = caption_rewrites(caps)
+    c.check(not bad, f"rendered captions only ever append (rewrites: {bad[:3]})")
+    committed = {r["text"] for r in stables} | {r["text"] for r in run.requests if r["event"] == "ws_final"}
+    shown = {line for l in caps for line in l["caption"].split("\n") if line}
+    stray = sorted(shown - committed)
+    c.check(not stray, f"every rendered line is committed stable/final text, never a partial tail ({stray[:3]})")
+    c.check(any("🍵" in l["caption"] for l in caps), "a 4-byte emoji tail was appended and rendered")
+    c.check(run.any_status("stable captions"), "Tools status reports stable captions active")
+    c.check(done_mismatches(run) == [0], f"no non-append stable values ({done_mismatches(run)})")
+    c.check(all("session" not in l["caption"] and "connect" not in l["caption"] for l in caps),
+            "diagnostics never enter the caption text")
+
+    # Same server and audio with the setting off: the legacy partial preview
+    # does rewrite shown text, so the append-only check above is meaningful.
+    legacy = ctx.drive(srv, srv.token_file, 9000, stable="off")
+    new_starts = [r for r in legacy.requests if r["event"] == "ws_session_start"][len(starts):]
+    c.check(bool(new_starts) and all(r["stable"] is None for r in new_starts),
+            f"setting off: session.start carries no stable ({[r['stable'] for r in new_starts]})")
+    legacy_bad = caption_rewrites(legacy.captions())
+    c.check(bool(legacy_bad), f"setting off: partial previews rewrite shown text ({len(legacy_bad)} rewrites)")
+    run.notes.append(f"stable events={len(stables)} partial rewrites={pr} legacy caption rewrites={len(legacy_bad)}")
+    return c, run
+
+
+def sc_stable_fallback_no_capability(ctx) -> Checker:
+    c = Checker("stable_fallback_no_capability")
+    srv = ctx.server(["--revisable", "--growing-text", "--hide-stable-capability"])
+    run = ctx.drive(srv, srv.token_file, 10000)  # setting on (default)
+    starts = [r for r in run.requests if r["event"] == "ws_session_start"]
+    c.check(bool(starts) and all(r["transcript_mode"] == "revisable" and r["stable"] is None for r in starts),
+            f"no stable requested when the server does not advertise it: {[(r['transcript_mode'], r['stable']) for r in starts]}")
+    c.check(not [r for r in run.requests if r["event"] == "ws_stable"], "no transcript.stable sent")
+    c.check(run.any_status("session active") and not run.any_status("stable captions"),
+            "connects normally, status does not claim stable captions")
+    caps = run.captions()
+    c.check(any(l["partial"] and l["caption"][-1:] in GUESSES for l in caps),
+            "falls back to the partial preview (unconfirmed tail shown, as before)")
+    c.check(any(not l["partial"] and l["caption"] for l in caps), "finals rendered")
+    c.check(bool(caption_rewrites(caps)), "legacy partial-replace behaviour is unchanged")
+    return c, run
+
+
+def sc_stable_rejected_downgrade(ctx) -> Checker:
+    c = Checker("stable_rejected_downgrade")
+    srv = ctx.server(["--revisable", "--reject-stable-field"])
+    run = ctx.drive(srv, srv.token_file, 12000)
+    starts = [r for r in run.requests if r["event"] == "ws_session_start"]
+    errs = [r for r in run.requests if r["event"] == "ws_error_event"]
+    c.check(bool(starts) and starts[0]["stable"] == {"agreement": 2},
+            "first session.start asks for stable (server advertises it)")
+    c.check(any(r["code"] == "protocol_error" for r in errs), f"server rejects it like an old server: {errs[:2]}")
+    c.check(len(starts) >= 2 and starts[1]["stable"] is None and starts[1]["transcript_mode"] == "revisable",
+            f"next attempt drops stable, keeps revisable: {[(r['transcript_mode'], r['stable']) for r in starts]}")
+    c.check(run.any_status("rejected stable captions"), "Tools status explains the downgrade (on the active session)")
+    c.check(run.any_status("session active") and not run.any_status("stopped"),
+            "still connects; the rejection is not fatal")
+    c.check(any(l["partial"] and "測試文字" in l["caption"] for l in run.captions()),
+            "partial previews rendered after the downgrade")
+    return c, run
+
+
+def sc_stable_reconnect_hold(ctx) -> Checker:
+    c = Checker("stable_reconnect_hold")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    marks: dict[str, float] = {}
+    t0 = time.monotonic()
+
+    def outages():
+        time.sleep(7)
+        marks["stop1"] = (time.monotonic() - t0) * 1000
+        srv.stop()
+        time.sleep(3)
+        srv.start()
+        marks["start1"] = (time.monotonic() - t0) * 1000
+        time.sleep(8)
+        marks["stop2"] = (time.monotonic() - t0) * 1000
+        srv.stop()
+        time.sleep(14)
+        srv.start()
+        marks["start2"] = (time.monotonic() - t0) * 1000
+
+    # Reconnect backoff has grown to ~16 s by the second outage: leave room.
+    run = ctx.drive(srv, srv.token_file, 55000, during=outages)
+    caps = run.captions()
+    active = [t for t, s in run.statuses() if "session active" in s]
+    c.check(len([t for t in active if t > marks["start1"] - 500]) >= 1 and active[0] < marks["stop1"],
+            f"session active before and after the short outage (at {active} ms, marks={marks})")
+    first_text = next((l["t"] for l in caps if l["caption"]), None)
+    short_window = [l for l in caps if first_text is not None and first_text <= l["t"] < marks["stop2"] + 8000]
+    blanks = [l["t"] for l in short_window if not l["caption"]]
+    c.check(first_text is not None and first_text < marks["stop1"] and not blanks,
+            f"a 3 s outage never blanks the caption (first text {first_text} ms, blanks at {blanks})")
+    bad = caption_rewrites(short_window)
+    c.check(not bad, f"across the reconnect the caption only appends/scrolls ({bad[:2]})")
+    held = [l for l in caps if marks["stop1"] < l["t"] < marks["start1"]]
+    before = [l for l in caps if l["t"] <= marks["stop1"]]
+    c.check(not held or (before and held[-1]["caption"]),
+            "during the outage the last committed text stays on screen")
+    cleared = [l["t"] for l in caps if not l["caption"] and marks["stop2"] + 8000 <= l["t"] <= marks["stop2"] + 14000]
+    c.check(bool(cleared), f"a long outage clears the frozen caption after ~10 s (cleared at {cleared}, "
+                           f"server stopped at {round(marks['stop2'])} ms)")
+    c.check(any(l["caption"] for l in caps if l["t"] > marks["start2"]), "captions come back after the long outage")
+    return c, run
+
+
 SCENARIOS = {
     "happy": sc_happy,
     "final_only": sc_final_only,
@@ -407,6 +584,10 @@ SCENARIOS = {
     "concurrent": sc_concurrent_limit,
     "bad_token": sc_bad_token,
     "rate_limited": sc_rate_limited,
+    "stable": sc_stable_append_only,
+    "stable_fallback": sc_stable_fallback_no_capability,
+    "stable_rejected": sc_stable_rejected_downgrade,
+    "stable_hold": sc_stable_reconnect_hold,
 }
 
 

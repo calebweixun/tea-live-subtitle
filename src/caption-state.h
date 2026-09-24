@@ -31,6 +31,25 @@ void tea_caption_state_set_max_lines(tea_caption_state_t *state, int total_lines
  * session is still alive. */
 void tea_caption_state_reset(tea_caption_state_t *state);
 
+/* Connection lost, but keep what is on screen: drops any unconfirmed
+ * preview, freezes every line (no segment of the old session may grow any
+ * more), forgets the old session's segment tracking, and lets the *next*
+ * session's text scroll in under the frozen lines instead of wiping them.
+ * Used in stable mode so a reconnect never blanks the canvas; the caller is
+ * responsible for calling tea_caption_state_reset() if the outage lasts too
+ * long for the frozen text to still be meaningful. */
+void tea_caption_state_hold_for_reconnect(tea_caption_state_t *state);
+
+/* Selects how the *next* session's events are shown (the caller sets this
+ * right before sending session.start):
+ *   false: legacy partial mode -- one preview line that transcript.partial
+ *          replaces wholesale, finals pushed below it.
+ *   true:  stable mode -- only committed transcript.stable text is shown,
+ *          stored per segment_id, append-only; transcript.partial is never
+ *          rendered. Any preview line is dropped when switching. */
+void tea_caption_state_set_stable_mode(tea_caption_state_t *state, bool enabled);
+bool tea_caption_state_stable_mode(tea_caption_state_t *state);
+
 /* transcript.partial: replaces the full text of segment_id, only if
  * revision is strictly greater than what we've already shown and the
  * segment has not already reached a terminal state. Ignored (not an error)
@@ -42,16 +61,48 @@ void tea_caption_state_on_partial(tea_caption_state_t *state, const char *sessio
 /* transcript.final: the segment's terminal, immutable text. Always wins
  * over any partial for the same segment_id regardless of revision
  * ordering glitches, and after this call further partials for that
- * segment_id are rejected. */
+ * segment_id are rejected.
+ *
+ * Stable mode: the final only ever *extends* the segment's line. If it does
+ * not start with the committed text already on screen, the line is left
+ * alone and the closing transcript.stable (state "diverged") that the server
+ * sends right after decides how it ends. */
 void tea_caption_state_on_final(tea_caption_state_t *state, const char *session_id, const char *segment_id,
 				uint64_t revision, const char *text);
 
+/* Same as tea_caption_state_on_final(), plus the segment_index so stable mode
+ * can keep lines in transcript order when a segment shows up late. */
+#define TEA_CAPTION_SEGMENT_INDEX_UNKNOWN UINT64_MAX
+void tea_caption_state_on_final_indexed(tea_caption_state_t *state, const char *session_id, const char *segment_id,
+					uint64_t segment_index, uint64_t revision, const char *text);
+
+/* transcript.stable (stable mode only; ignored otherwise). `text` is the
+ * segment's whole committed text; by contract it starts with the previous
+ * value byte-for-byte, so only the new tail is appended. Defensive rule: a
+ * value that does not start with what is already displayed never changes the
+ * displayed text -- it is dropped and counted (see
+ * tea_caption_state_stable_mismatches()). `stable_state` is "open", or one of
+ * "final" / "diverged" / "abandoned", which close the segment's line.
+ * Lines are kept per segment_id, so a later segment's stable text arriving
+ * before an earlier segment's final never touches the earlier line. */
+void tea_caption_state_on_stable(tea_caption_state_t *state, const char *session_id, const char *segment_id,
+				 uint64_t segment_index, uint64_t stable_revision, const char *text,
+				 const char *stable_state);
+
+/* Number of transcript.stable values dropped because they did not extend the
+ * displayed text (contract violation / old or buggy server). Cumulative for
+ * the lifetime of the state object; diagnostics only (Tools dialog). */
+uint64_t tea_caption_state_stable_mismatches(tea_caption_state_t *state);
+
 /* segment.skipped / segment.error: drop any preview for this segment
- * without ever having shown finalized text for it. */
+ * without ever having shown finalized text for it. In stable mode, committed
+ * text that is already on screen stays (it was promised never to change);
+ * the line simply stops growing. */
 void tea_caption_state_on_segment_dropped(tea_caption_state_t *state, const char *session_id, const char *segment_id);
 
 /* session.cancelled: clears all not-yet-final previews; finalized lines
- * already shown are left alone (they're already immutable text). */
+ * already shown are left alone (they're already immutable text). In stable
+ * mode committed lines are likewise kept and frozen. */
 void tea_caption_state_on_session_cancelled(tea_caption_state_t *state, const char *session_id);
 
 /* Returns a newly bfree()-able UTF-8 string containing transcript text only,
@@ -63,7 +114,8 @@ char *tea_caption_state_render(tea_caption_state_t *state);
 
 /* True while the last-rendered line is a partial (not yet final), so the
  * caller can render it with reduced opacity / a different color per
- * docs/08. */
+ * docs/08. In stable mode: the last line is committed text of a segment
+ * that may still grow (no closing transcript.stable yet). */
 bool tea_caption_state_last_line_is_partial(tea_caption_state_t *state);
 
 #ifdef __cplusplus

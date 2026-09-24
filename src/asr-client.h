@@ -73,6 +73,19 @@ uint64_t tea_asr_client_dropped_audio_frames(tea_asr_client_t *client);
 bool tea_asr_client_capabilities_known(tea_asr_client_t *client);
 bool tea_asr_client_supports_partial_transcripts(tea_asr_client_t *client);
 
+/* "Stable captions (append-only)" source setting, default on. When on and the
+ * server advertises capabilities.features.stable_transcripts, session.start
+ * asks for `"stable":{"agreement":2}` and the caption state only shows
+ * committed transcript.stable text. When the server does not offer it (or
+ * rejects the request), the client silently falls back to the legacy
+ * partial-replace preview; it never fails to connect because of it. Takes
+ * effect on the next tea_asr_client_start(). */
+void tea_asr_client_set_stable_captions(tea_asr_client_t *client, bool enabled);
+/* Only meaningful once capabilities are known. */
+bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *client);
+/* True while the current session was started with `stable`. */
+bool tea_asr_client_stable_captions_active(tea_asr_client_t *client);
+
 #ifdef __cplusplus
 }
 #endif

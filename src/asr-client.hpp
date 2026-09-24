@@ -69,6 +69,11 @@ public:
 	 * (docs/08 section 5). Safe to read from any thread. */
 	bool capabilitiesKnown() const;
 	bool supportsPartialTranscripts() const;
+	bool supportsStableTranscripts() const;
+	bool stableCaptionsActive() const;
+
+	/* Takes effect on the next start(). */
+	void setStableCaptions(bool enabled);
 
 public slots:
 	void doStart();
@@ -83,6 +88,7 @@ private slots:
 	void onReconnectTimer();
 	void onWatchTimer();
 	void onCapabilitiesReply();
+	void onStaleCaptionTimer();
 
 private:
 	/* --- setup / lifecycle --- */
@@ -98,6 +104,10 @@ private:
 	void failAttempt();
 	void scheduleReconnect();
 	void setStatus(const QString &text);
+	/* Transport gone: in stable mode keep the committed text on screen
+	 * (frozen) and arm the stale-caption timer; otherwise clear as before
+	 * when `clearOtherwise`. */
+	void holdOrClearCaptions(bool clearOtherwise);
 	qint64 nowMs() const { return monotonic_.elapsed(); }
 
 	/* --- HTTP preflight: authenticated GET /v1/capabilities --- */
@@ -181,6 +191,22 @@ private:
 	 * this client's own worker thread in onCapabilitiesReply(). */
 	std::atomic<bool> capabilitiesKnown_{false};
 	std::atomic<bool> serverSupportsPartial_{false};
+	std::atomic<bool> serverSupportsStable_{false};
+
+	/* Stable captions (transcript.stable). stablePreferred_ is the source
+	 * setting; stableRejected_ is set when a server that advertised the
+	 * feature still rejected the `stable` field, so the next attempt falls
+	 * back to partial instead of failing forever (cleared by an explicit
+	 * restart). stableRequested_ describes the session.start just sent. */
+	std::atomic<bool> stablePreferred_{true};
+	bool stableRejected_ = false;
+	bool stableRequested_ = false;
+	std::atomic<bool> stableActive_{false};
+	bool stableMismatchLogged_ = false;
+	/* A held (frozen) caption is cleared if no new session starts within
+	 * this long: past that it no longer describes anything live. */
+	static const int kStaleCaptionMs = 10000;
+	QTimer *staleCaptionTimer_ = nullptr;
 
 	bool helloReceived_ = false;
 	bool sessionStartSent_ = false;

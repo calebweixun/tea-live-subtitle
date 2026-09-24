@@ -80,6 +80,7 @@ struct tea_captions_source {
 	char *applied_server_host;
 	int applied_server_port;
 	char *applied_token_path;
+	int applied_stable_captions; /* -1 = never applied, else 0/1 */
 
 	/* Cache of the last string pushed into the child text source, so
 	 * video_tick() only calls obs_source_update() when the composed
@@ -135,6 +136,10 @@ void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *i
 			.connected = tea_asr_client_is_connected(ctx->client),
 			.capabilities_known = tea_asr_client_capabilities_known(ctx->client),
 			.supports_partial_transcripts = tea_asr_client_supports_partial_transcripts(ctx->client),
+			.supports_stable_transcripts = tea_asr_client_supports_stable_transcripts(ctx->client),
+			.stable_captions_enabled = ctx->applied_stable_captions != 0,
+			.stable_captions_active = tea_asr_client_stable_captions_active(ctx->client),
+			.stable_mismatches = ctx->captions ? tea_caption_state_stable_mismatches(ctx->captions) : 0,
 		};
 		cb(&info, user);
 		bfree(status_text);
@@ -173,6 +178,14 @@ static const char *tea_captions_source_get_name(void *type_data)
 	return obs_module_text("TeaLiveSubtitle.SourceName");
 }
 
+/* obs_module_text() returns the key itself when a locale has no entry for it.
+ * Fall back to a readable built-in label instead of showing the raw key. */
+static const char *tea_text_or(const char *key, const char *fallback)
+{
+	const char *text = obs_module_text(key);
+	return (text && strcmp(text, key) != 0) ? text : fallback;
+}
+
 static bool tea_str_eq(const char *a, const char *b)
 {
 	if (!a || !b)
@@ -209,11 +222,12 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	const char *server_host = obs_data_get_string(settings, "server_host");
 	int server_port = (int)obs_data_get_int(settings, "server_port");
 	const char *token_path = obs_data_get_string(settings, "token_path");
+	const int stable_captions = obs_data_get_bool(settings, "stable_captions") ? 1 : 0;
 
 	bool audio_changed = !tea_str_eq(ctx->applied_audio_source_name, audio_source_name);
-	bool server_changed = !tea_str_eq(ctx->applied_server_host, server_host) ||
-			      ctx->applied_server_port != server_port ||
-			      !tea_str_eq(ctx->applied_token_path, token_path);
+	bool server_changed =
+		!tea_str_eq(ctx->applied_server_host, server_host) || ctx->applied_server_port != server_port ||
+		!tea_str_eq(ctx->applied_token_path, token_path) || ctx->applied_stable_captions != stable_captions;
 
 	if (audio_changed && ctx->tap) {
 		obs_source_t *audio_src =
@@ -229,6 +243,8 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	if (server_changed && ctx->client) {
 		tea_asr_client_set_server(ctx->client, server_host, server_port);
 		tea_asr_client_set_token_path(ctx->client, token_path);
+		/* session.start carries `stable`, so a toggle needs a new session. */
+		tea_asr_client_set_stable_captions(ctx->client, stable_captions != 0);
 		tea_asr_client_start(ctx->client); /* idempotent restart with the new settings */
 
 		bfree(ctx->applied_server_host);
@@ -236,6 +252,7 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 		ctx->applied_server_port = server_port;
 		bfree(ctx->applied_token_path);
 		ctx->applied_token_path = bstrdup(token_path);
+		ctx->applied_stable_captions = stable_captions;
 	}
 
 	if (!ctx->text_source)
@@ -272,6 +289,7 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	struct tea_captions_source *ctx = bzalloc(sizeof(struct tea_captions_source));
 	ctx->source = source;
 	ctx->applied_server_port = -1;
+	ctx->applied_stable_captions = -1;
 
 	ctx->text_source = tea_create_text_child();
 	if (!ctx->text_source) {
@@ -350,6 +368,9 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "server_host", "127.0.0.1");
 	obs_data_set_default_int(settings, "server_port", 8327);
 	obs_data_set_default_string(settings, "token_path", "");
+	/* Append-only captions (transcript.stable) are what live subtitles need:
+	 * on by default, silently unused when the server does not offer them. */
+	obs_data_set_default_bool(settings, "stable_captions", true);
 
 	obs_data_t *font_obj = obs_data_create();
 	obs_data_set_default_string(font_obj, "face", TEA_DEFAULT_FONT_FACE);
@@ -393,6 +414,14 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 	obs_properties_add_int(props, "server_port", obs_module_text("TeaLiveSubtitle.Prop.ServerPort"), 1, 65535, 1);
 	obs_properties_add_text(props, "token_path", obs_module_text("TeaLiveSubtitle.Prop.TokenPath"),
 				OBS_TEXT_DEFAULT);
+	obs_property_t *stable_prop = obs_properties_add_bool(
+		props, "stable_captions",
+		tea_text_or("TeaLiveSubtitle.Prop.StableCaptions", "Stable captions (append-only, no rewrites)"));
+	obs_property_set_long_description(
+		stable_prop, tea_text_or("TeaLiveSubtitle.Prop.StableCaptions.Tooltip",
+					 "Show only text the server has committed (transcript.stable), so shown "
+					 "characters are never rewritten. Off: show the live partial preview, which "
+					 "may change. Used only when the server supports it."));
 
 	/* text_ft2_source's own appearance settings, exposed as-is. */
 	obs_properties_add_font(props, "font", obs_module_text("TeaLiveSubtitle.Prop.Font"));

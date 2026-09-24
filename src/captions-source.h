@@ -23,6 +23,10 @@ typedef struct {
 	bool connected;
 	bool capabilities_known;
 	bool supports_partial_transcripts; /* only meaningful if capabilities_known */
+	bool supports_stable_transcripts;  /* only meaningful if capabilities_known */
+	bool stable_captions_enabled;      /* the source's "stable captions" setting */
+	bool stable_captions_active;       /* current session was started with `stable` */
+	uint64_t stable_mismatches;        /* transcript.stable values dropped as non-append */
 } tea_captions_source_info_t;
 
 /* Calls `cb` once per currently-live tea_live_subtitle_source instance, in
