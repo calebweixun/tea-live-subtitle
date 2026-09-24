@@ -162,6 +162,44 @@ bool TeaAsrClient::supportsPartialTranscripts() const
 	return serverSupportsPartial_.load(std::memory_order_relaxed);
 }
 
+bool TeaAsrClient::supportsStableTranscripts() const
+{
+	return serverSupportsStable_.load(std::memory_order_relaxed);
+}
+
+bool TeaAsrClient::stableCaptionsActive() const
+{
+	return stableActive_.load(std::memory_order_relaxed);
+}
+
+void TeaAsrClient::setStableCaptions(bool enabled)
+{
+	stablePreferred_ = enabled;
+}
+
+void TeaAsrClient::holdOrClearCaptions(bool clearOtherwise)
+{
+	if (!captions_)
+		return;
+	if (!stablePreferred_) {
+		if (clearOtherwise)
+			tea_caption_state_reset(captions_);
+		return;
+	}
+	/* A reconnect must not blank a live caption: keep the committed text
+	 * frozen until the next session's text scrolls in under it, but not
+	 * forever -- see kStaleCaptionMs. */
+	tea_caption_state_hold_for_reconnect(captions_);
+	if (staleCaptionTimer_ && !staleCaptionTimer_->isActive())
+		staleCaptionTimer_->start(kStaleCaptionMs);
+}
+
+void TeaAsrClient::onStaleCaptionTimer()
+{
+	if (captions_ && !sessionStarted_)
+		tea_caption_state_reset(captions_);
+}
+
 void TeaAsrClient::setStatus(const QString &text)
 {
 	{
@@ -180,6 +218,9 @@ void TeaAsrClient::resetProtocolStateLocked()
 	sessionStartSent_ = false;
 	sessionStarted_ = false;
 	sessionId_.clear();
+	stableRequested_ = false;
+	stableActive_ = false;
+	stableMismatchLogged_ = false;
 	nextSeq_ = 0;
 	nextSample_ = 0;
 	sendUntilSample_ = 0;
@@ -203,12 +244,17 @@ void TeaAsrClient::doStart()
 		reconnectTimer_->stop();
 	if (watchTimer_)
 		watchTimer_->stop();
+	if (staleCaptionTimer_)
+		staleCaptionTimer_->stop();
 	teardownSocket(true);
 	if (captions_)
 		tea_caption_state_reset(captions_);
 
 	errorPolicy_.reset();
 	backoff_.reset();
+	/* Settings change / "Reconnect All": ask for stable captions again even
+	 * if a previous server rejected them. */
+	stableRejected_ = false;
 
 	if (!pumpTimer_) {
 		pumpTimer_ = new QTimer(this);
@@ -226,6 +272,11 @@ void TeaAsrClient::doStart()
 		watchTimer_ = new QTimer(this);
 		connect(watchTimer_, &QTimer::timeout, this, &TeaAsrClient::onWatchTimer);
 	}
+	if (!staleCaptionTimer_) {
+		staleCaptionTimer_ = new QTimer(this);
+		staleCaptionTimer_->setSingleShot(true);
+		connect(staleCaptionTimer_, &QTimer::timeout, this, &TeaAsrClient::onStaleCaptionTimer);
+	}
 
 	beginAttempt();
 }
@@ -239,6 +290,8 @@ void TeaAsrClient::doStop()
 		watchTimer_->stop();
 	if (pumpTimer_)
 		pumpTimer_->stop();
+	if (staleCaptionTimer_)
+		staleCaptionTimer_->stop();
 	waitMode_ = WaitMode::None;
 	attemptGen_++; /* orphan any in-flight preflight reply */
 
@@ -274,6 +327,7 @@ void TeaAsrClient::beginAttempt()
 	teardownSocket(false);
 	errorPolicy_.beginAttempt();
 	capabilitiesKnown_ = false;
+	serverSupportsStable_ = false;
 	waitMode_ = WaitMode::None;
 	if (watchTimer_)
 		watchTimer_->stop();
@@ -307,6 +361,7 @@ void TeaAsrClient::beginAttempt()
 
 void TeaAsrClient::failAttempt()
 {
+	holdOrClearCaptions(false);
 	teardownSocket(false);
 	scheduleReconnect();
 }
@@ -456,6 +511,9 @@ void TeaAsrClient::onCapabilitiesReply()
 	QJsonObject features = obj.value(QStringLiteral("features")).toObject();
 	QJsonObject limits = obj.value(QStringLiteral("limits")).toObject();
 	serverSupportsPartial_ = features.value(QStringLiteral("partial_transcripts")).toBool(false);
+	/* Optional field: absent (older server, or revisable preview off) means
+	 * no transcript.stable, and the client stays on partial/final. */
+	serverSupportsStable_ = features.value(QStringLiteral("stable_transcripts")).toBool(false);
 	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
 	/* W9 LAN mode: every response carries this header. Surface it; the
 	 * bearer token is travelling in cleartext. */
@@ -864,9 +922,18 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		sendUntilSample_ = (uint64_t)obj.value(QStringLiteral("send_until_sample")).toDouble(0);
 		sessionStartedMs_ = nowMs();
 		const QString mode = obj.value(QStringLiteral("transcript_mode")).toString();
+		stableActive_ = stableRequested_;
+		if (staleCaptionTimer_)
+			staleCaptionTimer_->stop();
 		QString status = QStringLiteral("session active");
-		if (!mode.isEmpty())
+		if (!mode.isEmpty() && stableRequested_)
+			status += QStringLiteral(" (%1, stable captions)").arg(mode);
+		else if (!mode.isEmpty())
 			status += QStringLiteral(" (%1)").arg(mode);
+		else if (stableRequested_)
+			status += QStringLiteral(" (stable captions)");
+		if (stableRejected_)
+			status += QStringLiteral(" -- server rejected stable captions, using partial previews");
 		if (insecureLan_)
 			status += QStringLiteral(
 				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
@@ -898,9 +965,40 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 	if (type == QLatin1String("transcript.final")) {
 		QString segId = obj.value(QStringLiteral("segment_id")).toString();
 		uint64_t rev = (uint64_t)obj.value(QStringLiteral("revision")).toDouble(1);
+		const QJsonValue index = obj.value(QStringLiteral("segment_index"));
+		uint64_t segIndex = index.isDouble() && index.toDouble() >= 0 ? (uint64_t)index.toDouble()
+									      : TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
 		QString text = obj.value(QStringLiteral("text")).toString();
-		tea_caption_state_on_final(captions_, sessionId_.toUtf8().constData(), segId.toUtf8().constData(), rev,
-					   text.toUtf8().constData());
+		tea_caption_state_on_final_indexed(captions_, sessionId_.toUtf8().constData(),
+						   segId.toUtf8().constData(), segIndex, rev,
+						   text.toUtf8().constData());
+		return;
+	}
+
+	if (type == QLatin1String("transcript.stable")) {
+		/* Display only (docs/04): transcripts/exports stay on
+		 * transcript.final. `text` is the segment's whole committed text. */
+		QString segId = obj.value(QStringLiteral("segment_id")).toString();
+		const QJsonValue index = obj.value(QStringLiteral("segment_index"));
+		uint64_t segIndex = index.isDouble() && index.toDouble() >= 0 ? (uint64_t)index.toDouble()
+									      : TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
+		uint64_t stableRev = (uint64_t)obj.value(QStringLiteral("stable_revision")).toDouble(0);
+		QString text = obj.value(QStringLiteral("text")).toString();
+		QString state = obj.value(QStringLiteral("state")).toString();
+		const uint64_t mismatchesBefore = tea_caption_state_stable_mismatches(captions_);
+		tea_caption_state_on_stable(captions_, sessionId_.toUtf8().constData(), segId.toUtf8().constData(),
+					    segIndex, stableRev, text.toUtf8().constData(), state.toUtf8().constData());
+		if (!stableMismatchLogged_ && tea_caption_state_stable_mismatches(captions_) != mismatchesBefore) {
+			/* Contract violation (old/buggy server): the displayed text was
+			 * kept unchanged. Logged once per session; the running count is
+			 * in the Tools dialog. Never log the transcript text itself. */
+			stableMismatchLogged_ = true;
+			obs_log(LOG_WARNING,
+				"asr-client: transcript.stable (segment_index=%lld stable_revision=%llu state=%s) "
+				"does not extend the displayed text; kept the displayed text unchanged",
+				(long long)(segIndex == TEA_CAPTION_SEGMENT_INDEX_UNKNOWN ? -1 : (long long)segIndex),
+				(unsigned long long)stableRev, state.toUtf8().constData());
+		}
 		return;
 	}
 
@@ -931,6 +1029,26 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		bool retryable = obj.value(QStringLiteral("retryable")).toBool(true);
 		obs_log(LOG_WARNING, "asr-client: server error code=%s retryable=%d", code.toUtf8().constData(),
 			retryable ? 1 : 0);
+
+		if (stableRequested_ && !sessionStarted_ &&
+		    (code == QLatin1String("unsupported_option") || code == QLatin1String("protocol_error"))) {
+			/* The server advertised stable_transcripts but refused the
+			 * `stable` field (an older build answers protocol_error, a
+			 * misconfigured one unsupported_option). Stable captions are an
+			 * optional extra: reconnect without them instead of treating the
+			 * rejection as fatal. If the retry fails the same way, the
+			 * regular (possibly fatal) handling below applies. */
+			stableRejected_ = true;
+			obs_log(LOG_WARNING,
+				"asr-client: server rejected stable captions (%s); "
+				"falling back to transcript.partial",
+				code.toUtf8().constData());
+			errorPolicy_.observeError(code.toStdString(), message.toStdString(), true);
+			setStatus(QStringLiteral(
+					  "server rejected stable captions (%1); reconnecting with partial previews")
+					  .arg(code));
+			return;
+		}
 
 		/* Trust the server's own `retryable` flag exclusively -- do not
 		 * hardcode any particular `code` (e.g. "session_limit") as fatal.
@@ -987,6 +1105,16 @@ void TeaAsrClient::sendSessionStart()
 	start.insert(QStringLiteral("durable"), false);
 	if (serverSupportsPartial_)
 		start.insert(QStringLiteral("transcript_mode"), QStringLiteral("revisable"));
+	/* `stable` requires transcript_mode=revisable (else unsupported_option),
+	 * and is only sent when the server advertises it. */
+	stableRequested_ = serverSupportsPartial_ && serverSupportsStable_ && stablePreferred_ && !stableRejected_;
+	if (stableRequested_) {
+		QJsonObject stable;
+		stable.insert(QStringLiteral("agreement"), 2);
+		start.insert(QStringLiteral("stable"), stable);
+	}
+	if (captions_)
+		tea_caption_state_set_stable_mode(captions_, stableRequested_);
 
 	sendTextFrame(QJsonDocument(start).toJson(QJsonDocument::Compact));
 }
@@ -1064,9 +1192,7 @@ void TeaAsrClient::pumpAudio()
 
 void TeaAsrClient::onSocketDisconnected()
 {
-	if (captions_) {
-		tea_caption_state_reset(captions_);
-	}
+	holdOrClearCaptions(true);
 
 	/* A session that ran for a while resets the backoff; one that failed
 	 * quickly (or ended by idle_timeout, i.e. no audio) keeps escalating it,
@@ -1163,4 +1289,20 @@ extern "C" bool tea_asr_client_capabilities_known(tea_asr_client_t *client)
 extern "C" bool tea_asr_client_supports_partial_transcripts(tea_asr_client_t *client)
 {
 	return client && client->impl->supportsPartialTranscripts();
+}
+
+extern "C" void tea_asr_client_set_stable_captions(tea_asr_client_t *client, bool enabled)
+{
+	if (client)
+		client->impl->setStableCaptions(enabled);
+}
+
+extern "C" bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *client)
+{
+	return client && client->impl->supportsStableTranscripts();
+}
+
+extern "C" bool tea_asr_client_stable_captions_active(tea_asr_client_t *client)
+{
+	return client && client->impl->stableCaptionsActive();
 }

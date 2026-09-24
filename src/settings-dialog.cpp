@@ -69,6 +69,19 @@ void tea_fill_row_cb(const tea_captions_source_info_t *info, void *user)
 		capabilities = QString::fromUtf8(obs_module_text(info->supports_partial_transcripts
 									 ? "TeaLiveSubtitle.Dialog.PartialYes"
 									 : "TeaLiveSubtitle.Dialog.PartialNo"));
+		/* Stable-caption diagnostics (errors/violations stay here, never on
+		 * the caption canvas). */
+		if (!info->stable_captions_enabled)
+			capabilities += QStringLiteral("; stable captions: off (setting)");
+		else if (info->stable_captions_active)
+			capabilities += QStringLiteral("; stable captions: on");
+		else if (!info->supports_stable_transcripts)
+			capabilities += QStringLiteral("; stable captions: not offered by server (using partial)");
+		else
+			capabilities += QStringLiteral("; stable captions: not active (using partial)");
+		if (info->stable_mismatches > 0)
+			capabilities += QStringLiteral("; non-append stable updates ignored: %1")
+						.arg((qulonglong)info->stable_mismatches);
 	}
 	table->setItem(row, 4, new QTableWidgetItem(capabilities));
 }

@@ -45,7 +45,8 @@ OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目�
 `FakeSupervisor`／`FakeVad`，不載入模型、不用 8327 port、不寫使用者的 `~/Library` 目錄），
 驗證握手、授權、partial／final，以及 Host 被拒、token revoke／rotate、`rate_limited`、
 連線上限（pre-accept 403）、`concurrent_session_limit`（4029）、`idle_timeout`（4408）、
-server 重啟與 70 秒心跳。這個建置只用 Qt，不需要 OBS SDK：
+server 重啟與 70 秒心跳，以及穩定字幕（`stable*` 情境：要求與收到 `transcript.stable`、畫面只增不改、
+server 不宣告或拒絕 `stable` 時退回 partial、斷線重連不清空畫面）。這個建置只用 Qt，不需要 OBS SDK：
 
 ```sh
 cmake -S tests/e2e -B /tmp/tea-e2e-build -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
@@ -64,6 +65,28 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   Host 被拒 60 秒。token 檔為空或不存在時完全不連線，檔案一變動就立刻重試。沒選音訊來源時不佔用
   server 連線名額。
 * 所有錯誤與斷線只出現在 Tools 對話框的狀態欄，不進字幕畫布。
+
+### 穩定字幕（只增不改，`transcript.stable`）
+
+來源屬性「穩定字幕（只增不改）」（設定鍵 `stable_captions`），**預設開啟**。契約以 server 的
+`docs/04-api.md`「只增不改的穩定字幕流」為準。
+
+* **要求**：preflight 的 `capabilities.features.stable_transcripts` 為 `true`（欄位不存在＝不支援）時，
+  `session.start` 送 `"transcript_mode":"revisable","stable":{"agreement":2}`。server 沒宣告就不送 `stable`，
+  直接用原本的 partial／final；宣告了卻在 `session.started` 前以 `protocol_error`／`unsupported_option` 拒絕時，
+  下一次連線自動拿掉 `stable` 改用 partial（不當成致命錯誤，Tools 狀態會寫明），按「全部重新連線」或改設定才會再試。
+* **顯示**：只顯示已提交的文字，未穩定的尾巴（`transcript.partial`）一律不上畫面——`text_ft2_source` 無法
+  只把半行做成不同樣式。每個 `segment_id` 各自一行、各自保存，下一段的 stable 比上一段的 final 早到也不會
+  互相覆蓋；行依 `segment_index` 排序。
+* **接尾巴**：`text` 是該段完整的已提交文字，外掛只把比畫面多出的 UTF-8 bytes 接上。收到不以畫面文字開頭的值
+  （違反契約，例如舊版或有 bug 的 server）時**不改字**、丟掉該值、在 OBS log 記一次，次數顯示在 Tools 對話框。
+* **收尾**：`transcript.final` 若延伸已提交文字就立刻接上；否則保留已提交文字，等緊接著的收尾 stable。
+  `final`／`diverged`／`abandoned` 是該段最後一則；`diverged` 保留已提交文字並接上 final 的尾巴，所以畫面可能與
+  final 不同——**逐字稿與存檔只認 `transcript.final`**，stable 只供顯示。`segment.skipped`／`segment.error`／
+  `session.cancelled` 不收回已顯示的字，只是該行不再增長。
+* **斷線重連**：穩定字幕開啟時，斷線不清空畫面；最後顯示的內容凍結，新 session 的字幕接在下面捲上來。
+  若 10 秒內沒有重新開始 session，就清空畫面，避免過期字幕假裝仍在直播。按「全部重新連線」或改設定仍會立即清空。
+* 關閉此選項時行為與先前相同：單一 preview 行由 `transcript.partial` 整段替換、final 推入上方、斷線即清空。
 
 ## 架構（規劃中，見交接規格）
 

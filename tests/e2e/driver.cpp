@@ -11,9 +11,13 @@
  *
  * Usage: asr-client-e2e --port N --token PATH [--host H] [--clients K]
  *                       [--duration-ms MS] [--audio speech|dead|none]
- *                       [--restart-at-ms MS]
+ *                       [--restart-at-ms MS] [--stable on|off]
+ *
+ * --stable mirrors the source's "stable captions" setting (plugin default on).
+ * The final {"event":"done"} line also carries "stable_mismatches" per client.
  */
 #include <QCoreApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QElapsedTimer>
@@ -63,6 +67,7 @@ int main(int argc, char **argv)
 	int durationMs = 10000;
 	int restartAtMs = -1;
 	std::string audio = "speech";
+	bool stable = true;
 
 	for (int i = 1; i < argc; i++) {
 		auto next = [&](const char *name) -> const char * {
@@ -86,6 +91,8 @@ int main(int argc, char **argv)
 			restartAtMs = std::atoi(next("--restart-at-ms"));
 		else if (!std::strcmp(argv[i], "--audio"))
 			audio = next("--audio");
+		else if (!std::strcmp(argv[i], "--stable"))
+			stable = std::strcmp(next("--stable"), "off") != 0;
 		else {
 			std::fprintf(stderr, "unknown argument %s\n", argv[i]);
 			return 2;
@@ -106,6 +113,7 @@ int main(int argc, char **argv)
 		s.client = tea_asr_client_create(s.tap, s.captions);
 		tea_asr_client_set_server(s.client, host.c_str(), port);
 		tea_asr_client_set_token_path(s.client, token.c_str());
+		tea_asr_client_set_stable_captions(s.client, stable);
 		tea_asr_client_start(s.client);
 	}
 
@@ -152,13 +160,18 @@ int main(int argc, char **argv)
 
 	QTimer::singleShot(durationMs, [&]() {
 		poll.stop();
+		QJsonArray mismatches;
+		for (auto &s : rigs)
+			mismatches.append((double)tea_caption_state_stable_mismatches(s.captions));
 		for (auto &s : rigs) {
 			tea_asr_client_stop(s.client);
 			tea_asr_client_destroy(s.client);
 			tea_caption_state_destroy(s.captions);
 			tea_audio_tap_destroy(s.tap);
 		}
-		emitLine(QJsonObject{{"t", (double)clock.elapsed()}, {"event", "done"}});
+		emitLine(QJsonObject{{"t", (double)clock.elapsed()},
+				     {"event", "done"},
+				     {"stable_mismatches", mismatches}});
 		app.quit();
 	});
 
