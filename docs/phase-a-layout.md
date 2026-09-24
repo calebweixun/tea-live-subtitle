@@ -1,5 +1,9 @@
 # Phase A｜字幕資料流與固定寬度
 
+> 更新：渲染已改為逐行（見 `phase-b-rendering.md`）。下文「native FreeType child 收到
+> `custom_width`／`word_wrap`」的做法已被取代——那正是對齊無效的原因。畫布只畫 transcript、
+> 寬度模式與舊 scene 遷移規則仍然有效。
+
 這份文件記錄 OBS plugin 第一階段的畫布契約。完整協定規格仍在
 `tea-asr-service/docs/08-obs-plugin.md`；本 repo 不修改 server repo。
 
