@@ -116,6 +116,12 @@ class Run:
     def captions(self, client: int = 0) -> list[dict]:
         return [l for l in self.lines if l.get("client") == client and "caption" in l]
 
+    def snapshots(self, client: int = 0) -> list[dict]:
+        return [l for l in self.lines if l.get("client") == client and "snapshot" in l]
+
+    def event_time(self, name: str) -> float | None:
+        return next((l["t"] for l in self.lines if l.get("event") == name), None)
+
     def any_status(self, needle: str, client: int = 0) -> bool:
         return any(needle in s for _, s in self.statuses(client))
 
@@ -159,10 +165,11 @@ class Checker:
 
 def run_driver(driver: Path, port: int, token: Path, duration_ms: int, work: Path, *,
                host: str = "127.0.0.1", clients: int = 1, audio: str = "speech",
-               restart_at_ms: int | None = None, during=None, stable: str = "on") -> list[dict]:
+               restart_at_ms: int | None = None, during=None, stable: str = "on",
+               extra_args: tuple[str, ...] = ()) -> list[dict]:
     cmd = [str(driver), "--host", host, "--port", str(port), "--token", str(token),
            "--clients", str(clients), "--duration-ms", str(duration_ms), "--audio", audio,
-           "--stable", stable]
+           "--stable", stable, *extra_args]
     if restart_at_ms is not None:
         cmd += ["--restart-at-ms", str(restart_at_ms)]
     with (work / "driver.stderr").open("a") as err:
@@ -570,6 +577,55 @@ def sc_stable_reconnect_hold(ctx) -> Checker:
     return c, run
 
 
+def sc_stable_tail_display_toggle(ctx) -> Checker:
+    """Unstable tail + display-only settings changed mid-session.
+
+    The OBS source turns "show not-yet-confirmed text" and the line count into
+    plain caption-state calls (no reconnect). The driver makes the same calls
+    5 s into a running session; the server must see exactly one session, and
+    the committed text of every line must still only ever grow.
+    """
+    c = Checker("stable_tail_display_toggle")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    run = ctx.drive(srv, srv.token_file, 14000, extra_args=("--tail", "off", "--toggle-display-at-ms", "5000"))
+    toggle = run.event_time("display_toggle")
+    starts = [r for r in run.requests if r["event"] == "ws_session_start"]
+    accepts = [r for r in run.requests if r["event"] == "ws_accept"]
+    c.check(toggle is not None, f"display settings were changed mid-session (at {toggle} ms)")
+    c.check(len(starts) == 1 and len(accepts) == 1,
+            f"one WebSocket and one session.start for the whole run, display change included "
+            f"(accepts={len(accepts)}, starts={len(starts)})")
+    c.check(bool(starts) and starts[0]["stable"] == {"agreement": 2}, "the session asked for stable captions")
+    snaps = run.snapshots()
+    before = [s for s in snaps if toggle is not None and s["t"] < toggle]
+    after = [s for s in snaps if toggle is not None and s["t"] >= toggle]
+    c.check(any(line["text"] for s in before for line in s["snapshot"]) and
+            all(line["tail"] is None for s in before for line in s["snapshot"]),
+            "before the toggle: committed text only, no tail")
+    tails = [line["tail"] for s in after for line in s["snapshot"] if line["tail"]]
+    c.check(bool(tails), f"after the toggle the not-yet-confirmed tail is shown ({len(tails)} tails)")
+    partials = {r["text"] for r in run.requests if r["event"] == "ws_partial"}
+    stray = sorted({line["text"] + line["tail"] for s in after for line in s["snapshot"] if line["tail"]} - partials)
+    c.check(not stray, f"every committed text + tail is exactly a partial the server sent ({stray[:3]})")
+    committed = {r["text"] for r in run.requests if r["event"] in ("ws_stable", "ws_final")} | {""}
+    bad_committed = sorted({line["text"] for s in snaps for line in s["snapshot"]} - committed)
+    c.check(not bad_committed, f"committed text is only ever stable/final text, never a partial ({bad_committed[:3]})")
+    rewrites = []
+    seen: dict[str, str] = {}
+    for s in snaps:
+        for line in s["snapshot"]:
+            old = seen.get(line["key"])
+            if old is not None and not line["text"].startswith(old):
+                rewrites.append((old, line["text"]))
+            seen[line["key"]] = line["text"]
+    c.check(not rewrites, f"per line, committed text only appends even while the tail changes ({rewrites[:2]})")
+    caps_before = [l for l in run.captions() if toggle is not None and l["t"] < toggle]
+    c.check(not caption_rewrites(caps_before), "rendered captions stay append-only")
+    c.check(done_mismatches(run) == [0], f"no non-append stable values ({done_mismatches(run)})")
+    run.notes.append(f"snapshots={len(snaps)} tails={len(tails)} partials={len(partials)}")
+    return c, run
+
+
 SCENARIOS = {
     "happy": sc_happy,
     "final_only": sc_final_only,
@@ -588,6 +644,7 @@ SCENARIOS = {
     "stable_fallback": sc_stable_fallback_no_capability,
     "stable_rejected": sc_stable_rejected_downgrade,
     "stable_hold": sc_stable_reconnect_hold,
+    "stable_tail": sc_stable_tail_display_toggle,
 }
 
 

@@ -62,7 +62,12 @@ typedef struct {
 	char *text; /* never NULL */
 	char segment_id[TEA_ID_BUF];
 	uint64_t order;
+	uint64_t key; /* display identity, see tea_caption_snapshot_line_t */
+	/* stable mode: newest transcript.partial of this segment (NULL if none).
+	 * Only ever used to report an unstable tail; never copied into `text`. */
+	char *partial;
 	bool open;
+	bool order_unknown; /* created before its segment_index was known */
 } tea_caption_line_t;
 
 struct tea_caption_state {
@@ -87,6 +92,11 @@ struct tea_caption_state {
 
 	char *preview_text; /* NULL when no open preview (partial mode only) */
 	char preview_segment_id[TEA_ID_BUF];
+	uint64_t preview_key;
+
+	uint64_t next_key;
+	uint64_t revision;
+	bool stable_tail_lines;
 };
 
 tea_caption_state_t *tea_caption_state_create(void)
@@ -97,11 +107,17 @@ tea_caption_state_t *tea_caption_state_create(void)
 	return st;
 }
 
+static uint64_t tea_new_key_locked(tea_caption_state_t *st)
+{
+	return ++st->next_key;
+}
+
 static void tea_drop_oldest_line_locked(tea_caption_state_t *st)
 {
 	if (st->line_count <= 0)
 		return;
 	bfree(st->lines[0].text);
+	bfree(st->lines[0].partial);
 	memmove(&st->lines[0], &st->lines[1], sizeof(tea_caption_line_t) * (size_t)(st->line_count - 1));
 	st->line_count--;
 	memset(&st->lines[st->line_count], 0, sizeof(tea_caption_line_t));
@@ -111,10 +127,20 @@ static void tea_clear_finalized_locked(tea_caption_state_t *st)
 {
 	for (int i = 0; i < st->line_count; i++) {
 		bfree(st->lines[i].text);
+		bfree(st->lines[i].partial);
 		st->lines[i].text = NULL;
+		st->lines[i].partial = NULL;
 	}
 	memset(st->lines, 0, sizeof(st->lines));
 	st->line_count = 0;
+}
+
+static void tea_clear_partial(tea_caption_line_t *line)
+{
+	if (!line)
+		return;
+	bfree(line->partial);
+	line->partial = NULL;
 }
 
 static void tea_clear_preview_locked(tea_caption_state_t *st)
@@ -122,6 +148,7 @@ static void tea_clear_preview_locked(tea_caption_state_t *st)
 	bfree(st->preview_text);
 	st->preview_text = NULL;
 	st->preview_segment_id[0] = '\0';
+	st->preview_key = 0;
 }
 
 void tea_caption_state_destroy(tea_caption_state_t *state)
@@ -151,6 +178,7 @@ void tea_caption_state_set_max_lines(tea_caption_state_t *state, int total_lines
 		total_lines = TEA_MAX_FINALIZED_LINES;
 
 	pthread_mutex_lock(&state->lock);
+	state->revision++;
 	state->total_lines = total_lines;
 	if (!state->stable_mode) {
 		int keep = tea_visible_lines_locked(state);
@@ -168,6 +196,7 @@ static void tea_reset_locked(tea_caption_state_t *st)
 	st->next_segment_slot = 0;
 	st->carry_over = false;
 	st->epoch++;
+	st->revision++;
 }
 
 void tea_caption_state_reset(tea_caption_state_t *state)
@@ -183,14 +212,17 @@ void tea_caption_state_hold_for_reconnect(tea_caption_state_t *state)
 {
 	pthread_mutex_lock(&state->lock);
 	tea_clear_preview_locked(state);
-	for (int i = 0; i < state->line_count; i++)
+	for (int i = 0; i < state->line_count; i++) {
 		state->lines[i].open = false;
+		tea_clear_partial(&state->lines[i]);
+	}
 	memset(state->segments, 0, sizeof(state->segments));
 	state->next_segment_slot = 0;
 	state->have_session = false;
 	state->current_session_id[0] = '\0';
 	state->carry_over = true;
 	state->epoch++;
+	state->revision++;
 	pthread_mutex_unlock(&state->lock);
 }
 
@@ -200,6 +232,7 @@ void tea_caption_state_set_stable_mode(tea_caption_state_t *state, bool enabled)
 	if (state->stable_mode != enabled) {
 		tea_clear_preview_locked(state);
 		state->stable_mode = enabled;
+		state->revision++;
 	}
 	pthread_mutex_unlock(&state->lock);
 }
@@ -260,7 +293,7 @@ static tea_segment_track_t *tea_track_segment_locked(tea_caption_state_t *st, co
 	return slot;
 }
 
-static void tea_push_finalized_locked(tea_caption_state_t *st, const char *text)
+static void tea_push_finalized_locked(tea_caption_state_t *st, const char *text, uint64_t key)
 {
 	int keep = tea_visible_lines_locked(st);
 	while (st->line_count >= keep || st->line_count >= TEA_MAX_FINALIZED_LINES)
@@ -269,6 +302,7 @@ static void tea_push_finalized_locked(tea_caption_state_t *st, const char *text)
 	memset(line, 0, sizeof(*line));
 	line->text = bstrdup(text ? text : "");
 	line->order = st->line_count > 1 ? st->lines[st->line_count - 2].order : 0;
+	line->key = key ? key : tea_new_key_locked(st);
 }
 
 /* ---------------- stable mode ---------------- */
@@ -318,9 +352,34 @@ static tea_caption_line_t *tea_stable_line_locked(tea_caption_state_t *st, tea_s
 	line->text = bstrdup("");
 	snprintf(line->segment_id, TEA_ID_BUF, "%s", seg->segment_id);
 	line->order = order;
+	line->order_unknown = segment_index == TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
+	line->key = tea_new_key_locked(st);
 	line->open = true;
 	seg->had_line = true;
 	return line;
+}
+
+/* Must hold state->lock. A line created from a partial (no segment_index on
+ * that event) is re-sorted once the segment_index is known. Such a line has
+ * no committed text yet, so moving it never moves shown committed text. */
+static tea_caption_line_t *tea_stable_fix_order_locked(tea_caption_state_t *st, tea_caption_line_t *line,
+						       uint64_t segment_index)
+{
+	if (!line || !line->order_unknown || segment_index == TEA_CAPTION_SEGMENT_INDEX_UNKNOWN)
+		return line;
+	tea_caption_line_t moved = *line;
+	moved.order = (st->epoch << TEA_ORDER_EPOCH_SHIFT) | (segment_index & TEA_ORDER_INDEX_MASK);
+	moved.order_unknown = false;
+	int idx = (int)(line - st->lines);
+	memmove(&st->lines[idx], &st->lines[idx + 1], sizeof(tea_caption_line_t) * (size_t)(st->line_count - idx - 1));
+	st->line_count--;
+	int pos = st->line_count;
+	while (pos > 0 && st->lines[pos - 1].order > moved.order)
+		pos--;
+	memmove(&st->lines[pos + 1], &st->lines[pos], sizeof(tea_caption_line_t) * (size_t)(st->line_count - pos));
+	st->lines[pos] = moved;
+	st->line_count++;
+	return &st->lines[pos];
 }
 
 /* Must hold state->lock. Only ever appends: `text` must start with the bytes
@@ -372,15 +431,19 @@ void tea_caption_state_on_stable(tea_caption_state_t *state, const char *session
 	seg->stable_revision = stable_revision;
 
 	tea_caption_line_t *line = tea_stable_line_locked(state, seg, segment_index);
+	line = tea_stable_fix_order_locked(state, line, segment_index);
 	if (line && !tea_stable_extend_locked(line, text))
 		state->stable_mismatches++;
 
 	if (tea_stable_state_is_closing(stable_state)) {
 		seg->stable_closed = true;
 		seg->terminal = true;
-		if (line)
+		if (line) {
 			line->open = false;
+			tea_clear_partial(line);
+		}
 	}
+	state->revision++;
 	pthread_mutex_unlock(&state->lock);
 }
 
@@ -412,16 +475,27 @@ void tea_caption_state_on_partial(tea_caption_state_t *state, const char *sessio
 	seg->revision = revision;
 
 	if (state->stable_mode) {
-		/* A partial may still rewrite any of its characters, and text_ft2
-		 * cannot style half a line differently: stable mode shows only
-		 * committed transcript.stable text. */
+		/* A partial may still rewrite any of its characters, so it never
+		 * becomes committed text. It is only remembered as the source of
+		 * the optional unstable tail (see tea_caption_state_snapshot()). */
+		tea_caption_line_t *line = seg->stable_closed ? NULL : tea_find_line_locked(state, segment_id);
+		if (!line && state->stable_tail_lines && !seg->stable_closed && !seg->had_line)
+			line = tea_stable_line_locked(state, seg, TEA_CAPTION_SEGMENT_INDEX_UNKNOWN);
+		if (line && line->open) {
+			bfree(line->partial);
+			line->partial = bstrdup(text ? text : "");
+			state->revision++;
+		}
 		pthread_mutex_unlock(&state->lock);
 		return;
 	}
 
+	if (!state->preview_text || strncmp(state->preview_segment_id, segment_id, TEA_ID_BUF) != 0)
+		state->preview_key = tea_new_key_locked(state);
 	bfree(state->preview_text);
 	state->preview_text = bstrdup(text ? text : "");
 	snprintf(state->preview_segment_id, TEA_ID_BUF, "%s", segment_id);
+	state->revision++;
 
 	pthread_mutex_unlock(&state->lock);
 }
@@ -454,16 +528,24 @@ void tea_caption_state_on_final_indexed(tea_caption_state_t *state, const char *
 		 * "diverged" stable append the final's tail. */
 		tea_caption_line_t *line = seg->stable_closed ? NULL
 							      : tea_stable_line_locked(state, seg, segment_index);
+		line = tea_stable_fix_order_locked(state, line, segment_index);
 		if (line && tea_stable_extend_locked(line, text))
 			line->open = false; /* line == final now */
+		/* The final supersedes every partial: the unstable tail ends here. */
+		tea_clear_partial(line ? line : tea_find_line_locked(state, segment_id));
+		state->revision++;
 		pthread_mutex_unlock(&state->lock);
 		return;
 	}
 
-	if (state->preview_text && strncmp(state->preview_segment_id, segment_id, TEA_ID_BUF) == 0)
+	uint64_t key = 0;
+	if (state->preview_text && strncmp(state->preview_segment_id, segment_id, TEA_ID_BUF) == 0) {
+		key = state->preview_key; /* the preview line turns into this final line */
 		tea_clear_preview_locked(state);
+	}
 
-	tea_push_finalized_locked(state, text);
+	tea_push_finalized_locked(state, text, key);
+	state->revision++;
 
 	pthread_mutex_unlock(&state->lock);
 }
@@ -492,12 +574,15 @@ void tea_caption_state_on_segment_dropped(tea_caption_state_t *state, const char
 		/* Committed text already on screen stays; the "abandoned" stable
 		 * that follows (if any) closes the line with that same text. */
 		tea_caption_line_t *line = tea_find_line_locked(state, segment_id);
-		if (line)
+		if (line) {
 			line->open = false;
+			tea_clear_partial(line);
+		}
 	}
 
 	if (state->preview_text && strncmp(state->preview_segment_id, segment_id, TEA_ID_BUF) == 0)
 		tea_clear_preview_locked(state);
+	state->revision++;
 	pthread_mutex_unlock(&state->lock);
 }
 
@@ -508,8 +593,11 @@ void tea_caption_state_on_session_cancelled(tea_caption_state_t *state, const ch
 	    strncmp(state->current_session_id, session_id, TEA_ID_BUF) == 0) {
 		tea_clear_preview_locked(state);
 		/* Nothing more is sent after a cancel: freeze committed lines. */
-		for (int i = 0; i < state->line_count; i++)
+		for (int i = 0; i < state->line_count; i++) {
 			state->lines[i].open = false;
+			tea_clear_partial(&state->lines[i]);
+		}
+		state->revision++;
 	}
 	pthread_mutex_unlock(&state->lock);
 }
@@ -588,4 +676,90 @@ bool tea_caption_state_last_line_is_partial(tea_caption_state_t *state)
 	}
 	pthread_mutex_unlock(&state->lock);
 	return result;
+}
+
+/* ---------------- snapshot ---------------- */
+
+uint64_t tea_caption_state_revision(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	uint64_t result = state->revision;
+	pthread_mutex_unlock(&state->lock);
+	return result;
+}
+
+void tea_caption_state_set_stable_tail_lines(tea_caption_state_t *state, bool enabled)
+{
+	pthread_mutex_lock(&state->lock);
+	if (state->stable_tail_lines != enabled) {
+		state->stable_tail_lines = enabled;
+		state->revision++;
+	}
+	pthread_mutex_unlock(&state->lock);
+}
+
+/* The bytes of `partial` after `committed`, or NULL when `partial` does not
+ * start with `committed` byte-for-byte or adds nothing. Both are complete
+ * UTF-8 strings, so the returned pointer is at a character boundary. */
+static const char *tea_unstable_tail(const char *committed, const char *partial)
+{
+	if (!committed || !partial)
+		return NULL;
+	size_t shown = strlen(committed);
+	size_t incoming = strlen(partial);
+	if (incoming <= shown || memcmp(partial, committed, shown) != 0)
+		return NULL;
+	return partial + shown;
+}
+
+void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, tea_caption_snapshot_t *out)
+{
+	memset(out, 0, sizeof(*out));
+	pthread_mutex_lock(&state->lock);
+	out->revision = state->revision;
+
+	/* Same selection as tea_caption_state_render(): the newest `want` lines
+	 * with committed text. Tail-only lines (no committed text yet) never
+	 * count against that budget, so showing a tail never pushes an older
+	 * committed line off the list (which would bring it back later). */
+	int want = tea_visible_lines_locked(state);
+	int first = state->line_count;
+	int shown = 0;
+	while (first > 0 && shown < want) {
+		first--;
+		if (!state->stable_mode || state->lines[first].text[0] != '\0')
+			shown++;
+	}
+	const int cap = TEA_CAPTION_SNAPSHOT_MAX_LINES - 1; /* room for the preview */
+	for (int i = first; i < state->line_count && out->count < cap; i++) {
+		const tea_caption_line_t *line = &state->lines[i];
+		const char *tail = (state->stable_mode && include_tail) ? tea_unstable_tail(line->text, line->partial)
+									: NULL;
+		if (state->stable_mode && line->text[0] == '\0' && !tail)
+			continue;
+		tea_caption_snapshot_line_t *dst = &out->lines[out->count++];
+		dst->key = line->key;
+		dst->text = bstrdup(line->text);
+		dst->tail = tail ? bstrdup(tail) : NULL;
+		dst->open = line->open;
+	}
+	if (!state->stable_mode && state->preview_text) {
+		tea_caption_snapshot_line_t *dst = &out->lines[out->count++];
+		dst->key = state->preview_key ? state->preview_key : UINT64_MAX;
+		dst->text = bstrdup(state->preview_text);
+		dst->tail = NULL;
+		dst->open = true;
+	}
+	pthread_mutex_unlock(&state->lock);
+}
+
+void tea_caption_snapshot_free(tea_caption_snapshot_t *snapshot)
+{
+	if (!snapshot)
+		return;
+	for (int i = 0; i < snapshot->count; i++) {
+		bfree(snapshot->lines[i].text);
+		bfree(snapshot->lines[i].tail);
+	}
+	memset(snapshot, 0, sizeof(*snapshot));
 }

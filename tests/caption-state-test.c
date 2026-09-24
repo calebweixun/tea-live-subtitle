@@ -249,6 +249,148 @@ static void test_stable_ignored_in_partial_mode(void)
 	tea_caption_state_destroy(st);
 }
 
+/* ---------------- per-line snapshot + unstable tail ---------------- */
+
+static const tea_caption_snapshot_line_t *snap_line(const tea_caption_snapshot_t *snap, int i)
+{
+	expect(i >= 0 && i < snap->count, "snapshot line index in range");
+	return &snap->lines[i];
+}
+
+static void expect_tail(tea_caption_state_t *st, const char *text, const char *tail, const char *message)
+{
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count >= 1, message);
+	const tea_caption_snapshot_line_t *last = snap_line(&snap, snap.count - 1);
+	expect(strcmp(last->text, text) == 0, message);
+	if (tail)
+		expect(last->tail && strcmp(last->tail, tail) == 0, message);
+	else
+		expect(last->tail == NULL, message);
+	tea_caption_snapshot_free(&snap);
+}
+
+static void test_snapshot_matches_render(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_max_lines(st, 3);
+	tea_caption_state_on_final(st, "s", "a", 1, "first");
+	tea_caption_state_on_partial(st, "s", "b", 1, "preview");
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 2, "partial mode: finals plus the preview");
+	expect(strcmp(snap_line(&snap, 0)->text, "first") == 0 && !snap_line(&snap, 0)->open, "final line first");
+	expect(strcmp(snap_line(&snap, 1)->text, "preview") == 0 && snap_line(&snap, 1)->open, "preview line last");
+	expect(snap_line(&snap, 1)->tail == NULL, "partial mode never reports a tail");
+	uint64_t preview_key = snap_line(&snap, 1)->key;
+	expect(preview_key != 0 && preview_key != snap_line(&snap, 0)->key, "lines have distinct keys");
+	tea_caption_snapshot_free(&snap);
+
+	uint64_t rev = tea_caption_state_revision(st);
+	tea_caption_state_on_partial(st, "s", "b", 2, "preview grows");
+	expect(tea_caption_state_revision(st) > rev, "a change bumps the revision");
+	tea_caption_state_on_final(st, "s", "b", 3, "preview grows final");
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 2 && snap_line(&snap, 1)->key == preview_key,
+	       "the final keeps the preview line's identity (no flash on screen)");
+	tea_caption_snapshot_free(&snap);
+	tea_caption_state_destroy(st);
+}
+
+static void test_unstable_tail(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "我們", "open");
+	tea_caption_state_on_partial(st, "s", "seg-a", 2, "我們需要");
+	expect_tail(st, "我們", "需要", "a partial extending the committed text shows its extra part as tail");
+	expect_render(st, "我們", "render() never shows the tail");
+
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, false, &snap);
+	expect(snap.count == 1 && snap_line(&snap, 0)->tail == NULL, "tail display off: no tail reported");
+	uint64_t key = snap_line(&snap, 0)->key;
+	tea_caption_snapshot_free(&snap);
+
+	tea_caption_state_on_partial(st, "s", "seg-a", 3, "你們需要改");
+	expect_tail(st, "我們", NULL, "a partial that does not start with the committed text shows no tail");
+	expect_render(st, "我們", "and never changes the committed text");
+
+	tea_caption_state_on_partial(st, "s", "seg-a", 4, "我們需要改");
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 2, "我們需", "open");
+	expect_tail(st, "我們需", "要改", "the tail shrinks as the committed text catches up");
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 3, "我們需要改", "open");
+	expect_tail(st, "我們需要改", NULL, "no tail once everything is committed");
+	tea_caption_state_on_partial(st, "s", "seg-a", 5, "我們需要改一");
+	expect_tail(st, "我們需要改", "一", "a later partial brings a new tail");
+
+	tea_caption_state_on_final(st, "s", "seg-a", 6, "我們需要改進");
+	expect_tail(st, "我們需要改進", NULL, "the final replaces the tail with committed text");
+	tea_caption_state_on_partial(st, "s", "seg-a", 7, "我們需要改進了");
+	expect_tail(st, "我們需要改進", NULL, "no tail after the final");
+
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap_line(&snap, 0)->key == key, "the line keeps its identity while it grows");
+	tea_caption_snapshot_free(&snap);
+
+	/* a closing stable (no final first) also ends the tail */
+	tea_caption_state_on_stable(st, "s", "seg-b", 1, 1, "下一句", "open");
+	tea_caption_state_on_partial(st, "s", "seg-b", 1, "下一句話");
+	expect_tail(st, "下一句", "話", "second segment shows its own tail");
+	tea_caption_state_on_stable(st, "s", "seg-b", 1, 2, "下一句", "diverged");
+	expect_tail(st, "下一句", NULL, "a closing stable ends the tail");
+
+	/* skipped / cancelled / reconnect end the tail too */
+	tea_caption_state_on_stable(st, "s", "seg-c", 2, 1, "第三", "open");
+	tea_caption_state_on_partial(st, "s", "seg-c", 1, "第三句");
+	tea_caption_state_on_segment_dropped(st, "s", "seg-c");
+	expect_tail(st, "第三", NULL, "a dropped segment keeps its committed text but loses the tail");
+	tea_caption_state_on_stable(st, "s", "seg-d", 3, 1, "第四", "open");
+	tea_caption_state_on_partial(st, "s", "seg-d", 1, "第四句");
+	tea_caption_state_hold_for_reconnect(st);
+	expect_tail(st, "第四", NULL, "a connection loss drops the tail, keeps the committed text");
+
+	expect(tea_caption_state_stable_mismatches(st) == 0, "tails never count as contract violations");
+	tea_caption_state_destroy(st);
+}
+
+static void test_tail_only_lines(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "第一句", "final");
+
+	tea_caption_state_on_partial(st, "s", "seg-b", 1, "還沒");
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 1, "without tail lines a segment needs committed text to get a line");
+	tea_caption_snapshot_free(&snap);
+
+	tea_caption_state_set_stable_tail_lines(st, true);
+	tea_caption_state_on_partial(st, "s", "seg-c", 1, "預覽");
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 2, "with tail lines the first partial gets its own line");
+	expect(strcmp(snap_line(&snap, 1)->text, "") == 0 && snap_line(&snap, 1)->tail &&
+		       strcmp(snap_line(&snap, 1)->tail, "預覽") == 0,
+	       "a tail-only line has no committed text");
+	uint64_t key = snap_line(&snap, 1)->key;
+	tea_caption_snapshot_free(&snap);
+	expect_render(st, "第一句", "render() still shows committed text only");
+	tea_caption_state_snapshot(st, false, &snap);
+	expect(snap.count == 1, "tail display off hides tail-only lines");
+	tea_caption_snapshot_free(&snap);
+
+	tea_caption_state_on_stable(st, "s", "seg-c", 2, 1, "預", "open");
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 2 && snap_line(&snap, 1)->key == key && strcmp(snap_line(&snap, 1)->text, "預") == 0 &&
+		       snap_line(&snap, 1)->tail && strcmp(snap_line(&snap, 1)->tail, "覽") == 0,
+	       "the first stable fills the same line");
+	tea_caption_snapshot_free(&snap);
+	tea_caption_state_destroy(st);
+}
+
 int main(void)
 {
 	tea_caption_state_t *state = tea_caption_state_create();
@@ -289,6 +431,9 @@ int main(void)
 	test_stable_utf8_tails();
 	test_stable_hold_for_reconnect();
 	test_stable_ignored_in_partial_mode();
+	test_snapshot_matches_render();
+	test_unstable_tail();
+	test_tail_only_lines();
 
 	puts("caption state tests passed");
 	return EXIT_SUCCESS;

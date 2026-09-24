@@ -26,4 +26,41 @@ assert "obs_data_has_user_value(settings, \"layout_mode\")" in source
 assert "tea_caption_layout_mode_from_settings" in source
 assert "obs_data_set_int(settings, TEA_LAYOUT_SCHEMA_KEY, TEA_LAYOUT_SCHEMA_VERSION);" in source
 
+
+# Per-line renderer: existing scenes keep the neutral defaults (no fades, no
+# pause breaks, no screen row limit, no background, no tail); only a brand-new
+# source gets the recommended values, behind its own schema marker.
+render_defaults = [
+    'obs_data_set_default_bool(settings, TEA_KEY_FADE_IN, false);',
+    'obs_data_set_default_bool(settings, TEA_KEY_FADE_OUT, false);',
+    'obs_data_set_default_int(settings, TEA_KEY_PAUSE_MS, TEA_DEFAULT_PAUSE_MS);',
+    'obs_data_set_default_int(settings, TEA_KEY_MAX_ROWS, 0);',
+    'obs_data_set_default_bool(settings, TEA_KEY_BG, false);',
+    'obs_data_set_default_bool(settings, TEA_KEY_TAIL, false);',
+]
+for line in render_defaults:
+    assert line in source, line
+assert "#define TEA_DEFAULT_PAUSE_MS 0" in source
+new_block = "if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_RENDER_SCHEMA_KEY)) {"
+assert new_block in source
+block = source[source.index(new_block):]
+block = block[: block.index("}")]
+assert "obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERSION);" in block
+assert "obs_data_set_bool(settings, TEA_KEY_FADE_OUT, true);" in block
+
+# Appearance never reconnects: the only calls that (re)start the ASR session
+# are the connection-policy path and the Tools dialog's "Reconnect All", and
+# the connection-relevant keys are read nowhere else.
+assert source.count("tea_asr_client_start(ctx->client)") == 2
+apply_fn = source[source.index("static void tea_apply_connection("):]
+apply_fn = apply_fn[: apply_fn.index("\n}\n")]
+assert "tea_connection_decide(" in apply_fn and "tea_asr_client_start(ctx->client)" in apply_fn
+update_fn = source[source.index("static void tea_captions_source_update("):]
+update_fn = update_fn[: update_fn.index("\n}\n")]
+assert "tea_asr_client_start" not in update_fn and "tea_asr_client_set_stable_captions" not in update_fn
+assert "tea_apply_connection(ctx, settings, false);" in update_fn
+for read in ('obs_data_get_string(settings, "server_host")', 'obs_data_get_int(settings, "server_port")',
+             'obs_data_get_string(settings, "token_path")', 'obs_data_get_bool(settings, "stable_captions")'):
+    assert source.count(read) == apply_fn.count(read) == 1, read
+
 print("layout migration checks passed")
