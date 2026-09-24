@@ -34,6 +34,37 @@ OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目�
 在 push 到 `master` 時會自動跑 macOS / Windows / Ubuntu 三個平台。用
 `gh run list --repo calebweixun/tea-live-subtitle` 追蹤結果。
 
+## 測試
+
+**CI（不需要 OBS）**：`.github/workflows/protocol-tests.yaml` 編譯並執行
+`tests/asr-client-policy-test.cpp`（錯誤分類與重連退避）、`caption-layout-test.cpp`、
+`caption-state-test.c` 與 `tests/*.py` 靜態契約檢查。
+
+**端到端（本機，需要 tea-asr-service checkout 與桌面版 Qt6）**：用外掛真正的
+`asr-client.cpp`＋`caption-state.c`，連到**目前版本**的 server app（server repo 的測試用
+`FakeSupervisor`／`FakeVad`，不載入模型、不用 8327 port、不寫使用者的 `~/Library` 目錄），
+驗證握手、授權、partial／final，以及 Host 被拒、token revoke／rotate、`rate_limited`、
+連線上限（pre-accept 403）、`concurrent_session_limit`（4029）、`idle_timeout`（4408）、
+server 重啟與 70 秒心跳。這個建置只用 Qt，不需要 OBS SDK：
+
+```sh
+cmake -S tests/e2e -B /tmp/tea-e2e-build -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+cmake --build /tmp/tea-e2e-build
+python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
+  --service-dir /path/to/tea-asr-service   # 全部約 8 分鐘；--only happy,bad_token 可挑選
+```
+
+## 與 server 的連線契約（外掛端）
+
+* 每次連線先做**帶 token** 的 `GET /v1/capabilities` preflight，成功才開 WebSocket。server 在
+  `accept()` 之前拒絕的 WS 連線（unauthenticated／rate_limited／forbidden_origin／session_limit）
+  在線上一律是沒有內容的 `HTTP 403`，只有 HTTP 回應分辨得出原因。
+* 退避：一般錯誤 1→2→4→8→16→30 秒（上限 30 秒、±10% jitter）；token 被拒 30／60 秒、最多 5 次後停止
+  （每個字幕來源每 60 秒最多 2 次認證失敗，低於 server 的 10 次）；`rate_limited` 等 65 秒；
+  Host 被拒 60 秒。token 檔為空或不存在時完全不連線，檔案一變動就立刻重試。沒選音訊來源時不佔用
+  server 連線名額。
+* 所有錯誤與斷線只出現在 Tools 對話框的狀態欄，不進字幕畫布。
+
 ## 架構（規劃中，見交接規格）
 
 ```
