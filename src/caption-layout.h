@@ -62,12 +62,13 @@ static inline int tea_caption_layout_mode_from_settings(int stored_mode, bool ha
 static inline tea_caption_layout_t tea_caption_layout_resolve(int mode, int fixed_width, int padding,
 							      uint32_t child_width)
 {
-	tea_caption_layout_t result = {
-		.mode = mode == TEA_LAYOUT_MODE_FIXED ? TEA_LAYOUT_MODE_FIXED : TEA_LAYOUT_MODE_AUTO,
-		.outer_width = 0,
-		.content_width = 0,
-		.force_word_wrap = false,
-	};
+	/* No designated initializers: this header is also compiled as C++
+	 * (asr-client.cpp), and MSVC needs /std:c++20 for them. */
+	tea_caption_layout_t result;
+	result.mode = mode == TEA_LAYOUT_MODE_FIXED ? TEA_LAYOUT_MODE_FIXED : TEA_LAYOUT_MODE_AUTO;
+	result.outer_width = 0;
+	result.content_width = 0;
+	result.force_word_wrap = false;
 
 	uint32_t safe_padding = (uint32_t)tea_caption_layout_clamp_padding(padding);
 	if (result.mode == TEA_LAYOUT_MODE_FIXED) {
