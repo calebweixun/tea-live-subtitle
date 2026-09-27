@@ -97,6 +97,33 @@ bool tea_asr_client_supports_segmentation(tea_asr_client_t *client, int *min_ms,
 /* The value the running session uses (session.started.preview_policy.endpoint_silence_ms), -1 if unknown. */
 int tea_asr_client_effective_end_silence_ms(tea_asr_client_t *client);
 
+/* ---- diagnostics: "why are there no captions?" (docs/diagnostics.md) ---- */
+
+#define TEA_CONN_STOPPED 0
+#define TEA_CONN_WAITING_AUDIO 1 /* no audio source selected */
+#define TEA_CONN_WAITING_TOKEN 2 /* token file missing / rejected */
+#define TEA_CONN_CONNECTING 3
+#define TEA_CONN_CONNECTED 4 /* WebSocket up, no session yet */
+#define TEA_CONN_ACTIVE 5    /* session running, audio flowing */
+#define TEA_CONN_RECONNECTING 6
+
+typedef struct {
+	int connection;        /* TEA_CONN_* */
+	int speech;            /* TEA_SPEECH_* (asr-diagnostics.h): 0 listening, 1 speech, 2 processing */
+	double input_dbfs;     /* RMS of the last ~0.5 s pulled from the audio source, -120 = silence */
+	bool input_recent;     /* audio arrived from the source in the last second */
+	int64_t ms_since_text; /* since the last partial / stable / final, -1 = none this session */
+} tea_asr_client_diag_t;
+
+/* Safe from any thread. */
+void tea_asr_client_get_diag(tea_asr_client_t *client, tea_asr_client_diag_t *out);
+
+/* "Record recognition events (debugging)": when `dir` is non-empty, every
+ * session writes its server events to <dir>/tea-trace-<time>-<session>.jsonl
+ * in the {"t_ms", "event"} format tests/replay reads (size-capped). NULL or ""
+ * turns it off. Takes effect on the next session. */
+void tea_asr_client_set_trace_dir(tea_asr_client_t *client, const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

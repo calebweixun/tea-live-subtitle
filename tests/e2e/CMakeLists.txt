@@ -32,3 +32,8 @@ target_link_libraries(asr-client-e2e PRIVATE Qt6::Core Qt6::Network)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(asr-client-e2e PRIVATE -Wall -Wextra)
 endif()
+
+# Offline replay tool (tests/replay), built here too so the e2e run can check
+# that an event trace written by the client is readable by it.
+add_executable(caption-replay "${TEA_REPO_ROOT}/tests/replay/caption-replay.cpp" "${TEA_REPO_ROOT}/src/caption-state.c")
+target_include_directories(caption-replay PRIVATE "${TEA_REPO_ROOT}/src" "${TEA_REPO_ROOT}/tests/stubs")

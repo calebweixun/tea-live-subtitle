@@ -662,25 +662,28 @@ static void test_frame_geometry()
 
 static void test_connection_policy()
 {
-	tea_connection_settings_t applied = {"127.0.0.1", 8327, "", true, 0};
-	tea_connection_settings_t same = {"127.0.0.1", 8327, nullptr, true, 0};
+	tea_connection_settings_t applied = {"127.0.0.1", 8327, "", true, 0, false};
+	tea_connection_settings_t same = {"127.0.0.1", 8327, nullptr, true, 0, false};
 	expect(tea_connection_decide(&applied, &same, true, true, false) == TEA_CONNECTION_KEEP,
 	       "an appearance-only update never reconnects, even while editing");
 	expect(tea_connection_decide(&applied, &same, true, false, true) == TEA_CONNECTION_KEEP,
 	       "Apply without connection changes does not reconnect");
-	tea_connection_settings_t typing = {"127.0.0.", 8327, "", true, 0};
+	tea_connection_settings_t typing = {"127.0.0.", 8327, "", true, 0, false};
 	expect(tea_connection_decide(&applied, &typing, true, true, false) == TEA_CONNECTION_DEFER,
 	       "a host being typed in the Properties window waits");
 	expect(tea_connection_decide(&applied, &typing, true, true, true) == TEA_CONNECTION_RECONNECT,
 	       "Apply / closing the window reconnects with the edited host");
 	expect(tea_connection_decide(&applied, &typing, true, false, false) == TEA_CONNECTION_RECONNECT,
 	       "a non-interactive update (undo, script) applies at once");
-	tea_connection_settings_t stable_off = {"127.0.0.1", 8327, "", false, 0};
+	tea_connection_settings_t stable_off = {"127.0.0.1", 8327, "", false, 0, false};
 	expect(tea_connection_decide(&applied, &stable_off, true, true, false) == TEA_CONNECTION_DEFER,
 	       "stable captions is a session.start field: treated as a connection setting");
-	tea_connection_settings_t silence = {"127.0.0.1", 8327, "", true, 870};
+	tea_connection_settings_t silence = {"127.0.0.1", 8327, "", true, 870, false};
 	expect(tea_connection_decide(&applied, &silence, true, true, false) == TEA_CONNECTION_DEFER,
 	       "the sentence break silence is a session.start field: a connection setting");
+	tea_connection_settings_t tracing = {"127.0.0.1", 8327, "", true, 0, true};
+	expect(tea_connection_decide(&applied, &tracing, true, true, false) == TEA_CONNECTION_DEFER,
+	       "the event trace applies per session: a connection setting");
 	expect(tea_connection_decide(&applied, &same, false, true, false) == TEA_CONNECTION_RECONNECT,
 	       "the first update of a new source connects");
 }

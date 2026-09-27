@@ -109,6 +109,10 @@ class Run:
     lines: list[dict]
     requests: list[dict]
     notes: list[str] = field(default_factory=list)
+    log: list[str] = field(default_factory=list)  # the client's obs_log lines (what OBS would log)
+
+    def log_lines(self, needle: str) -> list[str]:
+        return [l for l in self.log if needle in l]
 
     def statuses(self, client: int = 0) -> list[tuple[float, str]]:
         return [(l["t"], l["status"]) for l in self.lines if l.get("client") == client and "status" in l]
@@ -172,7 +176,9 @@ def run_driver(driver: Path, port: int, token: Path, duration_ms: int, work: Pat
            "--stable", stable, *extra_args]
     if restart_at_ms is not None:
         cmd += ["--restart-at-ms", str(restart_at_ms)]
-    with (work / "driver.stderr").open("a") as err:
+    log_path = work / "driver.stderr"
+    offset = log_path.stat().st_size if log_path.exists() else 0
+    with log_path.open("a") as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
         if during is not None:
             during()
@@ -184,7 +190,10 @@ def run_driver(driver: Path, port: int, token: Path, duration_ms: int, work: Pat
         except ValueError:
             pass
     (work / "driver.jsonl").write_text(out)
-    return lines
+    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(offset)
+        log = fh.read().splitlines()
+    return lines, log
 
 
 def max_in_window(times: list[float], window: float) -> int:
@@ -726,6 +735,133 @@ def sc_segmentation_real(ctx) -> Checker:
     return c, run
 
 
+# --------------------------------------------------------------------------- diagnostics
+
+HEARTBEAT = "asr-client: heartbeat"
+WARN_NO_AUDIO = "WARN no audio sent"
+WARN_QUIET = "WARN audio is being sent but has been below"
+WARN_NO_SPEECH = "server hears no speech"
+WARN_STALLED = "WARN sending audio but no event from the server"
+ALL_WARNS = (WARN_NO_AUDIO, WARN_QUIET, WARN_NO_SPEECH, WARN_STALLED)
+
+
+def warn_counts(run: Run) -> dict[str, int]:
+    return {w: len(run.log_lines(w)) for w in ALL_WARNS}
+
+
+def sc_diag_heartbeat(ctx) -> Checker:
+    """Normal speech: connection lines, one heartbeat per 10 s, no warnings,
+    and speech.started / segment.queued are no longer logged as unhandled."""
+    c = Checker("diag_heartbeat")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    run = ctx.drive(srv, srv.token_file, 23000)
+    beats = run.log_lines(HEARTBEAT)
+    c.check(len(beats) == 2, f"one heartbeat line per 10 s in a 23 s run ({len(beats)})")
+    c.check(bool(beats) and all("ms audio in" in b and "dBFS" in b and "audio.ack=" in b and "speech.started=" in b
+                                and "last text" in b and "max gap" in b for b in beats),
+            "heartbeat: audio sent, longest gap, RMS/peak dBFS, events by type, time since the last text")
+    level_ok = any(" rms -1" in b for b in beats)  # the fake tone: 0.3 amplitude, 2/3 duty -> about -15 dBFS
+    c.check(level_ok, f"heartbeat level matches the fake tone ({beats[:1]})")
+    c.check(bool(run.log_lines("connection connecting")) and bool(run.log_lines("connection connected"))
+            and bool(run.log_lines("connection session active")),
+            "connection state lines: connecting, connected, session active")
+    active = run.log_lines("connection session active")
+    c.check(bool(active) and '"type":"session.start"' in active[0] and "endpoint_silence_ms=" in active[0],
+            "session start line shows the session.start actually sent and the server's parameters")
+    c.check(not run.log_lines("unhandled event type 'speech.started'")
+            and not run.log_lines("unhandled event type 'segment.queued'"),
+            "speech.started / segment.queued are handled, not logged as unhandled")
+    c.check(sum(warn_counts(run).values()) == 0, f"no warnings for normal speech ({warn_counts(run)})")
+    run.notes.append(beats[0].split("] ", 1)[-1] if beats else "no heartbeat")
+    return c, run
+
+
+def sc_diag_silence(ctx) -> Checker:
+    c = Checker("diag_silence")
+    srv = ctx.server(["--revisable"])
+    run = ctx.drive(srv, srv.token_file, 16000, audio="silence")
+    counts = warn_counts(run)
+    c.check(counts[WARN_QUIET] == 1, f"silent audio: one below -60 dBFS warning, rate limited ({counts})")
+    c.check(counts[WARN_NO_AUDIO] == 0 and counts[WARN_NO_SPEECH] == 0 and counts[WARN_STALLED] == 0,
+            f"no other warning ({counts})")
+    beats = run.log_lines(HEARTBEAT)
+    c.check(bool(beats) and "rms -120.0 dBFS" in beats[0], f"heartbeat shows digital silence ({beats[:1]})")
+    run.notes.append(run.log_lines(WARN_QUIET)[0].split("] ", 1)[-1] if run.log_lines(WARN_QUIET) else "-")
+    return c, run
+
+
+def sc_diag_no_audio(ctx) -> Checker:
+    c = Checker("diag_no_audio")
+    srv = ctx.server(["--revisable"])
+    run = ctx.drive(srv, srv.token_file, 38000, audio="dead")
+    counts = warn_counts(run)
+    warns = run.log_lines(WARN_NO_AUDIO)
+    c.check(counts[WARN_NO_AUDIO] == 2, f"no audio: warned after 3 s and again 30 s later, not more ({counts})")
+    c.check(counts[WARN_QUIET] == 0 and counts[WARN_NO_SPEECH] == 0 and counts[WARN_STALLED] == 0,
+            f"no other warning ({counts})")
+    beats = run.log_lines(HEARTBEAT)
+    c.check(bool(beats) and "sent 0 ms audio in 0 frames" in beats[0], f"heartbeat shows nothing sent ({beats[:1]})")
+    run.notes.append(warns[0].split("] ", 1)[-1] if warns else "-")
+    return c, run
+
+
+def sc_diag_no_speech(ctx) -> Checker:
+    c = Checker("diag_no_speech")
+    srv = ctx.server(["--revisable", "--deaf"])
+    run = ctx.drive(srv, srv.token_file, 30000)
+    counts = warn_counts(run)
+    dropped = [r for r in run.requests if r["event"] == "ws_dropped_by_deaf"]
+    c.check(counts[WARN_NO_SPEECH] == 1, f"audible audio, server reports no speech: one warning ({counts})")
+    c.check(counts[WARN_NO_AUDIO] == 0 and counts[WARN_QUIET] == 0 and counts[WARN_STALLED] == 0,
+            f"no other warning ({counts})")
+    c.check(not any(r["type"] == "audio.ack" for r in dropped), "acks still flow (so it is not a stall)")
+    beats = run.log_lines(HEARTBEAT)
+    c.check(bool(beats) and "speech.started=0" in beats[-1] and "last text none yet" in beats[-1],
+            f"heartbeat: audio sent, no speech.started, no text ({beats[-1:]})")
+    run.notes.append(run.log_lines(WARN_NO_SPEECH)[0].split("] ", 1)[-1] if run.log_lines(WARN_NO_SPEECH) else "-")
+    return c, run
+
+
+def sc_diag_trace(ctx) -> Checker:
+    import shutil
+    c = Checker("diag_trace")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    off_dir = ctx.work / "trace-off"
+    on_dir = ctx.work / "trace-on"
+    for d in (off_dir, on_dir):
+        shutil.rmtree(d, ignore_errors=True)
+    ctx.drive(srv, srv.token_file, 5000)
+    c.check(not off_dir.exists() and not on_dir.exists(), "no trace file when the setting is off")
+    run = ctx.drive(srv, srv.token_file, 9000, extra_args=("--trace-dir", str(on_dir)))
+    files = sorted(on_dir.glob("tea-trace-*.jsonl")) if on_dir.exists() else []
+    c.check(len(files) == 1, f"one trace file per session ({[f.name for f in files]})")
+    logged = run.log_lines("event trace for session")
+    c.check(bool(files) and bool(logged) and str(files[0]) in logged[0], "the trace path is logged at session start")
+    events = []
+    valid = bool(files)
+    for line in (files[0].read_text().splitlines() if files else []):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            valid = False
+            continue
+        if "event" in obj:
+            valid = valid and isinstance(obj.get("t_ms"), (int, float))
+            events.append(obj["event"].get("type"))
+    c.check(valid, "every line is JSON with a numeric t_ms")
+    c.check(events[:2] == ["hello", "session.started"] and "transcript.stable" in events
+            and "transcript.final" in events and "audio.ack" in events,
+            f"it holds the whole event timeline ({sorted(set(events))})")
+    replay = ctx.driver.parent / "caption-replay"
+    ok = False
+    if files and replay.exists():
+        out = subprocess.run([str(replay), str(files[0]), "--quiet"], capture_output=True, text=True, timeout=60)
+        ok = out.returncode == 0 and "# summary:" in out.stdout
+        run.notes.append(out.stdout.strip().splitlines()[-1][:160] if out.stdout.strip() else "no replay output")
+    c.check(ok, "tests/replay reads it")
+    return c, run
+
+
 SCENARIOS = {
     "happy": sc_happy,
     "final_only": sc_final_only,
@@ -749,6 +885,11 @@ SCENARIOS = {
     "segmentation_emulated": sc_segmentation_emulated,
     "segmentation_rejected": sc_segmentation_rejected,
     "segmentation_real": sc_segmentation_real,
+    "diag_heartbeat": sc_diag_heartbeat,
+    "diag_silence": sc_diag_silence,
+    "diag_no_audio": sc_diag_no_audio,
+    "diag_no_speech": sc_diag_no_speech,
+    "diag_trace": sc_diag_trace,
 }
 
 
@@ -766,8 +907,8 @@ class Ctx:
         return srv
 
     def drive(self, srv: FakeServer, token: Path, duration_ms: int, **kw) -> Run:
-        lines = run_driver(self.driver, srv.port, token, duration_ms, self.work, **kw)
-        return Run(lines=lines, requests=srv.requests())
+        lines, log = run_driver(self.driver, srv.port, token, duration_ms, self.work, **kw)
+        return Run(lines=lines, requests=srv.requests(), log=log)
 
     def close(self) -> None:
         for s in self._servers:

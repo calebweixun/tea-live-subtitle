@@ -97,7 +97,15 @@ assert "tea_asr_client_start" not in update_fn and "tea_asr_client_set_stable_ca
 assert "tea_apply_connection(ctx, settings, false);" in update_fn
 for read in ('obs_data_get_string(settings, "server_host")', 'obs_data_get_int(settings, "server_port")',
              'obs_data_get_string(settings, "token_path")', 'obs_data_get_bool(settings, "stable_captions")',
-             'obs_data_get_int(settings, TEA_KEY_END_SILENCE_MS)'):
+             'obs_data_get_int(settings, TEA_KEY_END_SILENCE_MS)',
+             'obs_data_get_bool(settings, TEA_KEY_EVENT_TRACE)'):
     assert source.count(read) == apply_fn.count(read) == 1, read
+
+# Diagnostics: the status line is appearance (off by default), the event
+# trace is a per-session connection setting (off by default).
+assert "obs_data_set_default_bool(settings, TEA_KEY_DIAG_OVERLAY, false);" in source
+assert "obs_data_set_default_bool(settings, TEA_KEY_EVENT_TRACE, false);" in source
+assert "cfg->diag_overlay = obs_data_get_bool(settings, TEA_KEY_DIAG_OVERLAY);" in source
+assert 'obs_module_config_path("traces")' in apply_fn
 
 print("layout migration checks passed")

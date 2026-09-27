@@ -1,7 +1,10 @@
 #include "asr-error-policy.hpp"
+#include "asr-diagnostics.h"
 #include "font-default-policy.h"
 
+#include <cmath>
 #include <cstdlib>
+#include <vector>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -17,6 +20,149 @@ void expect(bool condition, const char *message)
 }
 
 } // namespace
+
+static bool near_db(double a, double b)
+{
+	return std::fabs(a - b) < 0.05;
+}
+
+static void test_dbfs()
+{
+	tea_pcm_level_t level;
+	tea_pcm_level_reset(&level);
+	expect(tea_pcm_level_rms_dbfs(&level) == TEA_DBFS_FLOOR, "no samples: silence floor");
+	std::vector<int16_t> zeros(1600, 0);
+	tea_pcm_level_add(&level, zeros.data(), zeros.size());
+	expect(tea_pcm_level_rms_dbfs(&level) == TEA_DBFS_FLOOR && tea_pcm_level_peak_dbfs(&level) == TEA_DBFS_FLOOR,
+	       "digital silence is -120 dBFS, not -inf");
+
+	/* full-scale square wave: 0 dBFS RMS and peak */
+	tea_pcm_level_reset(&level);
+	std::vector<int16_t> square(1600);
+	for (size_t i = 0; i < square.size(); i++)
+		square[i] = (i / 8) % 2 ? 32767 : -32768;
+	tea_pcm_level_add(&level, square.data(), square.size());
+	expect(near_db(tea_pcm_level_peak_dbfs(&level), 0.0) && tea_pcm_level_rms_dbfs(&level) > -0.01,
+	       "full-scale square: 0 dBFS");
+
+	/* sine at amplitude 0.3 (the e2e fake tone): rms = 0.3/sqrt(2) -> -13.47 dBFS, peak -10.46 */
+	tea_pcm_level_reset(&level);
+	std::vector<int16_t> sine(16000);
+	for (size_t i = 0; i < sine.size(); i++)
+		sine[i] =
+			(int16_t)(0.3 * 32767.0 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * (double)i / 16000.0));
+	tea_pcm_level_add(&level, sine.data(), sine.size());
+	expect(near_db(tea_pcm_level_rms_dbfs(&level), 20.0 * std::log10(0.3 / std::sqrt(2.0))),
+	       "sine RMS dBFS = 20 log10(A / sqrt 2)");
+	expect(std::fabs(tea_pcm_level_peak_dbfs(&level) - 20.0 * std::log10(0.3)) < 0.1, "sine peak dBFS");
+	expect(tea_pcm_level_rms_dbfs(&level) < tea_pcm_level_peak_dbfs(&level), "RMS is below peak");
+
+	/* a -60 dBFS threshold sits at amplitude 0.001 */
+	expect(near_db(tea_dbfs_from_amplitude(0.001), -60.0), "0.001 full scale = -60 dBFS");
+	expect(tea_dbfs_from_amplitude(1e-9) == TEA_DBFS_FLOOR, "tiny amplitudes clamp to the floor");
+}
+
+static void test_speech_state()
+{
+	tea_speech_state_t s;
+	tea_speech_reset(&s);
+	expect(tea_speech_state(&s) == TEA_SPEECH_LISTENING, "starts listening");
+	tea_speech_on_started(&s);
+	expect(tea_speech_state(&s) == TEA_SPEECH_DETECTED, "speech.started: speech detected");
+	tea_speech_on_queued(&s);
+	expect(tea_speech_state(&s) == TEA_SPEECH_PROCESSING, "segment.queued: the segment is processing");
+	tea_speech_on_started(&s);
+	expect(tea_speech_state(&s) == TEA_SPEECH_DETECTED, "new speech while the last segment is processed");
+	tea_speech_on_queued(&s);
+	tea_speech_on_segment_done(&s);
+	expect(tea_speech_state(&s) == TEA_SPEECH_PROCESSING, "one of two segments done: still processing");
+	tea_speech_on_segment_done(&s);
+	tea_speech_on_segment_done(&s); /* a stray final never goes negative */
+	expect(tea_speech_state(&s) == TEA_SPEECH_LISTENING && s.pending == 0, "all done: listening again");
+	expect(tea_event_kind("speech.started") == TEA_EV_SPEECH_STARTED &&
+		       tea_event_kind("segment.queued") == TEA_EV_SEGMENT_QUEUED &&
+		       tea_event_kind("audio.ack") == TEA_EV_AUDIO_ACK &&
+		       tea_event_kind("transcript.stable") == TEA_EV_STABLE && tea_event_kind("pong") == TEA_EV_OTHER,
+	       "event kinds for the heartbeat counters");
+}
+
+/* Drives the warning state like asr-client.cpp: a 200 ms frame every 200 ms
+ * at `db`, server acks every 100 ms unless `server_quiet`, checked every
+ * 50 ms. Returns the times (ms) each warning was due. */
+static std::vector<int64_t> run_warn(int flag, int64_t duration_ms, double db, bool send, bool server_quiet,
+				     bool speech_events)
+{
+	tea_warn_state_t w;
+	tea_warn_session_start(&w, 0);
+	std::vector<int64_t> due_at;
+	for (int64_t t = 0; t <= duration_ms; t += 50) {
+		if (send && t % 200 == 0)
+			tea_warn_on_send(&w, t, 200, db);
+		if (!server_quiet && t % 100 == 0)
+			tea_warn_on_server_event(&w, t);
+		if (speech_events && t % 2000 == 0)
+			tea_warn_on_speech(&w);
+		if (tea_warn_due(&w, t) & flag)
+			due_at.push_back(t);
+	}
+	return due_at;
+}
+
+static void test_warning_timers()
+{
+	/* no audio at all while connected: after 3 s, then at most every 30 s */
+	std::vector<int64_t> no_audio = run_warn(TEA_WARN_NO_AUDIO, 70000, -20.0, false, false, false);
+	expect(no_audio.size() == 3 && no_audio[0] > 3000 && no_audio[0] <= 3100 && no_audio[1] - no_audio[0] == 30000,
+	       "no-audio warns after 3 s, then once per 30 s");
+	expect(run_warn(TEA_WARN_NO_AUDIO, 70000, -20.0, true, false, true).empty(),
+	       "no no-audio warning while frames are sent");
+
+	/* silence being sent: after 10 s below -60 dBFS */
+	std::vector<int64_t> quiet = run_warn(TEA_WARN_QUIET, 45000, -90.0, true, false, false);
+	expect(quiet.size() == 2 && quiet[0] > 10000 && quiet[0] <= 10100 && quiet[1] - quiet[0] == 30000,
+	       "quiet warns after 10 s below -60 dBFS, then once per 30 s");
+	expect(run_warn(TEA_WARN_QUIET, 45000, -40.0, true, false, true).empty(), "no quiet warning for normal audio");
+	expect(run_warn(TEA_WARN_QUIET, 45000, -90.0, false, false, false).empty(),
+	       "nothing sent: that is the no-audio warning, not the quiet one");
+
+	/* audible audio, but the server never reports speech */
+	std::vector<int64_t> no_speech = run_warn(TEA_WARN_NO_SPEECH, 50000, -20.0, true, false, false);
+	expect(no_speech.size() == 2 && no_speech[0] >= 15000 && no_speech[0] <= 15300,
+	       "no-speech warns after 15 s of audible audio, rate limited");
+	expect(run_warn(TEA_WARN_NO_SPEECH, 50000, -20.0, true, false, true).empty(),
+	       "speech.started / transcripts every 2 s: no warning");
+	expect(run_warn(TEA_WARN_NO_SPEECH, 50000, -90.0, true, false, false).empty(),
+	       "silence is not counted as unheard speech");
+
+	/* stalled server */
+	std::vector<int64_t> stalled = run_warn(TEA_WARN_STALLED, 40000, -20.0, true, true, true);
+	expect(stalled.size() == 2 && stalled[0] > 5000 && stalled[0] <= 5100 && stalled[1] - stalled[0] == 30000,
+	       "stalled warns after 5 s without any server event while sending, then once per 30 s");
+	expect(run_warn(TEA_WARN_STALLED, 40000, -20.0, true, false, true).empty(), "acks keep the stall warning away");
+	expect(run_warn(TEA_WARN_STALLED, 40000, -20.0, false, true, true).empty(),
+	       "not sending: a quiet server is not a stall");
+
+	/* no session: nothing */
+	tea_warn_state_t w;
+	tea_warn_session_start(&w, 0);
+	tea_warn_session_end(&w);
+	expect(tea_warn_due(&w, 100000) == 0, "no warnings without a session");
+}
+
+static void test_heartbeat()
+{
+	tea_heartbeat_t h;
+	tea_heartbeat_reset(&h, 0);
+	std::vector<int16_t> frame(3200, 1000);
+	tea_heartbeat_on_send(&h, 200, frame.data(), frame.size());
+	tea_heartbeat_on_send(&h, 400, frame.data(), frame.size());
+	tea_heartbeat_on_send(&h, 2400, frame.data(), frame.size());
+	expect(h.frames == 3 && h.samples / 16 == 600, "frames and ms of audio sent");
+	expect(tea_heartbeat_max_gap(&h, 2500) == 2000, "longest gap between sends");
+	expect(tea_heartbeat_max_gap(&h, 9500) == 7100, "an ongoing gap counts too");
+	expect(!tea_heartbeat_due(&h, 9999) && tea_heartbeat_due(&h, 10000), "one heartbeat every 10 s");
+	expect(near_db(tea_pcm_level_rms_dbfs(&h.level), 20.0 * std::log10(1000.0 / 32768.0)), "window level");
+}
 
 int main()
 {
@@ -211,6 +357,11 @@ int main()
 	expect(!ReconnectBackoff::sessionWasHealthy(5000, ""), "a short session does not reset backoff");
 	expect(!ReconnectBackoff::sessionWasHealthy(120000, "idle_timeout"),
 	       "an idle_timeout session does not reset backoff");
+
+	test_dbfs();
+	test_speech_state();
+	test_warning_timers();
+	test_heartbeat();
 
 	std::cout << "asr-client policy tests passed\n";
 	return EXIT_SUCCESS;

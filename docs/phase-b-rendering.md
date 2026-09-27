@@ -142,6 +142,12 @@ caption-state（執行緒安全）──snapshot──▶ captions-source.c（�
 * 逐字稿、匯出與存檔只認 `transcript.final`，這裡只是顯示。
 * 尾巴關閉時，畫面上只有已確定文字，diverged 收尾照舊會把 final 的後段接上（它延伸畫面上的字）。
 
+## 診斷列
+
+「在畫面上顯示診斷列」開啟時，字幕下方多一行小字（字級的一半），顯示連線狀態、語音狀態、輸入音量與距離上次出字的
+秒數（見 [`diagnostics.md`](diagnostics.md)）。它和字幕分開：不淡出、不在文字底色裡、不算在行數上限裡；
+來源高度會多出這一行。文字每 250 ms 更新一次，只在內容改變時重畫。
+
 ## 離線重播工具
 
 `tests/replay/caption-replay.cpp` 把真實 server 事件 trace（JSONL：`{"t_ms", "event"}`）餵進外掛真正的

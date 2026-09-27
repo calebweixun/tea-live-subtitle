@@ -16,7 +16,7 @@
  *                       [--duration-ms MS] [--audio speech|dead|none]
  *                       [--restart-at-ms MS] [--stable on|off]
  *                       [--tail on|off] [--toggle-display-at-ms MS]
- *                       [--end-silence-ms MS]
+ *                       [--end-silence-ms MS] [--trace-dir DIR]
  *
  * --stable mirrors the source's "stable captions" setting (plugin default on).
  * --tail mirrors "show not-yet-confirmed text"; --toggle-display-at-ms flips
@@ -24,6 +24,9 @@
  * the OBS source makes from update(), so a test can check that they never
  * touch the connection.
  * --end-silence-ms mirrors the "sentence break" setting (0 = server default).
+ * --trace-dir mirrors "record recognition events": one JSONL file per session.
+ * Diagnostics (connection, heartbeat, WARN lines) go to stderr through the
+ * obs_log stub, exactly as the plugin writes them to the OBS log.
  * The final {"event":"done"} line also carries "stable_mismatches",
  * "segmentation_supported" and "end_silence_effective" per client.
  */
@@ -83,6 +86,7 @@ int main(int argc, char **argv)
 	bool tail = false;
 	int toggleDisplayAtMs = -1;
 	int endSilenceMs = 0;
+	std::string traceDir;
 
 	for (int i = 1; i < argc; i++) {
 		auto next = [&](const char *name) -> const char * {
@@ -114,6 +118,8 @@ int main(int argc, char **argv)
 			toggleDisplayAtMs = std::atoi(next("--toggle-display-at-ms"));
 		else if (!std::strcmp(argv[i], "--end-silence-ms"))
 			endSilenceMs = std::atoi(next("--end-silence-ms"));
+		else if (!std::strcmp(argv[i], "--trace-dir"))
+			traceDir = next("--trace-dir");
 		else {
 			std::fprintf(stderr, "unknown argument %s\n", argv[i]);
 			return 2;
@@ -137,6 +143,7 @@ int main(int argc, char **argv)
 		tea_asr_client_set_token_path(s.client, token.c_str());
 		tea_asr_client_set_stable_captions(s.client, stable);
 		tea_asr_client_set_end_silence_ms(s.client, endSilenceMs);
+		tea_asr_client_set_trace_dir(s.client, traceDir.c_str());
 		tea_asr_client_start(s.client);
 	}
 

@@ -20,6 +20,10 @@
 #include "audio-tap.h"
 #include "caption-state.h"
 #include "asr-error-policy.hpp"
+#include "asr-diagnostics.h"
+#include "asr-client.h"
+
+#include <QFile>
 
 /*
  * Hand-rolled RFC 6455 client over QTcpSocket.
@@ -79,6 +83,11 @@ public:
 	/* Take effect on the next start(). */
 	void setStableCaptions(bool enabled);
 	void setEndSilenceMs(int ms);
+	void setTraceDir(const QString &dir);
+
+	/* Diagnostics snapshot, safe from any thread. */
+	void diagnostics(int *connection, int *speech, double *input_dbfs, bool *input_recent,
+			 int64_t *ms_since_text) const;
 
 public slots:
 	void doStart();
@@ -264,4 +273,39 @@ private:
 	std::atomic<bool> connected_{false};
 
 	std::atomic<bool> wantRunning_{false};
+
+	/* ---- diagnostics (docs/diagnostics.md), all on this client's thread
+	 * except the atomics, which the overlay / Tools dialog read ---- */
+	void setConnState(int state, const QString &reason);
+	void diagOnSessionStarted(const QJsonObject &started);
+	void diagOnEvent(const QString &type);
+	void diagTick();
+	void logHeartbeat(qint64 now);
+	void traceOpen(const QJsonObject &started);
+	void traceWrite(const QJsonObject &event);
+	void traceClose();
+
+	std::atomic<int> connState_{TEA_CONN_STOPPED};
+	std::atomic<int> speechStateAtomic_{TEA_SPEECH_LISTENING};
+	std::atomic<int> inputDbfsTenths_{-1200};
+	std::atomic<qint64> lastInputMs_{-1};
+	std::atomic<qint64> lastTextMsAtomic_{-1};
+	tea_speech_state_t speech_{};
+	tea_warn_state_t warn_{};
+	tea_heartbeat_t heartbeat_{};
+	tea_pcm_level_t inputLevel_{};
+	qint64 inputLevelStartMs_ = 0;
+	qint64 lastTextMs_ = -1;
+	QByteArray lastSessionStart_; /* the session.start actually sent */
+	QJsonObject lastHello_;
+	qint64 lastHelloMs_ = -1;
+	uint16_t lastCloseCode_ = 0;
+
+	/* optional per-session event trace */
+	mutable QMutex traceMutex_;
+	QString traceDir_;
+	QFile *traceFile_ = nullptr;
+	qint64 traceBytes_ = 0;
+	qint64 traceT0_ = 0;
+	static const qint64 kTraceMaxBytes = 32ll * 1024 * 1024;
 };
