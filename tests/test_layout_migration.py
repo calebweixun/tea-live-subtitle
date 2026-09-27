@@ -50,7 +50,12 @@ assert "obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERS
 assert "obs_data_set_bool(settings, TEA_KEY_FADE_OUT, true);" in block
 # Render schema 2: new sources start with the settings the user settled on
 # in a real broadcast. OBS colours are 0xAABBGGRR: #DBE577 -> 0xFF77E5DB.
-assert "#define TEA_RENDER_SCHEMA_VERSION 2" in source
+assert "#define TEA_RENDER_SCHEMA_VERSION 3" in source
+# Render schema 3: punctuation line breaks -- off for existing sources, on
+# (sentence ends + commas, minimum 8) for new ones.
+assert "obs_data_set_default_int(settings, TEA_KEY_PUNCT_BREAK, TEA_PUNCT_BREAK_OFF);" in source
+assert "#define TEA_NEW_SOURCE_PUNCT_BREAK TEA_PUNCT_BREAK_COMMA" in source
+assert "#define TEA_PUNCT_COMMA_MIN_DEFAULT 8" in layout_display
 assert "#define TEA_NEW_SOURCE_COLOR_BOTTOM 0xFF77E5DB" in source
 for line in ('obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);',
              'obs_data_set_int(settings, "color2", TEA_NEW_SOURCE_COLOR_BOTTOM);',
@@ -60,7 +65,9 @@ for line in ('obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);',
              'obs_data_set_int(settings, "max_lines", TEA_NEW_SOURCE_MAX_LINES);',
              'obs_data_set_int(settings, TEA_KEY_END_SILENCE_MS, TEA_NEW_SOURCE_END_SILENCE_MS);',
              'obs_data_set_int(settings, TEA_KEY_FADE_DELAY_MS, TEA_NEW_SOURCE_FADE_DELAY_MS);',
-             'obs_data_set_bool(settings, TEA_KEY_TAIL, true);'):
+             'obs_data_set_bool(settings, TEA_KEY_TAIL, true);',
+             'obs_data_set_int(settings, TEA_KEY_PUNCT_BREAK, TEA_NEW_SOURCE_PUNCT_BREAK);',
+             'obs_data_set_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);'):
     assert line in block, line
 for define in ("#define TEA_NEW_SOURCE_CAPTION_WIDTH 1800", "#define TEA_NEW_SOURCE_MAX_LINES 3",
                "#define TEA_NEW_SOURCE_MAX_ROWS 2", "#define TEA_NEW_SOURCE_END_SILENCE_MS 870",

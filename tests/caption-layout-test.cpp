@@ -103,11 +103,11 @@ std::string row_text(const std::string &text, const tea_wrap_row_t &row)
 
 std::vector<std::string> wrap_rows(const tea_display_line_t &line, const std::string &text, uint32_t max_width,
 				   uint32_t extra, bool word_wrap, const tea_glyph_cache_t *cache,
-				   std::vector<tea_wrap_row_t> *raw = nullptr)
+				   std::vector<tea_wrap_row_t> *raw = nullptr, const tea_punct_break_t *punct = nullptr)
 {
 	tea_wrap_row_t ring[32];
 	tea_wrap_row_t ordered[32];
-	int total = tea_wrap_line(&line, text.c_str(), max_width, extra, word_wrap, cache, ring, 32);
+	int total = tea_wrap_line_ex(&line, text.c_str(), max_width, extra, word_wrap, punct, cache, ring, 32);
 	expect(total >= 0, "wrap must not report missing glyphs for a learned font");
 	int kept = tea_wrap_rows_in_order(ring, total, 32, ordered);
 	std::vector<std::string> out;
@@ -323,6 +323,145 @@ static void test_big_append_keeps_rows()
 	expect(after[0] + after[1] == grown, "no character is lost or duplicated across the break");
 	expect(line.chunk_count == 2 && line.chunks[1].start == first.size() && line.chunks[1].born_ns == 900 * kMs,
 	       "the burst is one chunk: it fades in once, on both rows it lands on");
+}
+
+namespace {
+
+std::vector<std::string> punct_rows(const std::string &text, int mode, int comma_min, uint32_t width = 2000,
+				    std::vector<tea_wrap_row_t> *raw = nullptr)
+{
+	static tea_glyph_cache_t cache;
+	tea_glyph_cache_clear(&cache);
+	learn(&cache, text);
+	std::string full;
+	tea_display_line_t line = line_from_chunks({text}, &full);
+	tea_punct_break_t punct;
+	punct.mode = mode;
+	punct.comma_min_chars = comma_min;
+	return wrap_rows(line, full, width, 0, true, &cache, raw, &punct);
+}
+
+bool rows_are(const std::vector<std::string> &rows, std::initializer_list<const char *> want)
+{
+	if (rows.size() != want.size())
+		return false;
+	size_t i = 0;
+	for (const char *w : want)
+		if (rows[i++] != w)
+			return false;
+	return true;
+}
+
+} // namespace
+
+static void test_punctuation_breaks()
+{
+	const int S = TEA_PUNCT_BREAK_SENTENCE, C = TEA_PUNCT_BREAK_COMMA;
+	expect(rows_are(punct_rows("今天很好。我們走吧", TEA_PUNCT_BREAK_OFF, 8), {"今天很好。我們走吧"}),
+	       "off: punctuation never breaks");
+	std::vector<tea_wrap_row_t> raw;
+	expect(rows_are(punct_rows("今天很好。我們走吧", S, 8, 2000, &raw), {"今天很好。", "我們走吧"}),
+	       "sentence-final punctuation ends the row and stays on it");
+	expect(raw[0].punct_break && !raw[1].punct_break, "the row is marked as ended by punctuation");
+	expect(rows_are(punct_rows("今天很好，我們走吧", S, 0), {"今天很好，我們走吧"}),
+	       "sentence mode ignores commas");
+	expect(rows_are(punct_rows("今天很好，我們走吧", C, 8), {"今天很好，我們走吧"}),
+	       "a comma after fewer than the minimum characters does not break");
+	expect(rows_are(punct_rows("今天天氣真的非常好，我們走吧", C, 8), {"今天天氣真的非常好，", "我們走吧"}),
+	       "a comma after enough characters breaks");
+	expect(rows_are(punct_rows("好。走", C, 8), {"好。", "走"}), "sentence-final punctuation ignores the minimum");
+	expect(rows_are(punct_rows("一二三、四五六七八九十、好", C, 8), {"一二三、四五六七八九十、", "好"}),
+	       "the minimum counts the characters on the current row");
+
+	/* full-width and ASCII variants alike */
+	expect(rows_are(punct_rows("好．走", S, 0), {"好．", "走"}) &&
+		       rows_are(punct_rows("好！走", S, 0), {"好！", "走"}) &&
+		       rows_are(punct_rows("好？走", S, 0), {"好？", "走"}) &&
+		       rows_are(punct_rows("好；走", S, 0), {"好；", "走"}) &&
+		       rows_are(punct_rows("好!走", S, 0), {"好!", "走"}) &&
+		       rows_are(punct_rows("好?走", S, 0), {"好?", "走"}) &&
+		       rows_are(punct_rows("好;走", S, 0), {"好;", "走"}) &&
+		       rows_are(punct_rows("好,走", C, 0), {"好,", "走"}),
+	       "full-width and ASCII marks break alike");
+
+	/* numbers and abbreviations */
+	expect(rows_are(punct_rows("It costs 3.5 dollars. Then we go", S, 0), {"It costs 3.5 dollars.", "Then we go"}),
+	       "a decimal point never breaks; the next row starts at the next non-space character");
+	expect(rows_are(punct_rows("1,000 people, and more", C, 0), {"1,000 people,", "and more"}),
+	       "a thousands separator never breaks");
+	expect(rows_are(punct_rows("價格是3.5元。好", S, 0), {"價格是3.5元。", "好"}), "numbers inside CJK text too");
+	expect(rows_are(punct_rows("Mr. Smith went home. He slept", S, 0), {"Mr. Smith went home.", "He slept"}),
+	       "a title abbreviation does not end a sentence");
+	expect(rows_are(punct_rows("see e.g. this one", S, 0), {"see e.g. this one"}) &&
+		       rows_are(punct_rows("the U.S. army", S, 0), {"the U.S. army"}) &&
+		       rows_are(punct_rows("J. K. Rowling", S, 0), {"J. K. Rowling"}),
+	       "e.g. / U.S. / initials do not end a sentence");
+	expect(rows_are(punct_rows("www.example.com is up", S, 0), {"www.example.com is up"}),
+	       "a dot followed by a letter never breaks");
+
+	/* runs of marks and closing brackets stay together */
+	expect(rows_are(punct_rows("他說：「好。」然後走了", S, 0), {"他說：「好。」", "然後走了"}),
+	       "a closing bracket after the mark stays on the row it closes");
+	expect(rows_are(punct_rows("真的嗎？！是的", S, 0), {"真的嗎？！", "是的"}), "?! stays together");
+	expect(rows_are(punct_rows("嗯……好", S, 0), {"嗯……", "好"}) &&
+		       rows_are(punct_rows("Well... ok", S, 0), {"Well...", "ok"}),
+	       "an ellipsis stays together");
+
+	/* nothing is decided before the next character: no row is ever split
+	 * under text already shown */
+	expect(rows_are(punct_rows("今天很好。", S, 0), {"今天很好。"}), "a mark at the end is not a break yet");
+	expect(rows_are(punct_rows("It is 3.", S, 0), {"It is 3."}) &&
+		       rows_are(punct_rows("It is 3.5", S, 0), {"It is 3.5"}),
+	       "3. then 3.5: the dot is only decided by the character after it");
+
+	/* a comma that overflows hangs and ends the row */
+	expect(rows_are(punct_rows("一二三四五，六", C, 0, 100, &raw), {"一二三四五，", "六"}) && raw[0].punct_break,
+	       "a hanging comma ends its row as a punctuation break");
+}
+
+static void test_punctuation_breaks_never_move_shown_text()
+{
+	/* Grow a line one code point per update through commas, periods, a
+	 * decimal number and an abbreviation, in the most eager mode, with a
+	 * narrow box: every earlier row stays exactly as it was, the last one
+	 * only grows. */
+	static tea_glyph_cache_t cache;
+	tea_glyph_cache_clear(&cache);
+	const std::string full =
+		"今天我們要討論，字幕的顯示方式。還有換行、對齊，與淡出的效果！價格是3.5元，Mr. Smith said "
+		"hi. Then 1,000 people came……真的嗎？好。";
+	learn(&cache, full);
+	tea_punct_break_t punct;
+	punct.mode = TEA_PUNCT_BREAK_COMMA;
+	punct.comma_min_chars = 3;
+	tea_display_line_t line;
+	size_t pos = 0;
+	tea_utf8_decode(full.data(), full.size(), &pos);
+	std::string text = full.substr(0, pos);
+	tea_display_line_init(&line, 7, text.size(), text.size(), 0);
+	std::vector<std::string> prev = wrap_rows(line, text, 150, 4, true, &cache, nullptr, &punct);
+	uint64_t t = 0;
+	int breaks = 0;
+	while (pos < full.size()) {
+		tea_utf8_decode(full.data(), full.size(), &pos);
+		std::string next = full.substr(0, pos);
+		t += 100 * kMs;
+		tea_display_line_observe(&line, text.c_str(), text.size(), next.c_str(), next.size(), next.size(), t);
+		text = next;
+		std::vector<tea_wrap_row_t> raw;
+		std::vector<std::string> now = wrap_rows(line, text, 150, 4, true, &cache, &raw, &punct);
+		expect(now.size() >= prev.size(), "appending never removes a row");
+		for (size_t i = 0; i + 1 < prev.size(); i++)
+			expect(now[i] == prev[i], "a finished row never changes when text is appended");
+		if (!prev.empty())
+			expect(now[prev.size() - 1].compare(0, prev.back().size(), prev.back()) == 0,
+			       "the growing row only gains characters at its end");
+		breaks = 0;
+		for (const auto &r : raw)
+			breaks += r.punct_break ? 1 : 0;
+		prev = now;
+	}
+	expect(breaks >= 6, "the text really was broken at punctuation");
 }
 
 static void test_chunks()
@@ -555,6 +694,8 @@ int main()
 	test_wrapping();
 	test_append_stability();
 	test_chunks();
+	test_punctuation_breaks();
+	test_punctuation_breaks_never_move_shown_text();
 	test_big_append_keeps_rows();
 	test_open_lines_do_not_fade_while_speaking();
 	test_end_silence_setting();

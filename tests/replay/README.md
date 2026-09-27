@@ -17,7 +17,12 @@ c++ -std=c++17 -Itests/stubs -Isrc tests/replay/caption-replay.cpp /tmp/caption-
 
 The defaults are the settings of the live report: fade-out after 1500 ms, 200 ms fades, 2 rows, 3 sentences,
 1800 px, a 48 px font, black outline and shadow, and unconfirmed text shown. `--quiet` prints only the flags and the
-summary.
+summary. `--punct off|sentence|comma` and `--comma-min N` select punctuation line breaks.
+
+The `# rows` line reports visible characters per row, rows per segment, and punctuation breaks: how many happened, whether
+the mark was committed or still in the tail, and how long after the mark first showed. It also counts layout moves:
+a row of a line whose text only grew that lost or changed characters, which must be 0.
+`--selftest-width-change W MS` switches the box width at MS as a real reflow, to check that the detector notices moves.
 
 To compare with an older plugin, extract its `src/` and `tests/stubs/` (for example with
 `git archive <rev> src tests/stubs`). Build the same tool against that tree with `-DTEA_REPLAY_LEGACY`. That

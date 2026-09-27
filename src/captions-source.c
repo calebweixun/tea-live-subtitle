@@ -100,14 +100,18 @@ static const char *const k_text_ft2_ids[] = {
 #define TEA_KEY_BG_PADDING "text_bg_padding"
 #define TEA_KEY_TAIL "show_unstable_tail"
 #define TEA_KEY_TAIL_OPACITY "unstable_tail_opacity"
+/* Punctuation line breaks: TEA_PUNCT_BREAK_* and the comma minimum. */
+#define TEA_KEY_PUNCT_BREAK "punct_break_mode"
+#define TEA_KEY_PUNCT_COMMA_MIN "punct_break_comma_min_chars"
 
 /* Sources created after the per-line renderer shipped get the recommended
  * live-subtitle look as explicit values (version 2: the settings the user
- * settled on in a real broadcast). Existing scenes keep their own values;
+ * settled on in a real broadcast; version 3 adds punctuation line breaks).
+ * Existing scenes keep their own values;
  * scenes from before the renderer have no marker and keep the neutral
  * defaults, so they look the same after the upgrade. */
 #define TEA_RENDER_SCHEMA_KEY "render_schema_version"
-#define TEA_RENDER_SCHEMA_VERSION 2
+#define TEA_RENDER_SCHEMA_VERSION 3
 
 #define TEA_DEFAULT_END_SILENCE_MS 0 /* server default */
 #define TEA_DEFAULT_FADE_MS 400
@@ -123,6 +127,7 @@ static const char *const k_text_ft2_ids[] = {
 #define TEA_NEW_SOURCE_MAX_LINES 3
 #define TEA_NEW_SOURCE_MAX_ROWS 2
 #define TEA_NEW_SOURCE_END_SILENCE_MS 870
+#define TEA_NEW_SOURCE_PUNCT_BREAK TEA_PUNCT_BREAK_COMMA
 #define TEA_NEW_SOURCE_FADE_DELAY_MS 1500
 #define TEA_NEW_SOURCE_FADE_MS 200
 #define TEA_NEW_SOURCE_BG_PADDING 0
@@ -171,6 +176,7 @@ struct tea_render_config {
 	int bg_padding;
 	bool tail;
 	float tail_opacity;
+	tea_punct_break_t punct;
 	int font_size;
 	obs_data_t *child; /* text_ft2 appearance settings (no "text") */
 	char *metrics_sig; /* anything that changes glyph advances / heights */
@@ -578,6 +584,10 @@ static struct tea_render_config *tea_config_build(struct tea_captions_source *ct
 	cfg->bg_padding = tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_BG_PADDING), 0, 200);
 	cfg->tail = obs_data_get_bool(settings, TEA_KEY_TAIL);
 	cfg->tail_opacity = (float)tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_TAIL_OPACITY), 0, 100) / 100.0f;
+	cfg->punct.mode = tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_PUNCT_BREAK), TEA_PUNCT_BREAK_OFF,
+					    TEA_PUNCT_BREAK_COMMA);
+	cfg->punct.comma_min_chars =
+		tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_PUNCT_COMMA_MIN), 0, TEA_PUNCT_COMMA_MIN_MAX);
 
 	/* obs_data_apply() copies user values only. Start with the effective
 	 * defaults so a platform CJK font (and all other plugin defaults) actually
@@ -1263,8 +1273,8 @@ static void tea_layout(struct tea_captions_source *ctx)
 		struct tea_rline *line = &ctx->lines[ctx->order[o]];
 		tea_wrap_row_t ring[TEA_WRAP_RING];
 		tea_wrap_row_t ordered[TEA_WRAP_RING];
-		int total = tea_wrap_line(&line->meta, line->text, geo.wrap_width, ctx->outline_extra, geo.word_wrap,
-					  ctx->glyphs, ring, TEA_WRAP_RING);
+		int total = tea_wrap_line_ex(&line->meta, line->text, geo.wrap_width, ctx->outline_extra, geo.word_wrap,
+					     &cfg->punct, ctx->glyphs, ring, TEA_WRAP_RING);
 		if (total == TEA_WRAP_MISSING_GLYPH)
 			return;
 		int kept = tea_wrap_rows_in_order(ring, total, TEA_WRAP_RING, ordered);
@@ -1656,6 +1666,8 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, TEA_KEY_BG_PADDING, TEA_DEFAULT_BG_PADDING);
 	obs_data_set_default_bool(settings, TEA_KEY_TAIL, false);
 	obs_data_set_default_int(settings, TEA_KEY_TAIL_OPACITY, TEA_DEFAULT_TAIL_OPACITY);
+	obs_data_set_default_int(settings, TEA_KEY_PUNCT_BREAK, TEA_PUNCT_BREAK_OFF);
+	obs_data_set_default_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
 	if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_RENDER_SCHEMA_KEY)) {
 		obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERSION);
 		obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);
@@ -1677,6 +1689,8 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 		obs_data_set_int(settings, TEA_KEY_FADE_DELAY_MS, TEA_NEW_SOURCE_FADE_DELAY_MS);
 		obs_data_set_int(settings, TEA_KEY_FADE_MS, TEA_NEW_SOURCE_FADE_MS);
 		obs_data_set_bool(settings, TEA_KEY_TAIL, true);
+		obs_data_set_int(settings, TEA_KEY_PUNCT_BREAK, TEA_NEW_SOURCE_PUNCT_BREAK);
+		obs_data_set_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
 	}
 
 	obs_data_set_default_string(settings, "audio_source_name", "");
@@ -1889,6 +1903,29 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 		rows_prop, tea_text_or("TeaLiveSubtitle.Prop.MaxVisibleRows.Tooltip",
 				       "Counts wrapped rows. When a new row would exceed the limit, the oldest "
 				       "row leaves the screen as a whole; text inside a row never changes."));
+	obs_property_t *punct_list = obs_properties_add_list(
+		props, TEA_KEY_PUNCT_BREAK, tea_text_or("TeaLiveSubtitle.Prop.PunctBreak", "Line break at punctuation"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(punct_list, tea_text_or("TeaLiveSubtitle.Prop.PunctBreak.Off", "Off"),
+				  TEA_PUNCT_BREAK_OFF);
+	obs_property_list_add_int(punct_list,
+				  tea_text_or("TeaLiveSubtitle.Prop.PunctBreak.Sentence",
+					      "After sentence ends (\xe3\x80\x82\xef\xbc\x9f\xef\xbc\x81\xe2\x80\xa6"
+					      "\xef\xbc\x9b)"),
+				  TEA_PUNCT_BREAK_SENTENCE);
+	obs_property_list_add_int(punct_list,
+				  tea_text_or("TeaLiveSubtitle.Prop.PunctBreak.Comma",
+					      "After sentence ends and commas (\xef\xbc\x8c\xe3\x80\x81)"),
+				  TEA_PUNCT_BREAK_COMMA);
+	obs_property_set_long_description(
+		punct_list, tea_text_or("TeaLiveSubtitle.Prop.PunctBreak.Tooltip",
+					"Start a new row right after punctuation, inside one sentence of the server. "
+					"Helps with fast speakers who rarely pause long enough for the sentence break. "
+					"The mark stays at the end of its row; text already on screen never moves."));
+	obs_properties_add_int(props, TEA_KEY_PUNCT_COMMA_MIN,
+			       tea_text_or("TeaLiveSubtitle.Prop.PunctCommaMin",
+					   "Minimum characters on a row before a comma breaks"),
+			       0, TEA_PUNCT_COMMA_MIN_MAX, 1);
 	obs_properties_add_bool(props, "show_placeholder", obs_module_text("TeaLiveSubtitle.Prop.ShowPlaceholder"));
 
 	/* --- fades --- */

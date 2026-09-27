@@ -21,12 +21,14 @@
  * Usage: caption-replay TRACE.jsonl [--fade-delay-ms 1500] [--fade-ms 200]
  *          [--max-rows 2] [--max-lines 3] [--width 1800] [--padding 10]
  *          [--font-px 48] [--outline-extra 6] [--tail on|off]
+ *          [--punct off|sentence|comma] [--comma-min 8]
  *          [--pause-ms 870 (legacy build only)] [--quiet]
  */
 
 #include "caption-state.h"
 #include "caption-display.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -225,6 +227,11 @@ struct Settings {
 	uint32_t outline_extra = 6; /* outline + drop shadow */
 	bool tail = true;
 	uint32_t pause_ms = 870; /* legacy build only: the old client-side gap line break */
+	int punct_mode = 0;      /* TEA_PUNCT_BREAK_* (not in the legacy build) */
+	int comma_min = 8;
+	/* detector self-test: switch the box width mid-run (a real reflow) */
+	int width2 = 0;
+	uint64_t width_change_ns = 0;
 	bool quiet = false;
 };
 
@@ -250,6 +257,8 @@ struct RowView {
 	std::string text;
 	std::string tail; /* the part of `text` that is unconfirmed */
 	float alpha;
+	size_t start = 0, end = 0;
+	bool punct_break = false;
 };
 
 struct Sim {
@@ -344,12 +353,30 @@ struct Sim {
 		}
 	}
 
+	tea_caption_frame_t geometry() const
+	{
+		return tea_caption_frame_resolve(TEA_LAYOUT_MODE_FIXED, cfg.width, cfg.padding, 0, true,
+						 cfg.outline_extra, (uint32_t)cfg.font_px, true, 0);
+	}
+
+	int wrap(const tea_display_line_t &meta, const std::string &text, tea_wrap_row_t *ring) const
+	{
+		tea_caption_frame_t geo = geometry();
+#ifdef TEA_REPLAY_LEGACY
+		return tea_wrap_line(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap, cache.get(),
+				     ring, 32);
+#else
+		tea_punct_break_t punct;
+		punct.mode = cfg.punct_mode;
+		punct.comma_min_chars = cfg.comma_min;
+		return tea_wrap_line_ex(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap, &punct,
+					cache.get(), ring, 32);
+#endif
+	}
+
 	/* tea_layout() + the alpha tea_draw_pieces() would use */
 	std::vector<RowView> layout(uint64_t now)
 	{
-		tea_caption_frame_t geo = tea_caption_frame_resolve(TEA_LAYOUT_MODE_FIXED, cfg.width, cfg.padding, 0,
-								    true, cfg.outline_extra, (uint32_t)cfg.font_px,
-								    true, 0);
 		struct Pending {
 			uint64_t key;
 			tea_wrap_row_t row;
@@ -358,8 +385,7 @@ struct Sim {
 		for (uint64_t key : order) {
 			Line &line = lines[key];
 			tea_wrap_row_t ring[32], ordered[32];
-			int total = tea_wrap_line(&line.meta, line.text.c_str(), geo.wrap_width, cfg.outline_extra,
-						  geo.word_wrap, cache.get(), ring, 32);
+			int total = wrap(line.meta, line.text, ring);
 			if (total < 0)
 				continue;
 			int kept = tea_wrap_rows_in_order(ring, total, 32, ordered);
@@ -384,6 +410,11 @@ struct Sim {
 				v.tail = line.text.substr(locked > r.start ? locked : r.start,
 							  r.end - (locked > r.start ? locked : r.start));
 			v.alpha = tea_fade_out_alpha(true, now, fade_ref(line), cfg.fade_delay_ms, cfg.fade_ms);
+			v.start = r.start;
+			v.end = r.end;
+#ifndef TEA_REPLAY_LEGACY
+			v.punct_break = r.punct_break;
+#endif
 			out.push_back(v);
 		}
 		return out;
@@ -488,7 +519,15 @@ int main(int argc, char **argv)
 			cfg.tail = std::strcmp(next(), "off") != 0;
 		else if (a == "--pause-ms")
 			cfg.pause_ms = (uint32_t)std::atoi(next());
-		else if (a == "--quiet")
+		else if (a == "--punct") {
+			std::string m = next();
+			cfg.punct_mode = m == "comma" ? 2 : m == "sentence" ? 1 : 0;
+		} else if (a == "--comma-min")
+			cfg.comma_min = std::atoi(next());
+		else if (a == "--selftest-width-change") {
+			cfg.width2 = std::atoi(next());
+			cfg.width_change_ns = (uint64_t)std::atoll(next()) * TEA_NS_PER_MS;
+		} else if (a == "--quiet")
 			cfg.quiet = true;
 		else {
 			std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -539,13 +578,43 @@ int main(int argc, char **argv)
 	std::map<uint64_t, bool> prev_open;
 	std::map<uint64_t, size_t> prev_visible_from;
 	int flags_fade = 0, flags_evict = 0, flags_hidden = 0, flags_rewrite = 0, flags_other = 0, final_shrinks = 0;
+	/* layout stability and row statistics */
+	struct PrevRow {
+		size_t start;
+		std::string text;
+	};
+	std::map<uint64_t, std::vector<PrevRow>> prev_rows;
+	int layout_moves = 0;
+	double row_chars_sum = 0;
+	uint64_t row_samples = 0;
+	size_t row_chars_max = 0;
+	std::map<uint64_t, Line> last_seen; /* for rows per segment */
+	struct Snap {
+		uint64_t t;
+		std::string text;
+		size_t shown_end;
+	};
+	std::map<uint64_t, std::vector<Snap>> shown_history;
+	struct Break {
+		uint64_t key;
+		size_t end;
+		std::string prefix;
+		uint64_t t;
+		bool committed; /* the mark was committed text when the break first showed */
+	};
+	std::map<std::string, Break> breaks_seen;
 	size_t max_burst = 0;
 	uint64_t max_burst_t = 0;
 	int bursts_over_8 = 0;
 
-	std::printf("# replay %s  fade_delay=%ums fade=%ums max_rows=%d max_lines=%d width=%d font=%dpx tail=%s%s\n",
+	std::printf("# replay %s  fade_delay=%ums fade=%ums max_rows=%d max_lines=%d width=%d font=%dpx tail=%s "
+		    "punct=%s comma_min=%d%s\n",
 		    argv[1], cfg.fade_delay_ms, cfg.fade_ms, cfg.max_rows, cfg.max_lines, cfg.width, cfg.font_px,
 		    cfg.tail ? "on" : "off",
+		    cfg.punct_mode == 2   ? "comma"
+		    : cfg.punct_mode == 1 ? "sentence"
+					  : "off",
+		    cfg.comma_min,
 #ifdef TEA_REPLAY_LEGACY
 		    "  [LEGACY build: pre-fix src/]"
 #else
@@ -631,6 +700,8 @@ int main(int argc, char **argv)
 			next_event++;
 		}
 
+		if (cfg.width2 > 0 && now >= cfg.width_change_ns)
+			sim.cfg.width = cfg.width2;
 		sim.sync(now);
 		sim.expire(now);
 		std::vector<RowView> rows = sim.layout(now);
@@ -700,6 +771,68 @@ int main(int argc, char **argv)
 		if (appeared >= 8)
 			bursts_over_8++;
 
+		/* shown text never moves: while a line's text only grows, every row
+		 * it showed keeps its start and its text (the last one may grow) */
+		{
+			std::map<uint64_t, std::vector<PrevRow>> cur_rows;
+			for (const RowView &r : rows)
+				cur_rows[r.key].push_back({r.start, r.text});
+			for (const auto &kv : prev_rows) {
+				auto line_it = sim.lines.find(kv.first);
+				if (line_it == sim.lines.end() ||
+				    !starts_with(line_it->second.text, prev_display[kv.first]))
+					continue; /* gone, or text rewritten (counted above) */
+				const std::vector<PrevRow> &old_rows = kv.second;
+				const std::vector<PrevRow> &new_rows = cur_rows[kv.first];
+				for (size_t i = 0; i < old_rows.size(); i++) {
+					if (old_rows[i].start < line_it->second.meta.visible_from)
+						continue; /* scrolled out whole (row limit) or faded */
+					bool ok = false;
+					for (const PrevRow &n : new_rows) {
+						if (n.start != old_rows[i].start)
+							continue;
+						ok = i + 1 < old_rows.size() ? n.text == old_rows[i].text
+									     : starts_with(n.text, old_rows[i].text);
+					}
+					if (!ok) {
+						layout_moves++;
+						std::printf(
+							"!! %8.3fs  LAYOUT MOVE: row [%s] of an unchanged prefix moved\n",
+							(double)now / 1e9, old_rows[i].text.c_str());
+					}
+				}
+			}
+			prev_rows.swap(cur_rows);
+		}
+		/* row statistics, punctuation first shown, breaks first shown */
+		for (size_t i = 0; i < rows.size(); i++) {
+			const RowView &r = rows[i];
+			if (r.alpha <= 0.05f)
+				continue;
+			size_t chars = utf8_chars(r.text);
+			row_chars_sum += (double)chars;
+			row_samples++;
+			if (chars > row_chars_max)
+				row_chars_max = chars;
+			if (r.punct_break && i + 1 < rows.size() && rows[i + 1].key == r.key) {
+				const std::string &text = sim.lines[r.key].text;
+				std::string id = std::to_string(r.key) + ":" + text.substr(0, r.end);
+				if (!breaks_seen.count(id))
+					breaks_seen[id] = {r.key, r.end, text.substr(0, r.end), now,
+							   r.end <= sim.lines[r.key].meta.locked_len};
+			}
+		}
+		for (const auto &kv : sim.lines) {
+			size_t shown_end = 0;
+			for (const RowView &r : rows)
+				if (r.key == kv.first && r.alpha > 0.05f && r.end > shown_end)
+					shown_end = r.end;
+			std::vector<Snap> &h = shown_history[kv.first];
+			if (h.empty() || h.back().text != kv.second.text || h.back().shown_end != shown_end)
+				h.push_back({now, kv.second.text, shown_end});
+			last_seen[kv.first] = kv.second;
+		}
+
 		std::string screen = render_screen(rows);
 		if (screen != prev_screen && !cfg.quiet)
 			std::printf("   %8.3fs  %s\n", (double)now / 1e9, screen.empty() ? "(empty)" : screen.c_str());
@@ -715,6 +848,50 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* rows per segment: the whole text of each line, wrapped as if no row had left */
+	int segs = 0, rows_total = 0, rows_max = 0;
+	for (auto &kv : last_seen) {
+		Line line = kv.second;
+		line.meta.visible_from = 0;
+		tea_wrap_row_t ring[32];
+		int n = sim.wrap(line.meta, line.text, ring);
+		if (n <= 0)
+			continue;
+		segs++;
+		rows_total += n;
+		if (n > rows_max)
+			rows_max = n;
+	}
+	/* how long after its punctuation was first on screen did each break show */
+	int breaks = 0, within_1s = 0, at_committed = 0;
+	uint64_t latency_max = 0;
+	std::vector<uint64_t> latencies;
+	for (const auto &kv : breaks_seen) {
+		const Break &b = kv.second;
+		uint64_t first = b.t;
+		for (const Snap &h : shown_history[b.key]) {
+			if (h.shown_end >= b.end && starts_with(h.text, b.prefix)) {
+				first = h.t;
+				break;
+			}
+		}
+		uint64_t latency = b.t - first;
+		latencies.push_back(latency);
+		breaks++;
+		at_committed += b.committed ? 1 : 0;
+		if (latency <= 1000 * TEA_NS_PER_MS)
+			within_1s++;
+		if (latency > latency_max)
+			latency_max = latency;
+	}
+	std::sort(latencies.begin(), latencies.end());
+	std::printf("# rows: avg visible chars/row=%.1f max=%zu | rows per segment avg=%.2f max=%d (%d segments) | "
+		    "punctuation breaks=%d (mark already committed=%d, still in the tail=%d), shown within 1 s of the "
+		    "mark=%d, median %.0f ms, max %.0f ms | layout moves=%d\n",
+		    row_samples ? row_chars_sum / (double)row_samples : 0.0, row_chars_max,
+		    segs ? (double)rows_total / segs : 0.0, rows_max, segs, breaks, at_committed, breaks - at_committed,
+		    within_1s, latencies.empty() ? 0.0 : (double)latencies[latencies.size() / 2] / 1e6,
+		    (double)latency_max / 1e6, layout_moves);
 	std::printf("# close audit: finals that extend what was shown=%d, shorter=%d, different=%d; "
 		    "closes that changed shown text=%d\n",
 		    close_extends, close_shorter, close_differs, close_changed_shown);
