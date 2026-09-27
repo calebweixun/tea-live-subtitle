@@ -12,8 +12,8 @@
  *     Latin breaks at spaces, closing punctuation hangs at the row end),
  *   - a glyph-advance cache fed by measurements of the real text_ft2 source,
  *   - greedy wrapping that never moves text that is already on screen,
- *   - per-line bookkeeping: appended chunks (for per-chunk fade-in), pause
- *     line breaks, rows removed by the row limit or by fading out,
+ *   - per-line bookkeeping: appended chunks (for per-chunk fade-in), rows
+ *     removed by the row limit or by fading out, speech activity,
  *   - fade-in / fade-out alpha over time,
  *   - horizontal alignment and the outer box geometry.
  *
@@ -250,7 +250,7 @@ typedef struct {
 } tea_glyph_slot_t;
 
 typedef struct {
-	tea_glyph_slot_t slots[TEA_GLYPH_CACHE_SLOTS];
+	tea_glyph_slot_t entries[TEA_GLYPH_CACHE_SLOTS];
 	uint32_t count;
 } tea_glyph_cache_t;
 
@@ -270,7 +270,7 @@ static inline const tea_glyph_slot_t *tea_glyph_cache_find(const tea_glyph_cache
 		return NULL;
 	uint32_t i = tea_glyph_cache_hash(cp);
 	for (uint32_t probes = 0; probes < TEA_GLYPH_CACHE_SLOTS; probes++) {
-		const tea_glyph_slot_t *slot = &cache->slots[i];
+		const tea_glyph_slot_t *slot = &cache->entries[i];
 		if (slot->cp == cp)
 			return slot;
 		if (slot->cp == 0)
@@ -300,9 +300,9 @@ static inline tea_glyph_slot_t *tea_glyph_cache_store(tea_glyph_cache_t *cache, 
 	if (!existing && cache->count >= TEA_GLYPH_CACHE_LIMIT)
 		tea_glyph_cache_clear(cache);
 	uint32_t i = tea_glyph_cache_hash(cp);
-	while (cache->slots[i].cp != 0 && cache->slots[i].cp != cp)
+	while (cache->entries[i].cp != 0 && cache->entries[i].cp != cp)
 		i = (i + 1u) & (TEA_GLYPH_CACHE_SLOTS - 1u);
-	tea_glyph_slot_t *slot = &cache->slots[i];
+	tea_glyph_slot_t *slot = &cache->entries[i];
 	if (slot->cp == 0) {
 		slot->cp = cp;
 		slot->seen_by = 0;
@@ -373,7 +373,6 @@ static inline bool tea_text_advance(const tea_glyph_cache_t *cache, const char *
 /* ------------------------------------------------------------------------ */
 
 #define TEA_DISPLAY_MAX_CHUNKS 48
-#define TEA_DISPLAY_MAX_HARD_BREAKS 16
 #define TEA_NS_PER_MS UINT64_C(1000000)
 
 /* A run of text that appeared at one time. Chunk i covers
@@ -390,9 +389,10 @@ typedef struct {
 	size_t visible_from; /* text before this offset has left the screen for good */
 	tea_display_chunk_t chunks[TEA_DISPLAY_MAX_CHUNKS];
 	int chunk_count;
-	size_t hard_breaks[TEA_DISPLAY_MAX_HARD_BREAKS]; /* pause breaks, ascending */
-	int hard_break_count;
-	uint64_t changed_ns; /* last time the displayed text changed */
+	uint64_t changed_ns;  /* last time the displayed text changed */
+	uint64_t activity_ns; /* last transcript event of this line's segment, or its close */
+	uint64_t activity;    /* tea_caption_snapshot_line_t.activity last seen */
+	bool open;            /* the server segment may still grow */
 	bool used;
 	bool persistent; /* never fades out (the waiting placeholder) */
 } tea_display_line_t;
@@ -406,6 +406,7 @@ static inline void tea_display_line_init(tea_display_line_t *line, uint64_t key,
 	line->len = len;
 	line->locked_len = locked_len < len ? locked_len : len;
 	line->changed_ns = now_ns;
+	line->activity_ns = now_ns;
 	if (len > 0) {
 		line->chunks[0].start = 0;
 		line->chunks[0].born_ns = now_ns;
@@ -413,52 +414,31 @@ static inline void tea_display_line_init(tea_display_line_t *line, uint64_t key,
 	}
 }
 
-static inline void tea_display_line_add_hard_break(tea_display_line_t *line, size_t at)
-{
-	for (int i = 0; i < line->hard_break_count; i++) {
-		if (line->hard_breaks[i] == at)
-			return;
-	}
-	if (line->hard_break_count == TEA_DISPLAY_MAX_HARD_BREAKS) {
-		memmove(&line->hard_breaks[0], &line->hard_breaks[1],
-			sizeof(line->hard_breaks[0]) * (TEA_DISPLAY_MAX_HARD_BREAKS - 1));
-		line->hard_break_count--;
-	}
-	int pos = line->hard_break_count;
-	while (pos > 0 && line->hard_breaks[pos - 1] > at) {
-		line->hard_breaks[pos] = line->hard_breaks[pos - 1];
-		pos--;
-	}
-	line->hard_breaks[pos] = at;
-	line->hard_break_count++;
-}
-
 /*
  * The displayed text of a line changed from old_text to new_text (committed
- * text plus unstable tail). Keeps the timing of the unchanged prefix, starts a
- * new chunk for what follows it, and -- when the text had not changed for at
- * least pause_ms -- starts a new row there (the "sentence break" pause).
- * Text removed from the end (a tail that went away) simply ends the chunks
- * there. Returns false when nothing changed.
+ * text plus unstable tail). Keeps the timing of the unchanged prefix and starts
+ * a new chunk for what follows it. Text removed from the end simply ends the
+ * chunks there. Returns false when nothing changed.
+ *
+ * Line breaks between sentences come from the server alone: every server
+ * segment is its own line, and the silence that ends a segment is the
+ * server's VAD setting (session.start.segmentation.end_silence_ms). Gaps
+ * between text arrivals are quantised by the server's preview cadence
+ * (~800 ms) and say nothing reliable about pauses in the audio.
  */
 static inline bool tea_display_line_observe(tea_display_line_t *line, const char *old_text, size_t old_len,
-					    const char *new_text, size_t new_len, size_t locked_len, uint64_t now_ns,
-					    uint32_t pause_ms)
+					    const char *new_text, size_t new_len, size_t locked_len, uint64_t now_ns)
 {
 	line->locked_len = locked_len < new_len ? locked_len : new_len;
 	if (old_len == new_len && (old_len == 0 || memcmp(old_text, new_text, old_len) == 0))
 		return false;
 
 	size_t common = tea_utf8_common_prefix(old_text, old_len, new_text, new_len);
-	bool paused = pause_ms > 0 && now_ns >= line->changed_ns &&
-		      now_ns - line->changed_ns >= (uint64_t)pause_ms * TEA_NS_PER_MS;
 
 	while (line->chunk_count > 0 && line->chunks[line->chunk_count - 1].start >= common && common < new_len)
 		line->chunk_count--;
 	while (line->chunk_count > 0 && line->chunks[line->chunk_count - 1].start >= new_len)
 		line->chunk_count--;
-	while (line->hard_break_count > 0 && line->hard_breaks[line->hard_break_count - 1] > common)
-		line->hard_break_count--;
 
 	if (new_len > common) {
 		if (line->chunk_count == TEA_DISPLAY_MAX_CHUNKS) {
@@ -470,14 +450,50 @@ static inline bool tea_display_line_observe(tea_display_line_t *line, const char
 		line->chunks[line->chunk_count].start = common;
 		line->chunks[line->chunk_count].born_ns = now_ns;
 		line->chunk_count++;
-		if (paused && common > line->visible_from)
-			tea_display_line_add_hard_break(line, common);
 	}
 	if (line->visible_from > common)
 		line->visible_from = common;
 	line->len = new_len;
 	line->changed_ns = now_ns;
+	if (line->activity_ns < now_ns)
+		line->activity_ns = now_ns;
 	return true;
+}
+
+/*
+ * Speech activity of a line's segment, from the caption state's snapshot:
+ * `activity` changes on every transcript event of the segment (a partial
+ * that changes nothing on screen included), `open` says the segment may
+ * still grow. Closing the segment counts as activity too, so a line that
+ * just closed gets the full fade-out delay from that moment.
+ */
+static inline void tea_display_line_note_activity(tea_display_line_t *line, uint64_t activity, bool open,
+						  uint64_t now_ns)
+{
+	if (activity != line->activity || open != line->open) {
+		line->activity = activity;
+		if (line->activity_ns < now_ns)
+			line->activity_ns = now_ns;
+	}
+	line->open = open;
+}
+
+/*
+ * The moment a line's fade-out delay counts from. A closed line fades
+ * `delay` after its last change. A line whose server segment is still open
+ * never fades while the session shows speech activity: stable commits need
+ * two agreeing previews at the server's ~800 ms preview cadence, so the
+ * committed text can stand still for 1.6-2.4 s or more while the speaker is
+ * talking. Every transcript event of the session (session_activity_ns)
+ * keeps an open line visible; only an open line with no activity at all
+ * for the delay may fade.
+ */
+static inline uint64_t tea_display_line_fade_ref(const tea_display_line_t *line, uint64_t session_activity_ns)
+{
+	uint64_t ref = line->changed_ns > line->activity_ns ? line->changed_ns : line->activity_ns;
+	if (line->open && session_activity_ns > ref)
+		ref = session_activity_ns;
+	return ref;
 }
 
 /* Every character shown so far leaves the screen (after fading out). Text
@@ -642,10 +658,9 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 }
 
 /*
- * Wraps the visible part of one line: [visible_from, len), split into
- * paragraphs at the pause breaks. Returns the row count (the last `cap` rows
- * are in `rows`, oldest first after tea_wrap_rows_in_order()) or
- * TEA_WRAP_MISSING_GLYPH.
+ * Wraps the visible part of one line: [visible_from, len). Returns the row
+ * count (the last `cap` rows are in `rows`, oldest first after
+ * tea_wrap_rows_in_order()) or TEA_WRAP_MISSING_GLYPH.
  */
 static inline int tea_wrap_line(const tea_display_line_t *line, const char *text, uint32_t max_width,
 				uint32_t outline_extra, bool word_wrap, const tea_glyph_cache_t *cache,
@@ -658,21 +673,10 @@ static inline int tea_wrap_line(const tea_display_line_t *line, const char *text
 	if (line->locked_len > 0 && line->locked_len < line->len)
 		starts[n++] = line->locked_len; /* the tail never pushes committed text around */
 
-	int total = 0;
-	size_t para = line->visible_from;
-	for (int h = 0; h <= line->hard_break_count; h++) {
-		size_t para_end = h < line->hard_break_count ? line->hard_breaks[h] : line->len;
-		if (para_end <= para)
-			continue;
-		if (para_end > line->len)
-			para_end = line->len;
-		total = tea_wrap_paragraph(text, para, para_end, starts, n, max_width, outline_extra, word_wrap, cache,
-					   rows, cap, total);
-		if (total == TEA_WRAP_MISSING_GLYPH)
-			return TEA_WRAP_MISSING_GLYPH;
-		para = para_end;
-	}
-	return total;
+	if (line->visible_from >= line->len)
+		return 0;
+	return tea_wrap_paragraph(text, line->visible_from, line->len, starts, n, max_width, outline_extra, word_wrap,
+				  cache, rows, cap, 0);
 }
 
 /* After tea_wrap_line() returned `total` rows into a ring of `cap`, copies
@@ -875,14 +879,16 @@ static inline uint32_t tea_caption_frame_row_y(const tea_caption_frame_t *f, int
 /*
  * Only these settings reach the server (session.start / the WebSocket URL /
  * the bearer token). Everything else is appearance and is applied by
- * redrawing only. `stable` is here because `stable` is a session.start field:
- * the server cannot switch it inside a running session.
+ * redrawing only. `stable` and `end_silence_ms` are here because they are
+ * session.start fields: the server cannot switch them inside a running
+ * session.
  */
 typedef struct {
 	const char *host;
 	int port;
 	const char *token_path;
 	bool stable;
+	int end_silence_ms; /* sentence break silence; 0 = server default */
 } tea_connection_settings_t;
 
 static inline bool tea_str_equal_or_both_empty(const char *a, const char *b)
@@ -897,7 +903,8 @@ static inline bool tea_str_equal_or_both_empty(const char *a, const char *b)
 static inline bool tea_connection_settings_equal(const tea_connection_settings_t *a, const tea_connection_settings_t *b)
 {
 	return tea_str_equal_or_both_empty(a->host, b->host) && a->port == b->port &&
-	       tea_str_equal_or_both_empty(a->token_path, b->token_path) && a->stable == b->stable;
+	       tea_str_equal_or_both_empty(a->token_path, b->token_path) && a->stable == b->stable &&
+	       a->end_silence_ms == b->end_silence_ms;
 }
 
 #define TEA_CONNECTION_KEEP 0      /* nothing to do */
@@ -920,4 +927,53 @@ static inline int tea_connection_decide(const tea_connection_settings_t *applied
 	if (!have_applied || force || !interactive)
 		return TEA_CONNECTION_RECONNECT;
 	return TEA_CONNECTION_DEFER;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Sentence break: the server's segmentation silence                         */
+/* ------------------------------------------------------------------------ */
+
+/* Bounds of session.start.segmentation.end_silence_ms (docs/04 「切段控制」).
+ * The server advertises the real ones in
+ * capabilities.features.segmentation_control.end_silence_ms. */
+#define TEA_END_SILENCE_MIN_MS 300
+#define TEA_END_SILENCE_MAX_MS 3000
+
+/*
+ * The value to put in session.start.segmentation.end_silence_ms, or 0 to
+ * leave the field out. It is sent only when the server advertised
+ * segmentation_control (an older server rejects unknown session.start
+ * fields), only for a non-zero setting (0 = server default), and clamped to
+ * the range the server advertised.
+ */
+static inline int tea_end_silence_request(int preferred_ms, bool server_supports, int server_min, int server_max)
+{
+	if (!server_supports || preferred_ms <= 0)
+		return 0;
+	if (server_min <= 0 || server_max < server_min) {
+		server_min = TEA_END_SILENCE_MIN_MS;
+		server_max = TEA_END_SILENCE_MAX_MS;
+	}
+	if (preferred_ms < server_min)
+		return server_min;
+	if (preferred_ms > server_max)
+		return server_max;
+	return preferred_ms;
+}
+
+/*
+ * Settings migration: the old client-side "sentence break pause"
+ * (line_break_pause_ms) measured gaps between text arrivals; the setting now
+ * means the server's end-of-segment silence. 0 (off) becomes "server
+ * default"; anything else is kept, clamped to the protocol range.
+ */
+static inline int tea_end_silence_from_legacy_pause(long long pause_ms)
+{
+	if (pause_ms <= 0)
+		return 0;
+	if (pause_ms < TEA_END_SILENCE_MIN_MS)
+		return TEA_END_SILENCE_MIN_MS;
+	if (pause_ms > TEA_END_SILENCE_MAX_MS)
+		return TEA_END_SILENCE_MAX_MS;
+	return (int)pause_ms;
 }

@@ -79,6 +79,12 @@ void tea_fill_row_cb(const tea_captions_source_info_t *info, void *user)
 			capabilities += QStringLiteral("; stable captions: not offered by server (using partial)");
 		else
 			capabilities += QStringLiteral("; stable captions: not active (using partial)");
+		/* Sentence break = the server's end-of-segment silence. */
+		if (info->end_silence_setting_ms > 0 && !info->supports_segmentation)
+			capabilities +=
+				QStringLiteral("; sentence break: server does not support setting it (uses its own)");
+		else if (info->end_silence_effective_ms > 0)
+			capabilities += QStringLiteral("; sentence break: %1 ms").arg(info->end_silence_effective_ms);
 		if (info->stable_mismatches > 0)
 			capabilities += QStringLiteral("; non-append stable updates ignored: %1")
 						.arg((qulonglong)info->stable_mismatches);

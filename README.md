@@ -75,16 +75,18 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   `session.start` 送 `"transcript_mode":"revisable","stable":{"agreement":2}`。server 沒宣告就不送 `stable`，
   直接用原本的 partial／final；宣告了卻在 `session.started` 前以 `protocol_error`／`unsupported_option` 拒絕時，
   下一次連線自動拿掉 `stable` 改用 partial（不當成致命錯誤，Tools 狀態會寫明），按「全部重新連線」或改設定才會再試。
-* **顯示**：預設只顯示已提交的文字。「顯示未確定文字（較淡）」（`show_unstable_tail`，預設關閉）開啟時，
-  同一段最新的 `transcript.partial` **以已提交文字開頭**時，才把多出來的部分以較淡的樣式接在後面；不是的話就不顯示
-  尾巴，已提交的字不受影響；該段收到 final／收尾 stable／skipped／cancelled 或斷線時尾巴消失。每個 `segment_id`
-  各自一行、各自保存，下一段的 stable 比上一段的 final 早到也不會互相覆蓋；行依 `segment_index` 排序。
+* **顯示**：預設只顯示已提交的文字。「顯示未確定文字（較淡）」（`show_unstable_tail`）開啟時，最新
+  `transcript.partial` 在已提交文字之後多出的部分以較淡的樣式接在後面。畫面上的字不倒退：比畫面短的預覽不採用，
+  預覽句尾的句號不顯示，未確定的字可以被修正但不會被收回；已提交的字從不改。每個 `segment_id` 各自一行、各自保存，
+  下一段的 stable 比上一段的 final 早到也不會互相覆蓋；行依 `segment_index` 排序。細節見
+  [`docs/phase-b-rendering.md`](docs/phase-b-rendering.md)。
 * **接尾巴**：`text` 是該段完整的已提交文字，外掛只把比畫面多出的 UTF-8 bytes 接上。收到不以畫面文字開頭的值
   （違反契約，例如舊版或有 bug 的 server）時**不改字**、丟掉該值、在 OBS log 記一次，次數顯示在 Tools 對話框。
-* **收尾**：`transcript.final` 若延伸已提交文字就立刻接上；否則保留已提交文字，等緊接著的收尾 stable。
-  `final`／`diverged`／`abandoned` 是該段最後一則；`diverged` 保留已提交文字並接上 final 的尾巴，所以畫面可能與
-  final 不同——**逐字稿與存檔只認 `transcript.final`**，stable 只供顯示。`segment.skipped`／`segment.error`／
-  `session.cancelled` 不收回已顯示的字，只是該行不再增長。
+* **收尾**：`transcript.final`（或收尾 stable）若延伸畫面上的字（已提交文字，顯示尾巴時再加上尾巴）就立刻接上；
+  否則**畫面維持原樣**——不換成較短或不同的 final，也不套用 `diverged` 的混合字串（真實模型常在一段含兩個片語時
+  丟掉其中一個，直接換上 final 會收回觀眾已讀過的字）。該行照樣算結束（淡出從此起算）。**逐字稿與存檔只認
+  `transcript.final`**，stable 與尾巴只供顯示。`segment.skipped`／`segment.error`／`session.cancelled` 同樣凍結
+  畫面上的內容。
 * **斷線重連**：穩定字幕開啟時，斷線不清空畫面；最後顯示的內容凍結，新 session 的字幕接在下面捲上來。
   若 10 秒內沒有重新開始 session，就清空畫面，避免過期字幕假裝仍在直播。按「全部重新連線」或改設定仍會立即清空。
 * 關閉此選項時行為與先前相同：單一 preview 行由 `transcript.partial` 整段替換、final 推入上方、斷線即清空。
@@ -96,10 +98,14 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
 * 每一行各自排版：對齊（左／中／右）依每行實際寬度計算；固定寬度模式下超過可用寬度自動折行
   （中文逐字、英文在空白處、句讀不放行首），已經出現在畫面上的字不會因為後面的字到來而被擠到下一行。
 * 「文字漸層上色／下色」就是 OBS 文字引擎的 `color1`／`color2`（上下漸層）；描邊與陰影固定為黑色。
-* 選用功能（舊來源升級後預設都關閉，新建的來源會帶建議值）：文字底色、換句偵測時間、畫面最多行數、
-  新文字淡入、舊字幕自動淡出（淡入淡出共用一個時間設定）、顯示未確定文字。
+* 選用功能（舊來源升級後預設都關閉，新建的來源會帶使用者直播時的設定）：文字底色、畫面最多行數、新文字淡入、
+  舊字幕自動淡出（淡入淡出共用一個時間設定；server 段落還開著、還有人在說話時不淡出）、顯示未確定文字。
+* 「換句偵測時間」是 server 的切段靜音長度（`session.start.segmentation.end_silence_ms`，300–3000 ms，0＝server
+  預設）：只在 server 的 `capabilities` 宣告 `segmentation_control` 時送出並夾在其範圍內，否則不送並在屬性視窗
+  提示不支援。client 不做 VAD，也不再用文字到達間隔判斷換句。
 * 外觀設定在「屬性」視窗改了就套用（OBS 約 0.5 秒後呼叫 update），只重畫、不重連；伺服器位址／連接埠／
-  Token／穩定字幕這類會送到 server 的設定，要按「套用連線設定」或關閉視窗才生效。
+  Token／穩定字幕／換句偵測時間這類會送到 server 的設定，要按「套用連線設定」或關閉視窗才生效。
+* 離線重播工具 `tests/replay/`：把真實 server 事件 trace 餵進字幕狀態機與排版政策，檢查畫面上的字是否倒退或消失。
 
 ## 架構（規劃中，見交接規格）
 

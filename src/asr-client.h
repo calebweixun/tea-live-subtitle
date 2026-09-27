@@ -86,6 +86,17 @@ bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *client);
 /* True while the current session was started with `stable`. */
 bool tea_asr_client_stable_captions_active(tea_asr_client_t *client);
 
+/* "Sentence break" source setting: the server's end-of-segment silence in ms
+ * (0 = server default). Sent as session.start.segmentation.end_silence_ms,
+ * clamped to the advertised range, only when the server advertises
+ * capabilities.features.segmentation_control; otherwise left out. Takes
+ * effect on the next tea_asr_client_start(). */
+void tea_asr_client_set_end_silence_ms(tea_asr_client_t *client, int ms);
+/* Only meaningful once capabilities are known; the out-params may be NULL. */
+bool tea_asr_client_supports_segmentation(tea_asr_client_t *client, int *min_ms, int *max_ms, int *default_ms);
+/* The value the running session uses (session.started.preview_policy.endpoint_silence_ms), -1 if unknown. */
+int tea_asr_client_effective_end_silence_ms(tea_asr_client_t *client);
+
 #ifdef __cplusplus
 }
 #endif

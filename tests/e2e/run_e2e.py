@@ -604,9 +604,27 @@ def sc_stable_tail_display_toggle(ctx) -> Checker:
             "before the toggle: committed text only, no tail")
     tails = [line["tail"] for s in after for line in s["snapshot"] if line["tail"]]
     c.check(bool(tails), f"after the toggle the not-yet-confirmed tail is shown ({len(tails)} tails)")
-    partials = {r["text"] for r in run.requests if r["event"] == "ws_partial"}
-    stray = sorted({line["text"] + line["tail"] for s in after for line in s["snapshot"] if line["tail"]} - partials)
-    c.check(not stray, f"every committed text + tail is exactly a partial the server sent ({stray[:3]})")
+    partials = [r["text"] for r in run.requests if r["event"] == "ws_partial"]
+
+    def from_a_partial(text: str, tail: str) -> bool:
+        # The tail is what some partial has after as many characters as the
+        # committed text (a prefix-matching partial is the common case);
+        # the hypothesis' closing punctuation may be left out.
+        return any(p[len(text):].startswith(tail) for p in partials)
+
+    stray = sorted({(line["text"], line["tail"]) for s in after for line in s["snapshot"]
+                    if line["tail"] and not from_a_partial(line["text"], line["tail"])})
+    c.check(not stray, f"every tail comes from a partial the server sent ({stray[:3]})")
+    shrunk = []
+    shown_before: dict[str, str] = {}
+    for s in after:
+        for line in s["snapshot"]:
+            shown = line["text"] + (line["tail"] or "")
+            old = shown_before.get(line["key"])
+            if old is not None and len(shown) < len(old) and old.startswith(shown):
+                shrunk.append((old, shown))
+            shown_before[line["key"]] = shown
+    c.check(not shrunk, f"shown text (committed + tail) is never cut back ({shrunk[:2]})")
     committed = {r["text"] for r in run.requests if r["event"] in ("ws_stable", "ws_final")} | {""}
     bad_committed = sorted({line["text"] for s in snaps for line in s["snapshot"]} - committed)
     c.check(not bad_committed, f"committed text is only ever stable/final text, never a partial ({bad_committed[:3]})")
@@ -623,6 +641,88 @@ def sc_stable_tail_display_toggle(ctx) -> Checker:
     c.check(not caption_rewrites(caps_before), "rendered captions stay append-only")
     c.check(done_mismatches(run) == [0], f"no non-append stable values ({done_mismatches(run)})")
     run.notes.append(f"snapshots={len(snaps)} tails={len(tails)} partials={len(partials)}")
+    return c, run
+
+
+def segmentation_starts(run: Run) -> list:
+    return [r.get("segmentation") for r in run.requests if r["event"] == "ws_session_start"]
+
+
+def done_field(run: Run, name: str):
+    return next((l.get(name) for l in run.lines if l.get("event") == "done"), None)
+
+
+def sc_segmentation_absent(ctx) -> Checker:
+    """Sentence break set, server without segmentation_control (every server
+    that predates docs/04「切段控制」): the field is never sent."""
+    c = Checker("segmentation_absent")
+    srv = ctx.server(["--revisable", "--growing-text", "--hide-segmentation-capability"])
+    run = ctx.drive(srv, srv.token_file, 8000, extra_args=("--end-silence-ms", "870"))
+    segs = segmentation_starts(run)
+    c.check(bool(segs) and all(sg is None for sg in segs),
+            f"session.start carries no segmentation when the server does not advertise it ({segs})")
+    c.check(run.any_status("session active") and not run.any_status("rejected"),
+            "connects normally; nothing is reported as rejected")
+    c.check(done_field(run, "segmentation_supported") == [False], "the client knows the server does not support it")
+    c.check(any(l["caption"] for l in run.captions()), "captions rendered")
+    return c, run
+
+
+def sc_segmentation_emulated(ctx) -> Checker:
+    """Server advertises segmentation_control (contract emulated around the
+    current server app, see fake_asr_server.py --emulate-segmentation)."""
+    c = Checker("segmentation_emulated")
+    srv = ctx.server(["--revisable", "--growing-text", "--emulate-segmentation"])
+    run = ctx.drive(srv, srv.token_file, 6000, extra_args=("--end-silence-ms", "870"))
+    segs = segmentation_starts(run)
+    c.check(segs[:1] == [{"end_silence_ms": 870}], f"the setting is sent as-is inside the range ({segs})")
+    c.check(done_field(run, "end_silence_effective") == [870],
+            f"the value in effect is read from session.started ({done_field(run, 'end_silence_effective')})")
+    c.check(run.any_status("sentence break 870 ms"), "Tools status shows the sentence break in effect")
+    clamped = ctx.drive(srv, srv.token_file, 5000, extra_args=("--end-silence-ms", "5000"))
+    segs2 = segmentation_starts(clamped)[len(segs):]
+    c.check(segs2[:1] == [{"end_silence_ms": 3000}], f"values above the advertised max are clamped ({segs2})")
+    default = ctx.drive(srv, srv.token_file, 5000, extra_args=("--end-silence-ms", "0"))
+    segs3 = segmentation_starts(default)[len(segs) + len(segs2):]
+    c.check(bool(segs3) and all(sg is None for sg in segs3), f"0 = server default: no field ({segs3})")
+    run.notes.append("wire contract only: the fake VAD does not segment differently")
+    return c, run
+
+
+def sc_segmentation_rejected(ctx) -> Checker:
+    """Server advertises segmentation_control but refuses the field: reconnect
+    with the server's default instead of failing."""
+    c = Checker("segmentation_rejected")
+    srv = ctx.server(["--revisable", "--growing-text", "--reject-segmentation-field"])
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=("--end-silence-ms", "870"))
+    segs = segmentation_starts(run)
+    errs = [r for r in run.requests if r["event"] == "ws_error_event"]
+    c.check(segs[:1] == [{"end_silence_ms": 870}], f"first session.start asks for it ({segs})")
+    c.check(any(r["code"] == "protocol_error" for r in errs), f"server rejects it ({errs[:2]})")
+    c.check(len(segs) >= 2 and segs[1] is None, f"next attempt drops only the segmentation field ({segs})")
+    starts = [r for r in run.requests if r["event"] == "ws_session_start"]
+    c.check(len(starts) >= 2 and starts[1]["stable"] == {"agreement": 2}, "stable captions are kept")
+    c.check(run.any_status("rejected the sentence break"), "Tools status explains the fallback")
+    c.check(run.any_status("session active"), "still connects")
+    return c, run
+
+
+def sc_segmentation_real(ctx) -> Checker:
+    """Against the server in --service-dir as-is. Needs a server with
+    docs/04「切段控制」; with an older one this documents that the field is
+    not sent and the scenario passes as skipped."""
+    c = Checker("segmentation_real")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    run = ctx.drive(srv, srv.token_file, 6000, extra_args=("--end-silence-ms", "870"))
+    supported = done_field(run, "segmentation_supported") == [True]
+    segs = segmentation_starts(run)
+    if not supported:
+        c.check(bool(segs) and all(sg is None for sg in segs),
+                f"SKIPPED (server without segmentation_control): field not sent ({segs})")
+        run.notes.append("needs the server with session.start.segmentation to run for real")
+        return c, run
+    c.check(segs[:1] == [{"end_silence_ms": 870}], f"sent to a real supporting server ({segs})")
+    c.check(done_field(run, "end_silence_effective") == [870], "the server reports 870 ms in effect")
     return c, run
 
 
@@ -645,6 +745,10 @@ SCENARIOS = {
     "stable_rejected": sc_stable_rejected_downgrade,
     "stable_hold": sc_stable_reconnect_hold,
     "stable_tail": sc_stable_tail_display_toggle,
+    "segmentation_absent": sc_segmentation_absent,
+    "segmentation_emulated": sc_segmentation_emulated,
+    "segmentation_rejected": sc_segmentation_rejected,
+    "segmentation_real": sc_segmentation_real,
 }
 
 

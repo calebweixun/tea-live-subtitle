@@ -27,6 +27,9 @@ typedef struct {
 	bool stable_captions_enabled;      /* the source's "stable captions" setting */
 	bool stable_captions_active;       /* current session was started with `stable` */
 	uint64_t stable_mismatches;        /* transcript.stable values dropped as non-append */
+	bool supports_segmentation;        /* capabilities advertise segmentation_control */
+	int end_silence_setting_ms;        /* the source's sentence break setting, 0 = server default */
+	int end_silence_effective_ms;      /* preview_policy.endpoint_silence_ms of the session, -1 unknown */
 } tea_captions_source_info_t;
 
 /* Calls `cb` once per currently-live tea_live_subtitle_source instance, in

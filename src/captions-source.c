@@ -40,8 +40,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  *   - A new layout is shown only after all of its textures exist; until then
  *     the previous layout stays on screen, so nothing ever flickers.
  *
- * All geometry and timing decisions (wrapping, alignment, row limit, pause
- * line breaks, fades) are pure functions in caption-display.h and tested
+ * All geometry and timing decisions (wrapping, alignment, row limit, fades,
+ * speech activity) are pure functions in caption-display.h and tested
  * without OBS in tests/caption-layout-test.cpp. This file only moves data
  * between the caption state, the workers and the GPU.
  *
@@ -85,7 +85,11 @@ static const char *const k_text_ft2_ids[] = {
 };
 
 /* ---- settings keys added by the per-line renderer ---- */
-#define TEA_KEY_PAUSE_MS "line_break_pause_ms"
+/* Sentence break: the server's end-of-segment silence, sent as
+ * session.start.segmentation.end_silence_ms (0 = server default). */
+#define TEA_KEY_END_SILENCE_MS "sentence_break_silence_ms"
+/* Before: a client-side gap between text arrivals. Migrated on load. */
+#define TEA_KEY_LEGACY_PAUSE_MS "line_break_pause_ms"
 #define TEA_KEY_FADE_IN "fade_in_enabled"
 #define TEA_KEY_FADE_OUT "fade_out_enabled"
 #define TEA_KEY_FADE_MS "fade_ms"
@@ -98,20 +102,30 @@ static const char *const k_text_ft2_ids[] = {
 #define TEA_KEY_TAIL_OPACITY "unstable_tail_opacity"
 
 /* Sources created after the per-line renderer shipped get the recommended
- * live-subtitle behaviour (fade in/out, pause breaks, a two-row screen
- * limit) as explicit values. Existing scenes have no marker and keep the
- * neutral defaults, so they look the same after the upgrade. */
+ * live-subtitle look as explicit values (version 2: the settings the user
+ * settled on in a real broadcast). Existing scenes keep their own values;
+ * scenes from before the renderer have no marker and keep the neutral
+ * defaults, so they look the same after the upgrade. */
 #define TEA_RENDER_SCHEMA_KEY "render_schema_version"
-#define TEA_RENDER_SCHEMA_VERSION 1
+#define TEA_RENDER_SCHEMA_VERSION 2
 
-#define TEA_DEFAULT_PAUSE_MS 0
-#define TEA_NEW_SOURCE_PAUSE_MS 3000
+#define TEA_DEFAULT_END_SILENCE_MS 0 /* server default */
 #define TEA_DEFAULT_FADE_MS 400
 #define TEA_DEFAULT_FADE_DELAY_MS 6000
-#define TEA_NEW_SOURCE_MAX_ROWS 2
 #define TEA_DEFAULT_BG_COLOR 0xA0000000 /* ABGR: black, ~63% opaque */
 #define TEA_DEFAULT_BG_PADDING 8
 #define TEA_DEFAULT_TAIL_OPACITY 50
+
+/* New-source values (render schema 2). OBS colours are 0xAABBGGRR. */
+#define TEA_NEW_SOURCE_COLOR_TOP 0xFFFFFFFF    /* #FFFFFF */
+#define TEA_NEW_SOURCE_COLOR_BOTTOM 0xFF77E5DB /* #DBE577 */
+#define TEA_NEW_SOURCE_CAPTION_WIDTH 1800
+#define TEA_NEW_SOURCE_MAX_LINES 3
+#define TEA_NEW_SOURCE_MAX_ROWS 2
+#define TEA_NEW_SOURCE_END_SILENCE_MS 870
+#define TEA_NEW_SOURCE_FADE_DELAY_MS 1500
+#define TEA_NEW_SOURCE_FADE_MS 200
+#define TEA_NEW_SOURCE_BG_PADDING 0
 
 #define TEA_WORKER_COUNT 3
 #define TEA_MAX_DRAW_ROWS 20
@@ -147,7 +161,6 @@ struct tea_render_config {
 	int legacy_custom_width;
 	bool legacy_word_wrap;
 	bool show_placeholder;
-	uint32_t pause_ms;
 	bool fade_in;
 	bool fade_out;
 	uint32_t fade_ms;
@@ -203,7 +216,8 @@ struct tea_draw_row {
 	int32_t x, y;
 	uint32_t w, h;
 	uint64_t born;    /* first appearance of the row's oldest piece */
-	uint64_t changed; /* line's last change: drives fade-out */
+	uint64_t changed; /* line's fade-out reference when laid out (fallback) */
+	uint64_t key;     /* line identity: the live fade-out reference is looked up at draw time */
 	bool persistent;
 };
 
@@ -250,6 +264,7 @@ struct tea_captions_source {
 	int applied_server_port;
 	char *applied_token_path;
 	int applied_stable_captions; /* -1 = never applied, else 0/1 */
+	int applied_end_silence_ms;
 	bool connection_pending;
 	volatile long properties_open;
 
@@ -273,6 +288,8 @@ struct tea_captions_source {
 	int order[TEA_MAX_LINES]; /* line indices, oldest first */
 	int order_count;
 	uint64_t caption_rev_seen;
+	uint64_t session_activity;    /* snapshot activity counter last seen */
+	uint64_t session_activity_ns; /* when it last changed: the session is talking */
 	bool force_snapshot;
 	bool layout_dirty;
 
@@ -380,6 +397,9 @@ void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *i
 			.stable_captions_enabled = ctx->applied_stable_captions != 0,
 			.stable_captions_active = tea_asr_client_stable_captions_active(ctx->client),
 			.stable_mismatches = ctx->captions ? tea_caption_state_stable_mismatches(ctx->captions) : 0,
+			.supports_segmentation = tea_asr_client_supports_segmentation(ctx->client, NULL, NULL, NULL),
+			.end_silence_setting_ms = ctx->applied_end_silence_ms,
+			.end_silence_effective_ms = tea_asr_client_effective_end_silence_ms(ctx->client),
 		};
 		cb(&info, user);
 		bfree(status_text);
@@ -411,6 +431,15 @@ static const char *tea_text_or(const char *key, const char *fallback)
 	return (text && strcmp(text, key) != 0) ? text : fallback;
 }
 
+static int tea_clamp_setting(long long v, int lo, int hi)
+{
+	if (v < lo)
+		return lo;
+	if (v > hi)
+		return hi;
+	return (int)v;
+}
+
 static bool tea_str_eq(const char *a, const char *b)
 {
 	if (!a || !b)
@@ -434,6 +463,8 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 	int server_port = (int)obs_data_get_int(settings, "server_port");
 	const char *token_path = obs_data_get_string(settings, "token_path");
 	const bool stable_captions = obs_data_get_bool(settings, "stable_captions");
+	const int end_silence_ms =
+		tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_END_SILENCE_MS), 0, TEA_END_SILENCE_MAX_MS);
 
 	pthread_mutex_lock(&ctx->conn_lock);
 	tea_connection_settings_t applied = {
@@ -441,12 +472,14 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		.port = ctx->applied_server_port,
 		.token_path = ctx->applied_token_path,
 		.stable = ctx->applied_stable_captions == 1,
+		.end_silence_ms = ctx->applied_end_silence_ms,
 	};
 	tea_connection_settings_t incoming = {
 		.host = server_host,
 		.port = server_port,
 		.token_path = token_path,
 		.stable = stable_captions,
+		.end_silence_ms = end_silence_ms,
 	};
 	const bool interactive = os_atomic_load_long(&ctx->properties_open) > 0;
 	const int action =
@@ -457,6 +490,8 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		tea_asr_client_set_token_path(ctx->client, token_path);
 		/* session.start carries `stable`, so a toggle needs a new session. */
 		tea_asr_client_set_stable_captions(ctx->client, stable_captions);
+		/* So does `segmentation` (the sentence break silence). */
+		tea_asr_client_set_end_silence_ms(ctx->client, end_silence_ms);
 		tea_asr_client_start(ctx->client); /* idempotent restart with the new settings */
 
 		bfree(ctx->applied_server_host);
@@ -465,6 +500,7 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		bfree(ctx->applied_token_path);
 		ctx->applied_token_path = bstrdup(token_path);
 		ctx->applied_stable_captions = stable_captions ? 1 : 0;
+		ctx->applied_end_silence_ms = end_silence_ms;
 	}
 	pthread_mutex_unlock(&ctx->conn_lock);
 }
@@ -522,36 +558,26 @@ static void tea_config_free(struct tea_render_config *cfg)
 	bfree(cfg);
 }
 
-static int tea_clamp_int(long long v, int lo, int hi)
-{
-	if (v < lo)
-		return lo;
-	if (v > hi)
-		return hi;
-	return (int)v;
-}
-
 static struct tea_render_config *tea_config_build(struct tea_captions_source *ctx, obs_data_t *settings)
 {
 	struct tea_render_config *cfg = bzalloc(sizeof(*cfg));
-	cfg->align = tea_clamp_int(obs_data_get_int(settings, "caption_align"), 0, 2);
+	cfg->align = tea_clamp_setting(obs_data_get_int(settings, "caption_align"), 0, 2);
 	cfg->padding = ctx->padding;
 	cfg->layout_mode = ctx->layout_mode;
 	cfg->caption_width = ctx->caption_width_px;
-	cfg->legacy_custom_width = tea_clamp_int(obs_data_get_int(settings, "custom_width"), 0, 8192);
+	cfg->legacy_custom_width = tea_clamp_setting(obs_data_get_int(settings, "custom_width"), 0, 8192);
 	cfg->legacy_word_wrap = obs_data_get_bool(settings, "word_wrap");
 	cfg->show_placeholder = ctx->show_placeholder;
-	cfg->pause_ms = (uint32_t)tea_clamp_int(obs_data_get_int(settings, TEA_KEY_PAUSE_MS), 0, 60000);
 	cfg->fade_in = obs_data_get_bool(settings, TEA_KEY_FADE_IN);
 	cfg->fade_out = obs_data_get_bool(settings, TEA_KEY_FADE_OUT);
-	cfg->fade_ms = (uint32_t)tea_clamp_int(obs_data_get_int(settings, TEA_KEY_FADE_MS), 0, 10000);
-	cfg->fade_delay_ms = (uint32_t)tea_clamp_int(obs_data_get_int(settings, TEA_KEY_FADE_DELAY_MS), 0, 600000);
-	cfg->max_rows = tea_clamp_int(obs_data_get_int(settings, TEA_KEY_MAX_ROWS), 0, TEA_MAX_DRAW_ROWS);
+	cfg->fade_ms = (uint32_t)tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_FADE_MS), 0, 10000);
+	cfg->fade_delay_ms = (uint32_t)tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_FADE_DELAY_MS), 0, 600000);
+	cfg->max_rows = tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_MAX_ROWS), 0, TEA_MAX_DRAW_ROWS);
 	cfg->bg = obs_data_get_bool(settings, TEA_KEY_BG);
 	cfg->bg_color = (uint32_t)obs_data_get_int(settings, TEA_KEY_BG_COLOR);
-	cfg->bg_padding = tea_clamp_int(obs_data_get_int(settings, TEA_KEY_BG_PADDING), 0, 200);
+	cfg->bg_padding = tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_BG_PADDING), 0, 200);
 	cfg->tail = obs_data_get_bool(settings, TEA_KEY_TAIL);
-	cfg->tail_opacity = (float)tea_clamp_int(obs_data_get_int(settings, TEA_KEY_TAIL_OPACITY), 0, 100) / 100.0f;
+	cfg->tail_opacity = (float)tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_TAIL_OPACITY), 0, 100) / 100.0f;
 
 	/* obs_data_apply() copies user values only. Start with the effective
 	 * defaults so a platform CJK font (and all other plugin defaults) actually
@@ -623,6 +649,16 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 
 		bfree(ctx->applied_audio_source_name);
 		ctx->applied_audio_source_name = bstrdup(audio_source_name);
+	}
+
+	/* --- settings migration: the sentence break used to be a client-side
+	 * gap between text arrivals; it is now the server's end silence. --- */
+	if (!obs_data_has_user_value(settings, TEA_KEY_END_SILENCE_MS) &&
+	    obs_data_has_user_value(settings, TEA_KEY_LEGACY_PAUSE_MS)) {
+		obs_data_set_int(
+			settings, TEA_KEY_END_SILENCE_MS,
+			tea_end_silence_from_legacy_pause(obs_data_get_int(settings, TEA_KEY_LEGACY_PAUSE_MS)));
+		obs_data_erase(settings, TEA_KEY_LEGACY_PAUSE_MS);
 	}
 
 	/* --- server connection: see tea_apply_connection() --- */
@@ -876,7 +912,7 @@ static void tea_recycle_workers(struct tea_captions_source *ctx)
 			continue;
 		uint8_t bit = tea_worker_bit(ctx, w);
 		for (uint32_t s = 0; s < TEA_GLYPH_CACHE_SLOTS; s++)
-			ctx->glyphs->slots[s].seen_by &= (uint8_t)~bit;
+			ctx->glyphs->entries[s].seen_by &= (uint8_t)~bit;
 		tea_worker_close(w);
 		tea_worker_open(ctx, i);
 	}
@@ -1048,7 +1084,7 @@ static char *tea_display_text(const char *text, const char *tail, size_t *len_ou
 }
 
 static void tea_sync_line(struct tea_captions_source *ctx, bool *keep, uint64_t key, const char *text, const char *tail,
-			  bool persistent, uint64_t now)
+			  bool persistent, bool open, uint64_t activity, uint64_t now)
 {
 	size_t len = 0, locked = 0;
 	char *display = tea_display_text(text, tail, &len, &locked);
@@ -1065,11 +1101,11 @@ static void tea_sync_line(struct tea_captions_source *ctx, bool *keep, uint64_t 
 		line->text = display;
 	} else {
 		struct tea_rline *line = &ctx->lines[idx];
-		tea_display_line_observe(&line->meta, line->text, line->meta.len, display, len, locked, now,
-					 persistent ? 0 : ctx->config->pause_ms);
+		tea_display_line_observe(&line->meta, line->text, line->meta.len, display, len, locked, now);
 		bfree(line->text);
 		line->text = display;
 	}
+	tea_display_line_note_activity(&ctx->lines[idx].meta, activity, open, now);
 	ctx->lines[idx].meta.persistent = persistent;
 	keep[idx] = true;
 	if (ctx->order_count < TEA_MAX_LINES)
@@ -1088,6 +1124,10 @@ static void tea_sync_lines(struct tea_captions_source *ctx, uint64_t now)
 
 	tea_caption_snapshot_t snap;
 	tea_caption_state_snapshot(ctx->captions, ctx->config->tail, &snap);
+	if (snap.activity != ctx->session_activity) {
+		ctx->session_activity = snap.activity;
+		ctx->session_activity_ns = now;
+	}
 
 	/* Lines that left the snapshot are dropped first, so their slots can be
 	 * reused by lines that just arrived. */
@@ -1120,15 +1160,17 @@ static void tea_sync_lines(struct tea_captions_source *ctx, uint64_t now)
 	ctx->order_count = 0;
 	for (int i = 0; i < snap.count; i++) {
 		const tea_caption_snapshot_line_t *s = &snap.lines[i];
-		tea_sync_line(ctx, keep, s->key, s->text, s->tail, false, now);
+		tea_sync_line(ctx, keep, s->key, s->text, s->tail, false, s->open, s->activity, now);
 	}
 	if (use_placeholder)
-		tea_sync_line(ctx, keep, TEA_PLACEHOLDER_KEY, placeholder, NULL, true, now);
+		tea_sync_line(ctx, keep, TEA_PLACEHOLDER_KEY, placeholder, NULL, true, false, 0, now);
 	tea_caption_snapshot_free(&snap);
 	ctx->layout_dirty = true;
 }
 
-/* Lines idle for longer than delay + fade have faded out completely. */
+/* Lines idle for longer than delay + fade have faded out completely. An
+ * open line only counts as idle when the whole session has been quiet (see
+ * tea_display_line_fade_ref()), so a sentence never fades out mid-speech. */
 static void tea_expire_lines(struct tea_captions_source *ctx, uint64_t now)
 {
 	const struct tea_render_config *cfg = ctx->config;
@@ -1138,7 +1180,8 @@ static void tea_expire_lines(struct tea_captions_source *ctx, uint64_t now)
 		struct tea_rline *line = &ctx->lines[i];
 		if (!line->used || line->meta.persistent || !tea_display_line_has_visible_text(&line->meta))
 			continue;
-		if (tea_fade_out_done(true, now, line->meta.changed_ns, cfg->fade_delay_ms, cfg->fade_ms)) {
+		const uint64_t ref = tea_display_line_fade_ref(&line->meta, ctx->session_activity_ns);
+		if (tea_fade_out_done(true, now, ref, cfg->fade_delay_ms, cfg->fade_ms)) {
 			tea_display_line_retire(&line->meta);
 			ctx->layout_dirty = true;
 		}
@@ -1264,7 +1307,8 @@ static void tea_layout(struct tea_captions_source *ctx)
 		row->y = (int32_t)tea_caption_frame_row_y(&geo, frame->row_count);
 		row->w = wr->width;
 		row->h = geo.row_height;
-		row->changed = line->meta.changed_ns;
+		row->changed = tea_display_line_fade_ref(&line->meta, ctx->session_activity_ns);
+		row->key = line->meta.key;
 		row->persistent = line->meta.persistent;
 		row->born = UINT64_MAX;
 		const bool has_tail = line->meta.locked_len < line->meta.len;
@@ -1365,11 +1409,22 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 	tea_recycle_workers(ctx);
 }
 
-static float tea_row_alpha(const struct tea_render_config *cfg, const struct tea_draw_row *row, uint64_t now)
+/* The fade-out reference is looked up live: the frame on screen may be a
+ * few frames older than the caption state (while new glyphs are measured
+ * or rendered), and activity that arrived since must still keep it up. */
+static float tea_row_alpha(const struct tea_captions_source *ctx, const struct tea_draw_row *row, uint64_t now)
 {
+	const struct tea_render_config *cfg = ctx->config;
 	if (row->persistent)
 		return 1.0f;
-	return tea_fade_out_alpha(cfg->fade_out, now, row->changed, cfg->fade_delay_ms, cfg->fade_ms);
+	uint64_t ref = row->changed;
+	int idx = tea_line_find((struct tea_captions_source *)ctx, row->key);
+	if (idx >= 0) {
+		uint64_t live = tea_display_line_fade_ref(&ctx->lines[idx].meta, ctx->session_activity_ns);
+		if (live > ref)
+			ref = live;
+	}
+	return tea_fade_out_alpha(cfg->fade_out, now, ref, cfg->fade_delay_ms, cfg->fade_ms);
 }
 
 static void tea_draw_backgrounds(struct tea_captions_source *ctx, uint64_t now)
@@ -1384,7 +1439,7 @@ static void tea_draw_backgrounds(struct tea_captions_source *ctx, uint64_t now)
 	for (int i = 0; i < ctx->committed.row_count; i++) {
 		const struct tea_draw_row *row = &ctx->committed.rows[i];
 		float alpha =
-			tea_row_alpha(cfg, row, now) * tea_fade_in_alpha(cfg->fade_in, now, row->born, cfg->fade_ms);
+			tea_row_alpha(ctx, row, now) * tea_fade_in_alpha(cfg->fade_in, now, row->born, cfg->fade_ms);
 		if (alpha <= 0.0f || row->w == 0)
 			continue;
 		struct vec4 c;
@@ -1422,7 +1477,7 @@ static void tea_draw_pieces(struct tea_captions_source *ctx, uint64_t now)
 			continue;
 		const struct tea_draw_row *row = &ctx->committed.rows[piece->row];
 		float alpha =
-			tea_row_alpha(cfg, row, now) * tea_fade_in_alpha(cfg->fade_in, now, piece->born, cfg->fade_ms);
+			tea_row_alpha(ctx, row, now) * tea_fade_in_alpha(cfg->fade_in, now, piece->born, cfg->fade_ms);
 		if (piece->tail)
 			alpha *= cfg->tail_opacity;
 		if (alpha <= 0.0f)
@@ -1590,7 +1645,7 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	/* Per-line renderer. The defaults are the "looks exactly like before"
 	 * values; only a brand-new source (same detection as above) gets the
 	 * recommended live-subtitle values written as its own settings. */
-	obs_data_set_default_int(settings, TEA_KEY_PAUSE_MS, TEA_DEFAULT_PAUSE_MS);
+	obs_data_set_default_int(settings, TEA_KEY_END_SILENCE_MS, TEA_DEFAULT_END_SILENCE_MS);
 	obs_data_set_default_bool(settings, TEA_KEY_FADE_IN, false);
 	obs_data_set_default_bool(settings, TEA_KEY_FADE_OUT, false);
 	obs_data_set_default_int(settings, TEA_KEY_FADE_MS, TEA_DEFAULT_FADE_MS);
@@ -1603,10 +1658,25 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, TEA_KEY_TAIL_OPACITY, TEA_DEFAULT_TAIL_OPACITY);
 	if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_RENDER_SCHEMA_KEY)) {
 		obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERSION);
+		obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);
+		obs_data_set_int(settings, "color2", TEA_NEW_SOURCE_COLOR_BOTTOM);
+		obs_data_set_bool(settings, "outline", true);
+		obs_data_set_bool(settings, "drop_shadow", true);
+		obs_data_set_bool(settings, TEA_KEY_BG, true);
+		obs_data_set_int(settings, TEA_KEY_BG_PADDING, TEA_NEW_SOURCE_BG_PADDING);
+		obs_data_set_int(settings, "layout_mode", TEA_LAYOUT_MODE_FIXED);
+		obs_data_set_int(settings, "caption_width_px", TEA_NEW_SOURCE_CAPTION_WIDTH);
+		obs_data_set_int(settings, "caption_align", TEA_ALIGN_CENTER);
+		obs_data_set_int(settings, "padding", 10);
+		obs_data_set_int(settings, "max_lines", TEA_NEW_SOURCE_MAX_LINES);
+		obs_data_set_int(settings, TEA_KEY_MAX_ROWS, TEA_NEW_SOURCE_MAX_ROWS);
+		obs_data_set_int(settings, TEA_KEY_END_SILENCE_MS, TEA_NEW_SOURCE_END_SILENCE_MS);
+		obs_data_set_bool(settings, "show_placeholder", true);
 		obs_data_set_bool(settings, TEA_KEY_FADE_IN, true);
 		obs_data_set_bool(settings, TEA_KEY_FADE_OUT, true);
-		obs_data_set_int(settings, TEA_KEY_PAUSE_MS, TEA_NEW_SOURCE_PAUSE_MS);
-		obs_data_set_int(settings, TEA_KEY_MAX_ROWS, TEA_NEW_SOURCE_MAX_ROWS);
+		obs_data_set_int(settings, TEA_KEY_FADE_DELAY_MS, TEA_NEW_SOURCE_FADE_DELAY_MS);
+		obs_data_set_int(settings, TEA_KEY_FADE_MS, TEA_NEW_SOURCE_FADE_MS);
+		obs_data_set_bool(settings, TEA_KEY_TAIL, true);
 	}
 
 	obs_data_set_default_string(settings, "audio_source_name", "");
@@ -1644,6 +1714,41 @@ static bool tea_enum_audio_sources_cb(void *param, obs_source_t *source)
 	if (flags & OBS_SOURCE_AUDIO)
 		obs_property_list_add_string(list, obs_source_get_name(source), obs_source_get_name(source));
 	return true;
+}
+
+/* What the server says about the sentence break setting, as of the last
+ * connection attempt (the Properties window is rebuilt on every open). */
+static void tea_sentence_break_hint(struct tea_captions_source *ctx, char *out, size_t size)
+{
+	int min_ms = 0, max_ms = 0, default_ms = 0;
+	const bool known = ctx && ctx->client && tea_asr_client_capabilities_known(ctx->client);
+	const bool supported = known &&
+			       tea_asr_client_supports_segmentation(ctx->client, &min_ms, &max_ms, &default_ms);
+	const int effective = ctx && ctx->client ? tea_asr_client_effective_end_silence_ms(ctx->client) : -1;
+	if (!known) {
+		snprintf(out, size, "%s",
+			 tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak.Unknown",
+				     "Sentence break: not connected yet, the server's support is unknown."));
+	} else if (!supported) {
+		snprintf(out, size, "%s",
+			 tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak.Unsupported",
+				     "This server does not support setting the sentence break; it uses its own "
+				     "value and this setting is not sent."));
+	} else {
+		/* numbers appended here: translations never carry format specifiers */
+		if (effective > 0)
+			snprintf(out, size, "%s %d-%d ms / %d ms / %d ms",
+				 tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak.Supported",
+					     "Supported by this server (values outside the range are clamped). "
+					     "Range / server default / current session:"),
+				 min_ms, max_ms, default_ms, effective);
+		else
+			snprintf(out, size, "%s %d-%d ms / %d ms / -",
+				 tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak.Supported",
+					     "Supported by this server (values outside the range are clamped). "
+					     "Range / server default / current session:"),
+				 min_ms, max_ms, default_ms);
+	}
 }
 
 /* Shows the "Auto mode never wraps" hint only where it applies, and only the
@@ -1695,12 +1800,26 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 					 "Show only text the server has committed (transcript.stable), so shown "
 					 "characters are never rewritten. Off: show the live partial preview, which "
 					 "may change. Used only when the server supports it."));
-	obs_properties_add_text(props, "connection_hint",
-				tea_text_or("TeaLiveSubtitle.Prop.ConnectionHint",
-					    "Server, port, token and stable-caption changes take effect when you "
-					    "press \"Apply connection settings\" or close this window. Everything "
-					    "else applies immediately."),
-				OBS_TEXT_INFO);
+	obs_property_t *silence_prop = obs_properties_add_int(
+		props, TEA_KEY_END_SILENCE_MS,
+		tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak", "Sentence break silence (ms, 0 = server default)"), 0,
+		TEA_END_SILENCE_MAX_MS, 10);
+	obs_property_set_long_description(
+		silence_prop,
+		tea_text_or("TeaLiveSubtitle.Prop.SentenceBreak.Tooltip",
+			    "How long a silence the server's voice detector waits for before it ends a sentence; "
+			    "every sentence starts a new line. Shorter: more, shorter lines. Sent to the server "
+			    "when the connection is applied."));
+	char hint[512];
+	tea_sentence_break_hint(ctx, hint, sizeof(hint));
+	obs_properties_add_text(props, "sentence_break_hint", hint, OBS_TEXT_INFO);
+	obs_properties_add_text(
+		props, "connection_hint",
+		tea_text_or("TeaLiveSubtitle.Prop.ConnectionHint",
+			    "Server, port, token, stable-caption and sentence-break changes take effect "
+			    "when you press \"Apply connection settings\" or close this window. Everything "
+			    "else applies immediately."),
+		OBS_TEXT_INFO);
 	obs_properties_add_button2(props, "apply_connection",
 				   tea_text_or("TeaLiveSubtitle.Prop.ApplyConnection", "Apply connection settings"),
 				   tea_apply_connection_clicked, data);
@@ -1770,15 +1889,6 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 		rows_prop, tea_text_or("TeaLiveSubtitle.Prop.MaxVisibleRows.Tooltip",
 				       "Counts wrapped rows. When a new row would exceed the limit, the oldest "
 				       "row leaves the screen as a whole; text inside a row never changes."));
-	obs_property_t *pause_prop = obs_properties_add_int(props, TEA_KEY_PAUSE_MS,
-							    tea_text_or("TeaLiveSubtitle.Prop.LineBreakPause",
-									"Sentence break pause (ms, 0 = off)"),
-							    0, 60000, 100);
-	obs_property_set_long_description(
-		pause_prop, tea_text_or("TeaLiveSubtitle.Prop.LineBreakPause.Tooltip",
-					"Start a new row when the caption has not changed for this long. Every new "
-					"server segment (the server cuts after ~0.9 s of silence) already starts a "
-					"new row; this adds breaks for long pauses inside one segment."));
 	obs_properties_add_bool(props, "show_placeholder", obs_module_text("TeaLiveSubtitle.Prop.ShowPlaceholder"));
 
 	/* --- fades --- */
@@ -1797,10 +1907,11 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 							    tea_text_or("TeaLiveSubtitle.Prop.UnstableTail",
 									"Show not-yet-confirmed text (fainter)"));
 	obs_property_set_long_description(
-		tail_prop, tea_text_or("TeaLiveSubtitle.Prop.UnstableTail.Tooltip",
-				       "Stable captions only. After the confirmed text, show the part of the newest "
-				       "preview the server has not confirmed yet. Confirmed text never changes; "
-				       "only this fainter tail may."));
+		tail_prop,
+		tea_text_or("TeaLiveSubtitle.Prop.UnstableTail.Tooltip",
+			    "Stable captions only. After the confirmed text, show (fainter) what the newest "
+			    "preview has beyond it. Shown text never goes backwards: unconfirmed words may be "
+			    "corrected, never removed, and a line keeps what it shows when its sentence ends."));
 	obs_properties_add_int_slider(props, TEA_KEY_TAIL_OPACITY,
 				      tea_text_or("TeaLiveSubtitle.Prop.UnstableTailOpacity",
 						  "Not-yet-confirmed text opacity (%)"),
