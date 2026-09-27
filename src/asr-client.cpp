@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "caption-display.h"
 
 #include <QCryptographicHash>
+#include <QDir>
 #include <QRandomGenerator>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -183,6 +184,254 @@ void TeaAsrClient::setEndSilenceMs(int ms)
 	endSilencePreferred_ = ms > 0 ? ms : 0;
 }
 
+void TeaAsrClient::setTraceDir(const QString &dir)
+{
+	QMutexLocker lock(&traceMutex_);
+	traceDir_ = dir;
+}
+
+void TeaAsrClient::diagnostics(int *connection, int *speech, double *input_dbfs, bool *input_recent,
+			       int64_t *ms_since_text) const
+{
+	const qint64 now = monotonic_.isValid() ? monotonic_.elapsed() : 0;
+	const qint64 lastInput = lastInputMs_.load();
+	const qint64 lastText = lastTextMsAtomic_.load();
+	*connection = connState_.load();
+	*speech = speechStateAtomic_.load();
+	*input_recent = lastInput >= 0 && now - lastInput <= 1000;
+	*input_dbfs = *input_recent ? inputDbfsTenths_.load() / 10.0 : TEA_DBFS_FLOOR;
+	*ms_since_text = lastText >= 0 ? now - lastText : -1;
+}
+
+/* ---------------- diagnostics (docs/diagnostics.md) ---------------- */
+
+static const char *tea_conn_name(int state)
+{
+	switch (state) {
+	case TEA_CONN_WAITING_AUDIO:
+		return "waiting for an audio source";
+	case TEA_CONN_WAITING_TOKEN:
+		return "waiting for the token file";
+	case TEA_CONN_CONNECTING:
+		return "connecting";
+	case TEA_CONN_CONNECTED:
+		return "connected";
+	case TEA_CONN_ACTIVE:
+		return "session active";
+	case TEA_CONN_RECONNECTING:
+		return "reconnecting";
+	default:
+		return "stopped";
+	}
+}
+
+static const char *tea_speech_name(int state)
+{
+	switch (state) {
+	case TEA_SPEECH_DETECTED:
+		return "speech detected";
+	case TEA_SPEECH_PROCESSING:
+		return "segment processing";
+	default:
+		return "listening";
+	}
+}
+
+void TeaAsrClient::setConnState(int state, const QString &reason)
+{
+	const int before = connState_.exchange(state);
+	if (before == state && state != TEA_CONN_RECONNECTING)
+		return;
+	obs_log(state == TEA_CONN_RECONNECTING || state == TEA_CONN_STOPPED ? LOG_WARNING : LOG_INFO,
+		"asr-client: connection %s%s%s", tea_conn_name(state), reason.isEmpty() ? "" : ": ",
+		reason.toUtf8().constData());
+}
+
+void TeaAsrClient::diagOnSessionStarted(const QJsonObject &started)
+{
+	const qint64 now = nowMs();
+	tea_warn_session_start(&warn_, now);
+	tea_heartbeat_reset(&heartbeat_, now);
+	tea_speech_reset(&speech_);
+	speechStateAtomic_ = TEA_SPEECH_LISTENING;
+	lastTextMs_ = -1;
+	lastTextMsAtomic_ = -1;
+	const QJsonObject policy = started.value(QStringLiteral("preview_policy")).toObject();
+	setConnState(TEA_CONN_ACTIVE, QStringLiteral("%1:%2 sent %3; server: transcript_mode=%4 endpoint_silence_ms=%5 "
+						     "min_interval_ms=%6")
+					      .arg(host_)
+					      .arg(port_)
+					      .arg(QString::fromUtf8(lastSessionStart_))
+					      .arg(started.value(QStringLiteral("transcript_mode")).toString())
+					      .arg(policy.value(QStringLiteral("endpoint_silence_ms")).toInt(-1))
+					      .arg(policy.value(QStringLiteral("min_interval_ms")).toInt(-1)));
+}
+
+void TeaAsrClient::diagOnEvent(const QString &type)
+{
+	const qint64 now = nowMs();
+	const QByteArray utf8 = type.toUtf8();
+	const int kind = tea_event_kind(utf8.constData());
+	heartbeat_.events[kind]++;
+	tea_warn_on_server_event(&warn_, now);
+	switch (kind) {
+	case TEA_EV_SPEECH_STARTED:
+		tea_speech_on_started(&speech_);
+		tea_warn_on_speech(&warn_);
+		break;
+	case TEA_EV_SEGMENT_QUEUED:
+		tea_speech_on_queued(&speech_);
+		break;
+	case TEA_EV_PARTIAL:
+	case TEA_EV_STABLE:
+	case TEA_EV_FINAL:
+		lastTextMs_ = now;
+		lastTextMsAtomic_ = now;
+		tea_warn_on_speech(&warn_);
+		if (kind == TEA_EV_FINAL)
+			tea_speech_on_segment_done(&speech_);
+		break;
+	default:
+		if (type == QLatin1String("segment.skipped") || type == QLatin1String("segment.error"))
+			tea_speech_on_segment_done(&speech_);
+		break;
+	}
+	speechStateAtomic_ = tea_speech_state(&speech_);
+}
+
+void TeaAsrClient::logHeartbeat(qint64 now)
+{
+	const tea_heartbeat_t &h = heartbeat_;
+	const double window_s = (double)(now - h.start_ms) / 1000.0;
+	const QString sinceText =
+		lastTextMs_ >= 0 ? QStringLiteral("%1 s ago").arg((double)(now - lastTextMs_) / 1000.0, 0, 'f', 1)
+				 : QStringLiteral("none yet");
+	obs_log(LOG_INFO,
+		"asr-client: heartbeat %.1fs: sent %llu ms audio in %llu frames, max gap %lld ms, level rms %.1f dBFS "
+		"peak %.1f dBFS; events partial=%u stable=%u final=%u speech.started=%u segment.queued=%u "
+		"audio.ack=%u other=%u; last text %s; speech state %s",
+		window_s, (unsigned long long)(h.samples / 16), (unsigned long long)h.frames,
+		(long long)tea_heartbeat_max_gap(&h, now), tea_pcm_level_rms_dbfs(&h.level),
+		tea_pcm_level_peak_dbfs(&h.level), h.events[TEA_EV_PARTIAL], h.events[TEA_EV_STABLE],
+		h.events[TEA_EV_FINAL], h.events[TEA_EV_SPEECH_STARTED], h.events[TEA_EV_SEGMENT_QUEUED],
+		h.events[TEA_EV_AUDIO_ACK], h.events[TEA_EV_OTHER], sinceText.toUtf8().constData(),
+		tea_speech_name(tea_speech_state(&speech_)));
+}
+
+void TeaAsrClient::diagTick()
+{
+	const qint64 now = nowMs();
+	/* input level for the overlay: last ~0.5 s pulled from the source */
+	if (now - inputLevelStartMs_ >= 500) {
+		if (inputLevel_.samples > 0)
+			inputDbfsTenths_ = (int)lround(tea_pcm_level_rms_dbfs(&inputLevel_) * 10.0);
+		tea_pcm_level_reset(&inputLevel_);
+		inputLevelStartMs_ = now;
+	}
+	if (!sessionStarted_)
+		return;
+	const int due = tea_warn_due(&warn_, now);
+	if (due & TEA_WARN_NO_AUDIO)
+		obs_log(LOG_WARNING,
+			"asr-client: WARN no audio sent for %lld ms while connected -- the audio source is muted, "
+			"deactivated, removed or not producing audio",
+			(long long)(now - (warn_.last_send_ms >= 0 ? warn_.last_send_ms : warn_.session_start_ms)));
+	if (due & TEA_WARN_QUIET)
+		obs_log(LOG_WARNING,
+			"asr-client: WARN audio is being sent but has been below %.0f dBFS for %lld ms -- the source "
+			"is silent or its volume is down",
+			TEA_WARN_QUIET_DBFS, (long long)(now - warn_.quiet_since_ms));
+	if (due & TEA_WARN_NO_SPEECH)
+		obs_log(LOG_WARNING,
+			"asr-client: WARN %lld ms of audible audio sent without speech.started or any transcript -- the "
+			"server hears no speech in it (music/noise? compare the server's VAD heartbeat)",
+			(long long)warn_.audible_without_speech_ms);
+	if (due & TEA_WARN_STALLED)
+		obs_log(LOG_WARNING,
+			"asr-client: WARN sending audio but no event from the server for %lld ms -- the connection or "
+			"the server is stalled",
+			(long long)(now - warn_.last_server_ms));
+	if (tea_heartbeat_due(&heartbeat_, now)) {
+		logHeartbeat(now);
+		tea_heartbeat_reset(&heartbeat_, now);
+	}
+}
+
+/* ---------------- optional event trace ---------------- */
+
+void TeaAsrClient::traceOpen(const QJsonObject &started)
+{
+	QMutexLocker lock(&traceMutex_);
+	if (traceDir_.isEmpty() || traceFile_)
+		return;
+	if (!QDir().mkpath(traceDir_)) {
+		obs_log(LOG_WARNING, "asr-client: event trace: cannot create %s", traceDir_.toUtf8().constData());
+		return;
+	}
+	const QString name = QStringLiteral("tea-trace-%1-%2.jsonl")
+				     .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")))
+				     .arg(sessionId_.left(8));
+	traceFile_ = new QFile(QDir(traceDir_).filePath(name));
+	if (!traceFile_->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+		obs_log(LOG_WARNING, "asr-client: event trace: cannot open %s",
+			traceFile_->fileName().toUtf8().constData());
+		delete traceFile_;
+		traceFile_ = nullptr;
+		return;
+	}
+	traceBytes_ = 0;
+	traceT0_ = lastHelloMs_ >= 0 ? lastHelloMs_ : nowMs();
+	obs_log(LOG_INFO, "asr-client: event trace for session %s: %s (up to %lld MB)", sessionId_.toUtf8().constData(),
+		traceFile_->fileName().toUtf8().constData(), (long long)(kTraceMaxBytes / (1024 * 1024)));
+	QJsonObject meta;
+	meta.insert(QStringLiteral("session_start"), QJsonDocument::fromJson(lastSessionStart_).object());
+	meta.insert(QStringLiteral("server"), QStringLiteral("%1:%2").arg(host_).arg(port_));
+	meta.insert(QStringLiteral("captured_at"), QDateTime::currentDateTime().toString(Qt::ISODate));
+	QJsonObject header;
+	header.insert(QStringLiteral("t_ms"), 0);
+	header.insert(QStringLiteral("meta"), meta);
+	/* header line (no "event": the replay tool skips it), then what came before */
+	QByteArray line = QJsonDocument(header).toJson(QJsonDocument::Compact) + '\n';
+	traceFile_->write(line);
+	traceBytes_ += line.size();
+	lock.unlock();
+	if (!lastHello_.isEmpty())
+		traceWrite(lastHello_);
+	traceWrite(started);
+}
+
+void TeaAsrClient::traceWrite(const QJsonObject &event)
+{
+	QMutexLocker lock(&traceMutex_);
+	if (!traceFile_)
+		return;
+	if (traceBytes_ >= kTraceMaxBytes) {
+		obs_log(LOG_WARNING, "asr-client: event trace reached %lld MB, stopped writing: %s",
+			(long long)(kTraceMaxBytes / (1024 * 1024)), traceFile_->fileName().toUtf8().constData());
+		traceFile_->close();
+		delete traceFile_;
+		traceFile_ = nullptr;
+		return;
+	}
+	QJsonObject line;
+	const bool isHello = event.value(QStringLiteral("type")).toString() == QLatin1String("hello");
+	line.insert(QStringLiteral("t_ms"), (double)((isHello ? lastHelloMs_ : nowMs()) - traceT0_));
+	line.insert(QStringLiteral("event"), event);
+	QByteArray bytes = QJsonDocument(line).toJson(QJsonDocument::Compact) + '\n';
+	traceFile_->write(bytes);
+	traceBytes_ += bytes.size();
+}
+
+void TeaAsrClient::traceClose()
+{
+	QMutexLocker lock(&traceMutex_);
+	if (!traceFile_)
+		return;
+	traceFile_->close();
+	delete traceFile_;
+	traceFile_ = nullptr;
+}
+
 bool TeaAsrClient::supportsSegmentationControl(int *min_ms, int *max_ms, int *default_ms) const
 {
 	const bool supported = serverSupportsSegmentation_.load(std::memory_order_relaxed);
@@ -323,6 +572,7 @@ void TeaAsrClient::doStop()
 
 	teardownSocket(true);
 	setStatus(QStringLiteral("stopped"));
+	setConnState(TEA_CONN_STOPPED, QStringLiteral("stopped by the source"));
 	if (captions_)
 		tea_caption_state_reset(captions_);
 }
@@ -342,6 +592,10 @@ void TeaAsrClient::teardownSocket(bool sendClose)
 	connectStartMs_ = -1;
 	lastRxMs_ = -1;
 	sessionStartedMs_ = -1;
+	traceClose();
+	tea_warn_session_end(&warn_);
+	tea_speech_reset(&speech_);
+	speechStateAtomic_ = TEA_SPEECH_LISTENING;
 	resetProtocolStateLocked();
 }
 
@@ -365,6 +619,8 @@ void TeaAsrClient::beginAttempt()
 	 * its idle_timeout every 120 s. Wait locally instead. */
 	if (tap_ && !tea_audio_tap_has_source(tap_)) {
 		setStatus(QStringLiteral("waiting: no audio source selected for this caption source"));
+		setConnState(TEA_CONN_WAITING_AUDIO,
+			     QStringLiteral("no audio source selected for this caption source"));
 		waitMode_ = WaitMode::AudioSource;
 		watchTimer_->start(1000);
 		return;
@@ -377,12 +633,14 @@ void TeaAsrClient::beginAttempt()
 		errorPolicy_.observeNoToken(tokenFilePath().toStdString());
 		setStatus(QStringLiteral("waiting: %1 (will connect when the token file changes)")
 				  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary())));
+		setConnState(TEA_CONN_WAITING_TOKEN, QString::fromStdString(errorPolicy_.lastErrorSummary()));
 		waitMode_ = WaitMode::TokenFile;
 		watchTimer_->start(tea_asr::ReconnectBackoff::kNoTokenPollMs);
 		return;
 	}
 
 	setStatus(QStringLiteral("checking server (GET /v1/capabilities)"));
+	setConnState(TEA_CONN_CONNECTING, QStringLiteral("http://%1:%2").arg(host_).arg(port_));
 	fetchCapabilities(token);
 }
 
@@ -407,6 +665,8 @@ void TeaAsrClient::scheduleReconnect()
 		const QString fatalReason = QString::fromStdString(errorPolicy_.fatalReason());
 		setStatus(fatalReason.isEmpty() ? QStringLiteral("stopped: server rejected this connection")
 						: fatalReason);
+		setConnState(TEA_CONN_STOPPED,
+			     fatalReason.isEmpty() ? QStringLiteral("server rejected this connection") : fatalReason);
 		return;
 	}
 
@@ -421,6 +681,7 @@ void TeaAsrClient::scheduleReconnect()
 		setStatus(QStringLiteral("stopped: %1 -- fix the token file (%2) or press Reconnect All; "
 					 "retries automatically when the token file changes")
 				  .arg(QString::fromStdString(errorPolicy_.lastErrorSummary()), tokenFilePath()));
+		setConnState(TEA_CONN_WAITING_TOKEN, QString::fromStdString(errorPolicy_.lastErrorSummary()));
 		waitMode_ = WaitMode::TokenFile;
 		watchTimer_->start(tea_asr::ReconnectBackoff::kNoTokenPollMs);
 		return;
@@ -435,6 +696,13 @@ void TeaAsrClient::scheduleReconnect()
 	/* Always surface the real reason alongside the countdown, never a bare
 	 * "reconnecting" label that gives the user nothing to act on. */
 	setStatus(QString::fromStdString(errorPolicy_.reconnectStatus(delayMs)));
+	setConnState(TEA_CONN_RECONNECTING,
+		     QStringLiteral("%1; retry in %2 s%3")
+			     .arg(QString::fromStdString(errorPolicy_.lastErrorSummary()))
+			     .arg((double)delayMs / 1000.0, 0, 'f', 1)
+			     .arg(lastCloseCode_ ? QStringLiteral(" (last close code %1)").arg(lastCloseCode_)
+						 : QString()));
+	lastCloseCode_ = 0;
 	reconnectTimer_->start(delayMs);
 
 	if (cls == tea_asr::FailureClass::Auth) {
@@ -554,6 +822,11 @@ void TeaAsrClient::onCapabilitiesReply()
 	segmentationMax_ = silenceMax;
 	segmentationDefault_ = silence.value(QStringLiteral("default")).toInt(0);
 	serverSupportsSegmentation_ = silenceMin > 0 && silenceMax >= silenceMin;
+	obs_log(LOG_INFO, "asr-client: capabilities: partial_transcripts=%d stable_transcripts=%d segmentation=%s",
+		serverSupportsPartial_.load() ? 1 : 0, serverSupportsStable_.load() ? 1 : 0,
+		serverSupportsSegmentation_.load()
+			? QStringLiteral("%1-%2 ms").arg(silenceMin).arg(silenceMax).toUtf8().constData()
+			: "not offered");
 	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
 	/* W9 LAN mode: every response carries this header. Surface it; the
 	 * bearer token is travelling in cleartext. */
@@ -704,6 +977,7 @@ TeaAsrClient::HandshakeResult TeaAsrClient::tryConsumeHandshakeResponse()
 	handshakeDone_ = true;
 	connected_ = true;
 	setStatus(QStringLiteral("connected, awaiting hello"));
+	setConnState(TEA_CONN_CONNECTED, QStringLiteral("WebSocket open to %1:%2").arg(host_).arg(port_));
 	return HandshakeResult::Accepted;
 }
 
@@ -889,6 +1163,7 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 		if (payload.size() >= 2)
 			code = (uint16_t(uint8_t(payload[0])) << 8) | uint16_t(uint8_t(payload[1]));
 		obs_log(LOG_INFO, "asr-client: server closed the WebSocket (code=%u)", (unsigned)code);
+		lastCloseCode_ = code;
 
 		/* RFC 6455 5.5.1: a peer that receives a close frame must send
 		 * one back (unless it already initiated the close itself). We
@@ -945,8 +1220,13 @@ void TeaAsrClient::handleWsFrame(uint8_t opcode, const QByteArray &payload)
 void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 {
 	QString type = obj.value(QStringLiteral("type")).toString();
+	diagOnEvent(type);
+	if (type != QLatin1String("hello") && type != QLatin1String("session.started"))
+		traceWrite(obj);
 
 	if (type == QLatin1String("hello")) {
+		lastHello_ = obj;
+		lastHelloMs_ = nowMs();
 		helloReceived_ = true;
 		QString modelState = obj.value(QStringLiteral("model_state")).toString();
 		setStatus(modelState.isEmpty() ? QStringLiteral("hello received") : modelState);
@@ -986,6 +1266,13 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 			status += QStringLiteral(
 				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
 		setStatus(status);
+		diagOnSessionStarted(obj);
+		traceOpen(obj);
+		return;
+	}
+
+	if (type == QLatin1String("speech.started") || type == QLatin1String("segment.queued")) {
+		/* Speech state for diagnostics only (diagOnEvent() above). */
 		return;
 	}
 
@@ -1193,12 +1480,14 @@ void TeaAsrClient::sendSessionStart()
 		start.insert(QStringLiteral("segmentation"), segmentation);
 	}
 
-	sendTextFrame(QJsonDocument(start).toJson(QJsonDocument::Compact));
+	lastSessionStart_ = QJsonDocument(start).toJson(QJsonDocument::Compact);
+	sendTextFrame(lastSessionStart_);
 }
 
 void TeaAsrClient::onPumpTimer()
 {
 	pumpAudio();
+	diagTick();
 
 	if (!socket_)
 		return;
@@ -1233,6 +1522,8 @@ void TeaAsrClient::pumpAudio()
 		size_t got = tea_audio_tap_pull_pcm16(tap_, chunkBuf, kMaxFramePcmBytes / sizeof(int16_t));
 		if (got == 0)
 			break;
+		tea_pcm_level_add(&inputLevel_, chunkBuf, got);
+		lastInputMs_ = nowMs();
 
 		QByteArray chunk((const char *)chunkBuf, (int)(got * sizeof(int16_t)));
 		if (pendingPcm_.size() >= kMaxPendingPcmChunks) {
@@ -1260,6 +1551,14 @@ void TeaAsrClient::pumpAudio()
 		frame.append(chunk);
 
 		sendBinaryFrame(frame);
+
+		const qint64 now = nowMs();
+		const int16_t *pcm = reinterpret_cast<const int16_t *>(chunk.constData());
+		tea_pcm_level_t frameLevel;
+		tea_pcm_level_reset(&frameLevel);
+		tea_pcm_level_add(&frameLevel, pcm, (size_t)frameSamples);
+		tea_heartbeat_on_send(&heartbeat_, now, pcm, (size_t)frameSamples);
+		tea_warn_on_send(&warn_, now, (int64_t)(frameSamples / 16), tea_pcm_level_rms_dbfs(&frameLevel));
 
 		nextSeq_++;
 		nextSample_ = endSample;
@@ -1408,4 +1707,23 @@ extern "C" bool tea_asr_client_supports_segmentation(tea_asr_client_t *client, i
 extern "C" int tea_asr_client_effective_end_silence_ms(tea_asr_client_t *client)
 {
 	return client ? client->impl->effectiveEndSilenceMs() : -1;
+}
+
+extern "C" void tea_asr_client_get_diag(tea_asr_client_t *client, tea_asr_client_diag_t *out)
+{
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	out->input_dbfs = TEA_DBFS_FLOOR;
+	out->ms_since_text = -1;
+	if (!client)
+		return;
+	client->impl->diagnostics(&out->connection, &out->speech, &out->input_dbfs, &out->input_recent,
+				  &out->ms_since_text);
+}
+
+extern "C" void tea_asr_client_set_trace_dir(tea_asr_client_t *client, const char *dir)
+{
+	if (client)
+		client->impl->setTraceDir(QString::fromUtf8(dir ? dir : ""));
 }

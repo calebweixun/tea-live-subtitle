@@ -36,6 +36,11 @@ modified):
   ``session.start`` to an unknown key, so the current server's extra=forbid
   answers ``protocol_error`` exactly like a server that predates the field.
 
+* ``--deaf``: the server never reports speech: ``speech.started``,
+  ``segment.queued`` and every transcript / segment result are dropped on
+  the way to the client (a server whose VAD hears no speech in the audio),
+  while ``audio.ack`` and ``flow.control`` keep flowing.
+
 Sentence-break (segmentation) knobs. ``session.start.segmentation`` and
 ``features.segmentation_control`` are being added to the server (docs/04
 「切段控制」); until a server with them is in ``--service-dir`` these emulate
@@ -88,6 +93,7 @@ def main() -> int:
     parser.add_argument("--hide-segmentation-capability", action="store_true")
     parser.add_argument("--emulate-segmentation", action="store_true")
     parser.add_argument("--reject-segmentation-field", action="store_true")
+    parser.add_argument("--deaf", action="store_true")
     args = parser.parse_args()
 
     if args.port == 8327:
@@ -256,6 +262,11 @@ def main() -> int:
                     payload = json.loads(message["text"])
                 except ValueError:
                     payload = {}
+                if args.deaf and payload.get("type") in (
+                        "speech.started", "segment.queued", "transcript.partial", "transcript.stable",
+                        "transcript.final", "segment.skipped", "segment.error"):
+                    record({**base, "event": "ws_dropped_by_deaf", "type": payload.get("type")})
+                    return
                 if (payload.get("type") == "session.started" and args.emulate_segmentation
                         and held.get("end_silence_ms") is not None and payload.get("preview_policy")):
                     payload["preview_policy"]["endpoint_silence_ms"] = held["end_silence_ms"]

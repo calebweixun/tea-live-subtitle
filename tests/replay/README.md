@@ -7,7 +7,8 @@ causes it reports are fade-out, row limit, a retracted tail, or a corrected tail
 sentence end (did the final extend what was shown?) and reports the largest amount of text that appears in one frame.
 
 A trace is JSONL, one `{"t_ms": <client receive time, ms>, "event": {...server event...}}` per line. The
-server repo's `benchmarks/capture_event_trace.py` writes this format.
+server repo's `benchmarks/capture_event_trace.py` writes this format, and so does the plugin's "record recognition
+events" setting (`docs/diagnostics.md`).
 
 ```sh
 cc  -std=c11   -c -Itests/stubs -Isrc src/caption-state.c -o /tmp/caption-state.o

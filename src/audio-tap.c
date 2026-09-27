@@ -49,6 +49,11 @@ struct tea_audio_tap {
 	uint32_t native_channels;
 
 	audio_resampler_t *resampler; /* created lazily once native_rate is known */
+
+	/* diagnostics: the captured source's name, and whether its format still
+	 * has to be logged (first callback after attaching). */
+	char *source_name;
+	volatile bool log_format_pending;
 	float pull_scratch[TEA_PULL_CHUNK_SAMPLES];
 };
 
@@ -72,6 +77,15 @@ static void tea_on_audio_capture(void *param, obs_source_t *src, const struct au
 
 	uint32_t channels = tap->native_channels ? tap->native_channels : 1;
 	uint32_t frames = data->frames;
+
+	if (tap->log_format_pending) {
+		tap->log_format_pending = false;
+		obs_log(LOG_INFO,
+			"audio-tap: receiving audio from '%s': %u Hz, %u channel(s) -> downmixed to mono, resampled to "
+			"16000 Hz%s",
+			tap->source_name ? tap->source_name : "?", tap->native_rate, channels,
+			muted ? " (source is muted: silence is sent)" : "");
+	}
 
 	if (muted) {
 		/* Still advance the sample clock: the server's VAD relies on a
@@ -145,10 +159,19 @@ void tea_audio_tap_set_source(tea_audio_tap_t *tap, obs_source_t *source)
 		obs_source_release(tap->attached_source);
 		tap->attached_source = NULL;
 	}
+	const bool had_source = tap->source_name != NULL;
+	bfree(tap->source_name);
+	tap->source_name = NULL;
 	if (source) {
 		tap->attached_source = obs_source_get_ref(source);
-		if (tap->attached_source)
+		if (tap->attached_source) {
+			tap->source_name = bstrdup(obs_source_get_name(tap->attached_source));
+			tap->log_format_pending = true;
+			obs_log(LOG_INFO, "audio-tap: capturing audio source '%s'", tap->source_name);
 			obs_source_add_audio_capture_callback(tap->attached_source, tea_on_audio_capture, tap);
+		}
+	} else if (had_source) {
+		obs_log(LOG_INFO, "audio-tap: audio source cleared (nothing is captured)");
 	}
 	pthread_mutex_unlock(&tap->attach_lock);
 }

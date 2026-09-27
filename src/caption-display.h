@@ -1066,6 +1066,7 @@ typedef struct {
 	const char *token_path;
 	bool stable;
 	int end_silence_ms; /* sentence break silence; 0 = server default */
+	bool trace;         /* record the session's events to a file (per session) */
 } tea_connection_settings_t;
 
 static inline bool tea_str_equal_or_both_empty(const char *a, const char *b)
@@ -1081,7 +1082,7 @@ static inline bool tea_connection_settings_equal(const tea_connection_settings_t
 {
 	return tea_str_equal_or_both_empty(a->host, b->host) && a->port == b->port &&
 	       tea_str_equal_or_both_empty(a->token_path, b->token_path) && a->stable == b->stable &&
-	       a->end_silence_ms == b->end_silence_ms;
+	       a->end_silence_ms == b->end_silence_ms && a->trace == b->trace;
 }
 
 #define TEA_CONNECTION_KEEP 0      /* nothing to do */

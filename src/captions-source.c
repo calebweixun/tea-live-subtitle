@@ -103,6 +103,14 @@ static const char *const k_text_ft2_ids[] = {
 /* Punctuation line breaks: TEA_PUNCT_BREAK_* and the comma minimum. */
 #define TEA_KEY_PUNCT_BREAK "punct_break_mode"
 #define TEA_KEY_PUNCT_COMMA_MIN "punct_break_comma_min_chars"
+/* Diagnostics (docs/diagnostics.md): an on-screen status line (appearance)
+ * and a per-session event trace file (connection: applies per session). */
+#define TEA_KEY_DIAG_OVERLAY "diag_overlay"
+#define TEA_KEY_EVENT_TRACE "event_trace"
+#define TEA_OVERLAY_KEY_BIT (UINT64_C(1) << 63) /* texture keys of the status line */
+#define TEA_OVERLAY_SCALE 0.5f
+#define TEA_OVERLAY_GAP 6
+#define TEA_OVERLAY_REFRESH_NS (250 * UINT64_C(1000000))
 
 /* Sources created after the per-line renderer shipped get the recommended
  * live-subtitle look as explicit values (version 2: the settings the user
@@ -177,6 +185,7 @@ struct tea_render_config {
 	bool tail;
 	float tail_opacity;
 	tea_punct_break_t punct;
+	bool diag_overlay;
 	int font_size;
 	obs_data_t *child; /* text_ft2 appearance settings (no "text") */
 	char *metrics_sig; /* anything that changes glyph advances / heights */
@@ -271,6 +280,7 @@ struct tea_captions_source {
 	char *applied_token_path;
 	int applied_stable_captions; /* -1 = never applied, else 0/1 */
 	int applied_end_silence_ms;
+	int applied_event_trace; /* -1 = never applied */
 	bool connection_pending;
 	volatile long properties_open;
 
@@ -310,8 +320,16 @@ struct tea_captions_source {
 	gs_eparam_t *fade_image;
 	gs_eparam_t *fade_opacity;
 
+	/* diagnostic status line (render thread) */
+	char *overlay_text;
+	uint64_t overlay_gen;
+	int overlay_tex;       /* texture of overlay_text, -1 none */
+	int overlay_shown_tex; /* last ready texture, drawn until the next is ready */
+	uint64_t overlay_next_ns;
+
 	volatile long out_width;
 	volatile long out_height;
+	uint32_t committed_height; /* captions only, without the status line */
 
 	/* Intrusive singly-linked list node for g_registry_head below, so the
 	 * Tools-menu settings dialog can enumerate every live instance (it has
@@ -471,6 +489,7 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 	const bool stable_captions = obs_data_get_bool(settings, "stable_captions");
 	const int end_silence_ms =
 		tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_END_SILENCE_MS), 0, TEA_END_SILENCE_MAX_MS);
+	const bool event_trace = obs_data_get_bool(settings, TEA_KEY_EVENT_TRACE);
 
 	pthread_mutex_lock(&ctx->conn_lock);
 	tea_connection_settings_t applied = {
@@ -479,6 +498,7 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		.token_path = ctx->applied_token_path,
 		.stable = ctx->applied_stable_captions == 1,
 		.end_silence_ms = ctx->applied_end_silence_ms,
+		.trace = ctx->applied_event_trace == 1,
 	};
 	tea_connection_settings_t incoming = {
 		.host = server_host,
@@ -486,6 +506,7 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		.token_path = token_path,
 		.stable = stable_captions,
 		.end_silence_ms = end_silence_ms,
+		.trace = event_trace,
 	};
 	const bool interactive = os_atomic_load_long(&ctx->properties_open) > 0;
 	const int action =
@@ -498,6 +519,10 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		tea_asr_client_set_stable_captions(ctx->client, stable_captions);
 		/* So does `segmentation` (the sentence break silence). */
 		tea_asr_client_set_end_silence_ms(ctx->client, end_silence_ms);
+		/* The event trace is opened per session. */
+		char *trace_dir = event_trace ? obs_module_config_path("traces") : NULL;
+		tea_asr_client_set_trace_dir(ctx->client, trace_dir);
+		bfree(trace_dir);
 		tea_asr_client_start(ctx->client); /* idempotent restart with the new settings */
 
 		bfree(ctx->applied_server_host);
@@ -507,6 +532,7 @@ static void tea_apply_connection(struct tea_captions_source *ctx, obs_data_t *se
 		ctx->applied_token_path = bstrdup(token_path);
 		ctx->applied_stable_captions = stable_captions ? 1 : 0;
 		ctx->applied_end_silence_ms = end_silence_ms;
+		ctx->applied_event_trace = event_trace ? 1 : 0;
 	}
 	pthread_mutex_unlock(&ctx->conn_lock);
 }
@@ -586,6 +612,7 @@ static struct tea_render_config *tea_config_build(struct tea_captions_source *ct
 	cfg->tail_opacity = (float)tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_TAIL_OPACITY), 0, 100) / 100.0f;
 	cfg->punct.mode = tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_PUNCT_BREAK), TEA_PUNCT_BREAK_OFF,
 					    TEA_PUNCT_BREAK_COMMA);
+	cfg->diag_overlay = obs_data_get_bool(settings, TEA_KEY_DIAG_OVERLAY);
 	cfg->punct.comma_min_chars =
 		tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_PUNCT_COMMA_MIN), 0, TEA_PUNCT_COMMA_MIN_MAX);
 
@@ -988,6 +1015,10 @@ static void tea_gc_textures(struct tea_captions_source *ctx)
 		tea_stamp_frame(ctx, &ctx->committed);
 	if (ctx->have_pending)
 		tea_stamp_frame(ctx, &ctx->pending);
+	if (ctx->overlay_tex >= 0)
+		ctx->texes[ctx->overlay_tex].stamp = ctx->frame_no;
+	if (ctx->overlay_shown_tex >= 0)
+		ctx->texes[ctx->overlay_shown_tex].stamp = ctx->frame_no;
 	bool entered = false;
 	for (int i = 0; i < TEA_TEX_CACHE_SIZE; i++) {
 		struct tea_tex *t = &ctx->texes[i];
@@ -1212,10 +1243,20 @@ static tea_caption_frame_t tea_frame_geometry(const struct tea_captions_source *
 					 cfg->bg_padding);
 }
 
+/* Height of the diagnostic status line below the captions (0 when off). */
+static uint32_t tea_overlay_height(const struct tea_captions_source *ctx)
+{
+	if (!ctx->config || !ctx->config->diag_overlay)
+		return 0;
+	uint32_t row = ctx->row_height > 0 ? ctx->row_height : (uint32_t)ctx->config->font_size;
+	return (uint32_t)((float)row * TEA_OVERLAY_SCALE) + TEA_OVERLAY_GAP;
+}
+
 static void tea_publish_size(struct tea_captions_source *ctx, uint32_t width, uint32_t height)
 {
+	ctx->committed_height = height;
 	os_atomic_set_long(&ctx->out_width, (long)width);
-	os_atomic_set_long(&ctx->out_height, (long)height);
+	os_atomic_set_long(&ctx->out_height, (long)(height + tea_overlay_height(ctx)));
 }
 
 struct tea_layout_row {
@@ -1397,6 +1438,84 @@ static void tea_take_config(struct tea_captions_source *ctx)
 	}
 }
 
+static const char *tea_overlay_connection(int state)
+{
+	switch (state) {
+	case TEA_CONN_WAITING_AUDIO:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.NoAudioSource", "no audio source");
+	case TEA_CONN_WAITING_TOKEN:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.WaitingToken", "waiting for token");
+	case TEA_CONN_CONNECTING:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Connecting", "connecting");
+	case TEA_CONN_CONNECTED:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Connected", "connected");
+	case TEA_CONN_ACTIVE:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Active", "recognising");
+	case TEA_CONN_RECONNECTING:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Reconnecting", "reconnecting");
+	default:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Stopped", "stopped");
+	}
+}
+
+static const char *tea_overlay_speech(int state)
+{
+	switch (state) {
+	case 1:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Speech.Detected", "speech");
+	case 2:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Speech.Processing", "processing");
+	default:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Speech.Listening", "listening");
+	}
+}
+
+/* "Diagnostics: recognising | listening | input -23 dBFS | last text 4 s".
+ * Numbers are appended here: translations never carry format specifiers. */
+static void tea_overlay_build(struct tea_captions_source *ctx, struct dstr *out)
+{
+	tea_asr_client_diag_t d;
+	tea_asr_client_get_diag(ctx->client, &d);
+	dstr_printf(out, "%s: %s | %s | ", tea_text_or("TeaLiveSubtitle.Overlay.Prefix", "Diagnostics"),
+		    tea_overlay_connection(d.connection), tea_overlay_speech(d.speech));
+	if (d.input_recent)
+		dstr_catf(out, "%s %d dBFS", tea_text_or("TeaLiveSubtitle.Overlay.Input", "input"),
+			  (int)(d.input_dbfs <= -120.0 ? -120 : d.input_dbfs - 0.5));
+	else
+		dstr_cat(out, tea_text_or("TeaLiveSubtitle.Overlay.NoInput", "no audio input"));
+	dstr_cat(out, " | ");
+	if (d.ms_since_text >= 0)
+		dstr_catf(out, "%s %lld %s", tea_text_or("TeaLiveSubtitle.Overlay.LastText", "last text"),
+			  (long long)(d.ms_since_text / 1000),
+			  tea_text_or("TeaLiveSubtitle.Overlay.SecondsAgo", "s ago"));
+	else
+		dstr_cat(out, tea_text_or("TeaLiveSubtitle.Overlay.NoText", "no text yet"));
+}
+
+static void tea_overlay_tick(struct tea_captions_source *ctx, uint64_t now)
+{
+	if (!ctx->config->diag_overlay) {
+		ctx->overlay_tex = -1;
+		ctx->overlay_shown_tex = -1;
+		return;
+	}
+	if (ctx->overlay_tex >= 0 && ctx->texes[ctx->overlay_tex].ready)
+		ctx->overlay_shown_tex = ctx->overlay_tex;
+	if (now < ctx->overlay_next_ns)
+		return;
+	ctx->overlay_next_ns = now + TEA_OVERLAY_REFRESH_NS;
+	struct dstr text = {0};
+	tea_overlay_build(ctx, &text);
+	if (text.array && (!ctx->overlay_text || strcmp(text.array, ctx->overlay_text) != 0)) {
+		bfree(ctx->overlay_text);
+		ctx->overlay_text = bstrdup(text.array);
+		ctx->overlay_gen++;
+		ctx->overlay_tex = tea_tex_acquire(ctx, TEA_OVERLAY_KEY_BIT | ctx->overlay_gen, ctx->overlay_text, 0,
+						   strlen(ctx->overlay_text));
+	}
+	dstr_free(&text);
+}
+
 static void tea_captions_source_video_tick(void *data, float seconds)
 {
 	(void)seconds;
@@ -1414,6 +1533,9 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 		tea_layout(ctx);
 	else if (ctx->have_pending)
 		tea_stamp_frame(ctx, &ctx->pending);
+	tea_overlay_tick(ctx, now);
+	if (ctx->overlay_tex >= 0)
+		ctx->texes[ctx->overlay_tex].stamp = ctx->frame_no; /* rasterised by tea_dispatch_jobs() */
 	tea_dispatch_jobs(ctx);
 	tea_gc_textures(ctx);
 	tea_recycle_workers(ctx);
@@ -1508,6 +1630,33 @@ static void tea_draw_pieces(struct tea_captions_source *ctx, uint64_t now)
 	}
 }
 
+/* The diagnostic status line: one small line under the captions, never
+ * faded, never inside the background box. */
+static void tea_draw_overlay(struct tea_captions_source *ctx)
+{
+	if (!ctx->config->diag_overlay || ctx->overlay_shown_tex < 0)
+		return;
+	const struct tea_tex *t = &ctx->texes[ctx->overlay_shown_tex];
+	if (!t->used || !t->ready || !t->tr || t->w == 0 || t->h == 0)
+		return;
+	gs_texture_t *tex = gs_texrender_get_texture(t->tr);
+	if (!tex)
+		return;
+	gs_effect_t *effect = ctx->fade_effect ? ctx->fade_effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *image = ctx->fade_effect ? ctx->fade_image : gs_effect_get_param_by_name(effect, "image");
+	gs_blend_function_separate(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	gs_effect_set_texture(image, tex);
+	if (ctx->fade_effect)
+		gs_effect_set_float(ctx->fade_opacity, 1.0f);
+	const tea_caption_frame_t geo = tea_frame_geometry(ctx);
+	gs_matrix_push();
+	gs_matrix_translate3f((float)geo.inset_x, (float)(ctx->committed_height + TEA_OVERLAY_GAP / 2), 0.0f);
+	gs_matrix_scale3f(TEA_OVERLAY_SCALE, TEA_OVERLAY_SCALE, 1.0f);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(tex, 0, t->w, t->h);
+	gs_matrix_pop();
+}
+
 static void tea_captions_source_video_render(void *data, gs_effect_t *effect)
 {
 	(void)effect;
@@ -1522,6 +1671,7 @@ static void tea_captions_source_video_render(void *data, gs_effect_t *effect)
 	if (ctx->config->bg)
 		tea_draw_backgrounds(ctx, now);
 	tea_draw_pieces(ctx, now);
+	tea_draw_overlay(ctx);
 	gs_blend_state_pop();
 }
 
@@ -1543,6 +1693,9 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	ctx->source = source;
 	ctx->applied_server_port = -1;
 	ctx->applied_stable_captions = -1;
+	ctx->applied_event_trace = -1;
+	ctx->overlay_tex = -1;
+	ctx->overlay_shown_tex = -1;
 	pthread_mutex_init(&ctx->conn_lock, NULL);
 	pthread_mutex_init(&ctx->config_lock, NULL);
 	ctx->glyphs = bzalloc(sizeof(tea_glyph_cache_t));
@@ -1620,6 +1773,7 @@ static void tea_captions_source_destroy(void *data)
 	pthread_mutex_destroy(&ctx->conn_lock);
 	pthread_mutex_destroy(&ctx->config_lock);
 
+	bfree(ctx->overlay_text);
 	bfree(ctx->applied_audio_source_name);
 	bfree(ctx->applied_server_host);
 	bfree(ctx->applied_token_path);
@@ -1668,6 +1822,8 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, TEA_KEY_TAIL_OPACITY, TEA_DEFAULT_TAIL_OPACITY);
 	obs_data_set_default_int(settings, TEA_KEY_PUNCT_BREAK, TEA_PUNCT_BREAK_OFF);
 	obs_data_set_default_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
+	obs_data_set_default_bool(settings, TEA_KEY_DIAG_OVERLAY, false);
+	obs_data_set_default_bool(settings, TEA_KEY_EVENT_TRACE, false);
 	if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_RENDER_SCHEMA_KEY)) {
 		obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERSION);
 		obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);
@@ -1834,6 +1990,15 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 			    "when you press \"Apply connection settings\" or close this window. Everything "
 			    "else applies immediately."),
 		OBS_TEXT_INFO);
+	obs_property_t *trace_prop = obs_properties_add_bool(props, TEA_KEY_EVENT_TRACE,
+							     tea_text_or("TeaLiveSubtitle.Prop.EventTrace",
+									 "Record recognition events (debugging)"));
+	obs_property_set_long_description(
+		trace_prop,
+		tea_text_or("TeaLiveSubtitle.Prop.EventTrace.Tooltip",
+			    "Writes every server event of each session to a file (one per session, size-capped) "
+			    "in the plugin's config folder; the path is in the OBS log. Send it to us when "
+			    "captions go missing. Takes effect with Apply connection settings."));
 	obs_properties_add_button2(props, "apply_connection",
 				   tea_text_or("TeaLiveSubtitle.Prop.ApplyConnection", "Apply connection settings"),
 				   tea_apply_connection_clicked, data);
@@ -1927,6 +2092,14 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 					   "Minimum characters on a row before a comma breaks"),
 			       0, TEA_PUNCT_COMMA_MIN_MAX, 1);
 	obs_properties_add_bool(props, "show_placeholder", obs_module_text("TeaLiveSubtitle.Prop.ShowPlaceholder"));
+	obs_property_t *overlay_prop = obs_properties_add_bool(
+		props, TEA_KEY_DIAG_OVERLAY,
+		tea_text_or("TeaLiveSubtitle.Prop.DiagOverlay", "Show a diagnostic status line (debugging)"));
+	obs_property_set_long_description(
+		overlay_prop, tea_text_or("TeaLiveSubtitle.Prop.DiagOverlay.Tooltip",
+					  "One small line under the captions: connection, whether the server hears "
+					  "speech, the input level and the time since the last text. Use it in a "
+					  "preview scene to see why captions are missing."));
 
 	/* --- fades --- */
 	obs_properties_add_bool(props, TEA_KEY_FADE_IN, tea_text_or("TeaLiveSubtitle.Prop.FadeIn", "Fade in new text"));
