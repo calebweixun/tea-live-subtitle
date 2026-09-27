@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "asr-client.h"
 #include "asr-client.hpp"
+#include "caption-display.h"
 
 #include <QCryptographicHash>
 #include <QRandomGenerator>
@@ -177,6 +178,28 @@ void TeaAsrClient::setStableCaptions(bool enabled)
 	stablePreferred_ = enabled;
 }
 
+void TeaAsrClient::setEndSilenceMs(int ms)
+{
+	endSilencePreferred_ = ms > 0 ? ms : 0;
+}
+
+bool TeaAsrClient::supportsSegmentationControl(int *min_ms, int *max_ms, int *default_ms) const
+{
+	const bool supported = serverSupportsSegmentation_.load(std::memory_order_relaxed);
+	if (min_ms)
+		*min_ms = segmentationMin_.load(std::memory_order_relaxed);
+	if (max_ms)
+		*max_ms = segmentationMax_.load(std::memory_order_relaxed);
+	if (default_ms)
+		*default_ms = segmentationDefault_.load(std::memory_order_relaxed);
+	return supported;
+}
+
+int TeaAsrClient::effectiveEndSilenceMs() const
+{
+	return effectiveEndSilence_.load(std::memory_order_relaxed);
+}
+
 void TeaAsrClient::holdOrClearCaptions(bool clearOtherwise)
 {
 	if (!captions_)
@@ -221,6 +244,8 @@ void TeaAsrClient::resetProtocolStateLocked()
 	stableRequested_ = false;
 	stableActive_ = false;
 	stableMismatchLogged_ = false;
+	segmentationRequested_ = 0;
+	effectiveEndSilence_ = -1;
 	nextSeq_ = 0;
 	nextSample_ = 0;
 	sendUntilSample_ = 0;
@@ -255,6 +280,7 @@ void TeaAsrClient::doStart()
 	/* Settings change / "Reconnect All": ask for stable captions again even
 	 * if a previous server rejected them. */
 	stableRejected_ = false;
+	segmentationRejected_ = false;
 
 	if (!pumpTimer_) {
 		pumpTimer_ = new QTimer(this);
@@ -328,6 +354,7 @@ void TeaAsrClient::beginAttempt()
 	errorPolicy_.beginAttempt();
 	capabilitiesKnown_ = false;
 	serverSupportsStable_ = false;
+	serverSupportsSegmentation_ = false;
 	waitMode_ = WaitMode::None;
 	if (watchTimer_)
 		watchTimer_->stop();
@@ -514,6 +541,19 @@ void TeaAsrClient::onCapabilitiesReply()
 	/* Optional field: absent (older server, or revisable preview off) means
 	 * no transcript.stable, and the client stays on partial/final. */
 	serverSupportsStable_ = features.value(QStringLiteral("stable_transcripts")).toBool(false);
+	/* Optional too: segmentation_control.end_silence_ms = {min, max, default}.
+	 * Absent means the server keeps its own end silence and would reject a
+	 * `segmentation` field. */
+	const QJsonObject silence = features.value(QStringLiteral("segmentation_control"))
+					    .toObject()
+					    .value(QStringLiteral("end_silence_ms"))
+					    .toObject();
+	const int silenceMin = silence.value(QStringLiteral("min")).toInt(0);
+	const int silenceMax = silence.value(QStringLiteral("max")).toInt(0);
+	segmentationMin_ = silenceMin;
+	segmentationMax_ = silenceMax;
+	segmentationDefault_ = silence.value(QStringLiteral("default")).toInt(0);
+	serverSupportsSegmentation_ = silenceMin > 0 && silenceMax >= silenceMin;
 	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
 	/* W9 LAN mode: every response carries this header. Surface it; the
 	 * bearer token is travelling in cleartext. */
@@ -923,6 +963,10 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		sessionStartedMs_ = nowMs();
 		const QString mode = obj.value(QStringLiteral("transcript_mode")).toString();
 		stableActive_ = stableRequested_;
+		const QJsonValue endpoint = obj.value(QStringLiteral("preview_policy"))
+						    .toObject()
+						    .value(QStringLiteral("endpoint_silence_ms"));
+		effectiveEndSilence_ = endpoint.isDouble() ? endpoint.toInt(-1) : -1;
 		if (staleCaptionTimer_)
 			staleCaptionTimer_->stop();
 		QString status = QStringLiteral("session active");
@@ -932,8 +976,12 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 			status += QStringLiteral(" (%1)").arg(mode);
 		else if (stableRequested_)
 			status += QStringLiteral(" (stable captions)");
+		if (effectiveEndSilence_ > 0)
+			status += QStringLiteral(" (sentence break %1 ms)").arg(effectiveEndSilence_.load());
 		if (stableRejected_)
 			status += QStringLiteral(" -- server rejected stable captions, using partial previews");
+		if (segmentationRejected_)
+			status += QStringLiteral(" -- server rejected the sentence break setting, using its default");
 		if (insecureLan_)
 			status += QStringLiteral(
 				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
@@ -1030,6 +1078,24 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		obs_log(LOG_WARNING, "asr-client: server error code=%s retryable=%d", code.toUtf8().constData(),
 			retryable ? 1 : 0);
 
+		if (segmentationRequested_ > 0 && !sessionStarted_ &&
+		    (code == QLatin1String("unsupported_option") || code == QLatin1String("protocol_error"))) {
+			/* Advertised segmentation_control but refused the field (or the
+			 * value): the sentence break setting is optional, so reconnect
+			 * with the server's default silence. Checked before `stable`:
+			 * it is the newer field, so the likelier culprit. */
+			segmentationRejected_ = true;
+			obs_log(LOG_WARNING,
+				"asr-client: server rejected session.start.segmentation (%s); using its default",
+				code.toUtf8().constData());
+			errorPolicy_.observeError(code.toStdString(), message.toStdString(), true);
+			setStatus(
+				QStringLiteral("server rejected the sentence break setting (%1); reconnecting with its "
+					       "default")
+					.arg(code));
+			return;
+		}
+
 		if (stableRequested_ && !sessionStarted_ &&
 		    (code == QLatin1String("unsupported_option") || code == QLatin1String("protocol_error"))) {
 			/* The server advertised stable_transcripts but refused the
@@ -1115,6 +1181,17 @@ void TeaAsrClient::sendSessionStart()
 	}
 	if (captions_)
 		tea_caption_state_set_stable_mode(captions_, stableRequested_);
+	/* continuous profile only (it is the only profile this client uses) */
+	segmentationRequested_ = segmentationRejected_
+					 ? 0
+					 : tea_end_silence_request(endSilencePreferred_.load(),
+								   serverSupportsSegmentation_.load(),
+								   segmentationMin_.load(), segmentationMax_.load());
+	if (segmentationRequested_ > 0) {
+		QJsonObject segmentation;
+		segmentation.insert(QStringLiteral("end_silence_ms"), segmentationRequested_);
+		start.insert(QStringLiteral("segmentation"), segmentation);
+	}
 
 	sendTextFrame(QJsonDocument(start).toJson(QJsonDocument::Compact));
 }
@@ -1305,4 +1382,30 @@ extern "C" bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *cli
 extern "C" bool tea_asr_client_stable_captions_active(tea_asr_client_t *client)
 {
 	return client && client->impl->stableCaptionsActive();
+}
+
+extern "C" void tea_asr_client_set_end_silence_ms(tea_asr_client_t *client, int ms)
+{
+	if (client)
+		client->impl->setEndSilenceMs(ms);
+}
+
+extern "C" bool tea_asr_client_supports_segmentation(tea_asr_client_t *client, int *min_ms, int *max_ms,
+						     int *default_ms)
+{
+	if (!client) {
+		if (min_ms)
+			*min_ms = 0;
+		if (max_ms)
+			*max_ms = 0;
+		if (default_ms)
+			*default_ms = 0;
+		return false;
+	}
+	return client->impl->supportsSegmentationControl(min_ms, max_ms, default_ms);
+}
+
+extern "C" int tea_asr_client_effective_end_silence_ms(tea_asr_client_t *client)
+{
+	return client ? client->impl->effectiveEndSilenceMs() : -1;
 }

@@ -133,7 +133,7 @@ tea_display_line_t line_from_chunks(const std::vector<std::string> &chunks, std:
 	for (size_t i = 1; i < chunks.size(); i++) {
 		std::string next = acc + chunks[i];
 		tea_display_line_observe(&line, acc.c_str(), acc.size(), next.c_str(), next.size(), next.size(),
-					 t0 + i * 100 * kMs, 0);
+					 t0 + i * 100 * kMs);
 		acc = next;
 	}
 	*text = acc;
@@ -260,7 +260,7 @@ static void test_wrapping()
 	line = line_from_chunks({"hello wor"}, &text);
 	std::string with_tail = text + "ld";
 	tea_display_line_observe(&line, text.c_str(), text.size(), with_tail.c_str(), with_tail.size(), text.size(),
-				 50 * kMs, 0);
+				 50 * kMs);
 	rows = wrap_rows(line, with_tail, 100, 0, true, &cache);
 	expect(rows[0] == "hello wor", "a tail overflowing the row starts on the next row");
 }
@@ -286,8 +286,7 @@ static void test_append_stability()
 		tea_utf8_decode(full.data(), full.size(), &pos);
 		std::string next = full.substr(0, pos);
 		t += 100 * kMs;
-		tea_display_line_observe(&line, text.c_str(), text.size(), next.c_str(), next.size(), next.size(), t,
-					 0);
+		tea_display_line_observe(&line, text.c_str(), text.size(), next.c_str(), next.size(), next.size(), t);
 		text = next;
 		std::vector<std::string> now = wrap_rows(line, text, 130, 4, true, &cache);
 		expect(now.size() >= prev.size(), "appending never removes a row");
@@ -300,7 +299,33 @@ static void test_append_stability()
 	}
 }
 
-static void test_pause_breaks_and_chunks()
+static void test_big_append_keeps_rows()
+{
+	/* The real model can commit 20 characters at once. Width 1800 at 48 px:
+	 * the burst overflows the row, earlier text stays where it was, the
+	 * burst is one chunk (one fade-in) split over the rows it lands on. */
+	static tea_glyph_cache_t cache;
+	tea_glyph_cache_clear(&cache);
+	const std::string first = "今天我們要討論的是字幕的顯示方式還有換行對齊淡出"; /* 24 */
+	const std::string burst = "的效果以及真實直播時觀眾看到的樣子是否穩定好讀";   /* 22 */
+	learn(&cache, first + burst);
+	std::string text;
+	tea_display_line_t line = line_from_chunks({first}, &text);
+	const uint32_t width = 36 * 20; /* 36 characters per row in the fake font */
+	auto before = wrap_rows(line, text, width, 0, true, &cache);
+	expect(before.size() == 1 && before[0] == first, "the first part fits one row");
+	std::string grown = text + burst;
+	tea_display_line_observe(&line, text.c_str(), text.size(), grown.c_str(), grown.size(), grown.size(),
+				 900 * kMs);
+	auto after = wrap_rows(line, grown, width, 0, true, &cache);
+	expect(after.size() == 2 && after[0].compare(0, first.size(), first) == 0,
+	       "a 20+ character burst never moves the text already on the row");
+	expect(after[0] + after[1] == grown, "no character is lost or duplicated across the break");
+	expect(line.chunk_count == 2 && line.chunks[1].start == first.size() && line.chunks[1].born_ns == 900 * kMs,
+	       "the burst is one chunk: it fades in once, on both rows it lands on");
+}
+
+static void test_chunks()
 {
 	static tea_glyph_cache_t cache;
 	tea_glyph_cache_clear(&cache);
@@ -310,16 +335,14 @@ static void test_pause_breaks_and_chunks()
 	std::string a = "我們";
 	tea_display_line_init(&line, 3, a.size(), a.size(), 0);
 	std::string b = "我們需要";
-	expect(tea_display_line_observe(&line, a.c_str(), a.size(), b.c_str(), b.size(), b.size(), 500 * kMs, 1000),
+	expect(tea_display_line_observe(&line, a.c_str(), a.size(), b.c_str(), b.size(), b.size(), 500 * kMs),
 	       "growth is a change");
-	expect(line.hard_break_count == 0, "a short gap keeps the row going");
 	std::string c = "我們需要一個";
-	tea_display_line_observe(&line, b.c_str(), b.size(), c.c_str(), c.size(), c.size(), 2500 * kMs, 1000);
-	expect(line.hard_break_count == 1 && line.hard_breaks[0] == b.size(),
-	       "a pause at least as long as the setting starts a new row");
+	tea_display_line_observe(&line, b.c_str(), b.size(), c.c_str(), c.size(), c.size(), 2500 * kMs);
 	auto rows = wrap_rows(line, c, 1000, 0, true, &cache);
-	expect(rows.size() == 2 && rows[0] == "我們需要" && rows[1] == "一個", "the pause break splits the rows");
-	expect(!tea_display_line_observe(&line, c.c_str(), c.size(), c.c_str(), c.size(), c.size(), 9000 * kMs, 1000),
+	expect(rows.size() == 1 && rows[0] == c,
+	       "a gap between text arrivals never breaks the line (only server segments do)");
+	expect(!tea_display_line_observe(&line, c.c_str(), c.size(), c.c_str(), c.size(), c.size(), 9000 * kMs),
 	       "an identical snapshot is not a change");
 
 	/* chunks: each appended run keeps its own birth time (per-run fade-in) */
@@ -331,14 +354,13 @@ static void test_pause_breaks_and_chunks()
 
 	/* a rewrite (legacy preview / unstable tail) keeps the unchanged prefix's timing */
 	std::string d = "我們需要XY";
-	tea_display_line_observe(&line, c.c_str(), c.size(), d.c_str(), d.size(), b.size(), 3000 * kMs, 0);
+	tea_display_line_observe(&line, c.c_str(), c.size(), d.c_str(), d.size(), b.size(), 3000 * kMs);
 	expect(line.chunks[line.chunk_count - 1].start == b.size() &&
 		       line.chunks[line.chunk_count - 1].born_ns == 3000 * kMs,
 	       "rewritten text becomes a new chunk after the common prefix");
-	expect(line.hard_break_count == 1, "a pause break inside the kept prefix survives");
 	expect(line.locked_len == b.size(), "the committed length is tracked separately from the tail");
 	std::string e = "我們需要";
-	tea_display_line_observe(&line, d.c_str(), d.size(), e.c_str(), e.size(), e.size(), 3100 * kMs, 0);
+	tea_display_line_observe(&line, d.c_str(), d.size(), e.c_str(), e.size(), e.size(), 3100 * kMs);
 	expect(line.len == e.size() && line.chunks[line.chunk_count - 1].start < e.size(),
 	       "a tail that disappears simply ends the chunks there");
 
@@ -346,9 +368,70 @@ static void test_pause_breaks_and_chunks()
 	tea_display_line_retire(&line);
 	expect(!tea_display_line_has_visible_text(&line), "a retired line shows nothing");
 	std::string f = "我們需要一個計畫";
-	tea_display_line_observe(&line, e.c_str(), e.size(), f.c_str(), f.size(), f.size(), 4000 * kMs, 0);
+	tea_display_line_observe(&line, e.c_str(), e.size(), f.c_str(), f.size(), f.size(), 4000 * kMs);
 	rows = wrap_rows(line, f, 1000, 0, true, &cache);
 	expect(rows.size() == 1 && rows[0] == "一個計畫", "text arriving after a fade-out shows only the new part");
+}
+
+static void test_open_lines_do_not_fade_while_speaking()
+{
+	/* The reported bug: fade-out delay 1500 ms, stable commits every
+	 * 1.6-2.4 s. The committed text of the open line stands still for longer
+	 * than the delay while the speaker keeps talking. */
+	const uint32_t delay = 1500, fade = 200;
+	tea_display_line_t line;
+	std::string text = "我們";
+	tea_display_line_init(&line, 9, text.size(), text.size(), 0);
+	tea_display_line_note_activity(&line, 1, true, 0);
+	/* partials keep arriving (every 800 ms) without changing what is shown */
+	uint64_t session = 0;
+	for (uint64_t t = 800; t <= 2400; t += 800) {
+		session = t * kMs;
+		tea_display_line_note_activity(&line, 1 + t, true, t * kMs);
+	}
+	uint64_t now = 2500 * kMs; /* 2.5 s since the text last changed */
+	uint64_t ref = tea_display_line_fade_ref(&line, session);
+	expect(tea_fade_out_alpha(true, now, ref, delay, fade) == 1.0f,
+	       "an open line with ongoing partials is fully visible even though its text is 2.5 s old");
+	expect(!tea_fade_out_done(true, now, ref, delay, fade), "and is never removed mid-speech");
+	expect(tea_fade_out_alpha(true, now, line.changed_ns, delay, fade) == 0.0f,
+	       "(the old rule -- time since the last text change -- had already faded it out)");
+
+	/* activity of *another* segment also keeps an open line up: the
+	 * session is still talking */
+	tea_display_line_t quiet;
+	tea_display_line_init(&quiet, 10, 3, 3, 0);
+	tea_display_line_note_activity(&quiet, 1, true, 0);
+	expect(tea_fade_out_alpha(true, 2500 * kMs, tea_display_line_fade_ref(&quiet, 2400 * kMs), delay, fade) == 1.0f,
+	       "session activity keeps every open line visible");
+	/* an open line with no activity anywhere for the delay may fade */
+	expect(tea_fade_out_done(true, 1800 * kMs, tea_display_line_fade_ref(&quiet, 0), delay, fade),
+	       "an open line with no activity at all for the delay fades out");
+
+	/* closing counts as activity: a closed line gets the full delay from then */
+	tea_display_line_note_activity(&quiet, 1, false, 5000 * kMs);
+	uint64_t closed_ref = tea_display_line_fade_ref(&quiet, 9000 * kMs);
+	expect(closed_ref == 5000 * kMs, "a closed line ignores later session activity");
+	expect(tea_fade_out_alpha(true, 6400 * kMs, closed_ref, delay, fade) == 1.0f &&
+		       tea_fade_out_done(true, 6700 * kMs, closed_ref, delay, fade),
+	       "a closed line fades out `delay` after it closed");
+}
+
+static void test_end_silence_setting()
+{
+	expect(tea_end_silence_request(870, true, 300, 3000) == 870, "a value inside the range is sent as-is");
+	expect(tea_end_silence_request(100, true, 300, 3000) == 300, "values are clamped to the server's minimum");
+	expect(tea_end_silence_request(5000, true, 300, 3000) == 3000, "and to the server's maximum");
+	expect(tea_end_silence_request(870, true, 400, 2000) == 870 &&
+		       tea_end_silence_request(350, true, 400, 2000) == 400,
+	       "the advertised range wins over the protocol bounds");
+	expect(tea_end_silence_request(870, false, 300, 3000) == 0,
+	       "a server that does not advertise segmentation_control gets no field at all");
+	expect(tea_end_silence_request(0, true, 300, 3000) == 0, "0 = server default: no field");
+	expect(tea_end_silence_from_legacy_pause(0) == 0, "an old pause of 0 (off) means server default");
+	expect(tea_end_silence_from_legacy_pause(870) == 870, "an old pause value carries over");
+	expect(tea_end_silence_from_legacy_pause(100) == 300 && tea_end_silence_from_legacy_pause(9000) == 3000,
+	       "old values are clamped into the protocol range");
 }
 
 static void test_row_limit()
@@ -440,22 +523,25 @@ static void test_frame_geometry()
 
 static void test_connection_policy()
 {
-	tea_connection_settings_t applied = {"127.0.0.1", 8327, "", true};
-	tea_connection_settings_t same = {"127.0.0.1", 8327, nullptr, true};
+	tea_connection_settings_t applied = {"127.0.0.1", 8327, "", true, 0};
+	tea_connection_settings_t same = {"127.0.0.1", 8327, nullptr, true, 0};
 	expect(tea_connection_decide(&applied, &same, true, true, false) == TEA_CONNECTION_KEEP,
 	       "an appearance-only update never reconnects, even while editing");
 	expect(tea_connection_decide(&applied, &same, true, false, true) == TEA_CONNECTION_KEEP,
 	       "Apply without connection changes does not reconnect");
-	tea_connection_settings_t typing = {"127.0.0.", 8327, "", true};
+	tea_connection_settings_t typing = {"127.0.0.", 8327, "", true, 0};
 	expect(tea_connection_decide(&applied, &typing, true, true, false) == TEA_CONNECTION_DEFER,
 	       "a host being typed in the Properties window waits");
 	expect(tea_connection_decide(&applied, &typing, true, true, true) == TEA_CONNECTION_RECONNECT,
 	       "Apply / closing the window reconnects with the edited host");
 	expect(tea_connection_decide(&applied, &typing, true, false, false) == TEA_CONNECTION_RECONNECT,
 	       "a non-interactive update (undo, script) applies at once");
-	tea_connection_settings_t stable_off = {"127.0.0.1", 8327, "", false};
+	tea_connection_settings_t stable_off = {"127.0.0.1", 8327, "", false, 0};
 	expect(tea_connection_decide(&applied, &stable_off, true, true, false) == TEA_CONNECTION_DEFER,
 	       "stable captions is a session.start field: treated as a connection setting");
+	tea_connection_settings_t silence = {"127.0.0.1", 8327, "", true, 870};
+	expect(tea_connection_decide(&applied, &silence, true, true, false) == TEA_CONNECTION_DEFER,
+	       "the sentence break silence is a session.start field: a connection setting");
 	expect(tea_connection_decide(&applied, &same, false, true, false) == TEA_CONNECTION_RECONNECT,
 	       "the first update of a new source connects");
 }
@@ -468,7 +554,10 @@ int main()
 	test_glyph_cache();
 	test_wrapping();
 	test_append_stability();
-	test_pause_breaks_and_chunks();
+	test_chunks();
+	test_big_append_keeps_rows();
+	test_open_lines_do_not_fade_while_speaking();
+	test_end_silence_setting();
 	test_row_limit();
 	test_fades();
 	test_frame_geometry();

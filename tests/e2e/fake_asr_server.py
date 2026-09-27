@@ -35,6 +35,24 @@ modified):
 * ``--reject-stable-field``: renames ``stable`` in the client's
   ``session.start`` to an unknown key, so the current server's extra=forbid
   answers ``protocol_error`` exactly like a server that predates the field.
+
+Sentence-break (segmentation) knobs. ``session.start.segmentation`` and
+``features.segmentation_control`` are being added to the server (docs/04
+「切段控制」); until a server with them is in ``--service-dir`` these emulate
+the contract around the unchanged server app:
+
+* ``--hide-segmentation-capability``: strips ``features.segmentation_control``
+  from ``/v1/capabilities`` -- a server without the feature (the default of
+  every server that predates it), whatever ``--service-dir`` contains.
+* ``--emulate-segmentation``: advertises
+  ``segmentation_control.end_silence_ms = {min 300, max 3000, default 900}``,
+  removes ``segmentation`` from the client's ``session.start`` before the
+  server app sees it, and reports the requested value back in
+  ``session.started.preview_policy.endpoint_silence_ms``. Only the wire
+  contract is emulated: the fake VAD does not change its segmentation.
+* ``--reject-segmentation-field``: advertises the capability like
+  ``--emulate-segmentation`` but renames the field to an unknown key, so the
+  server answers ``protocol_error`` (a server that advertises but refuses).
 """
 
 from __future__ import annotations
@@ -67,6 +85,9 @@ def main() -> int:
     parser.add_argument("--growing-text", action="store_true")
     parser.add_argument("--hide-stable-capability", action="store_true")
     parser.add_argument("--reject-stable-field", action="store_true")
+    parser.add_argument("--hide-segmentation-capability", action="store_true")
+    parser.add_argument("--emulate-segmentation", action="store_true")
+    parser.add_argument("--reject-segmentation-field", action="store_true")
     args = parser.parse_args()
 
     if args.port == 8327:
@@ -165,15 +186,27 @@ def main() -> int:
                     record({**base, "event": "ws_session_start",
                             "transcript_mode": payload.get("transcript_mode"),
                             "stable": payload.get("stable"),
+                            "segmentation": payload.get("segmentation"),
                             "stable_rewritten": bool(args.reject_stable_field and "stable" in payload)})
+                    changed = False
                     if args.reject_stable_field and "stable" in payload:
                         payload["stable_unknown_to_this_server"] = payload.pop("stable")
+                        changed = True
+                    if "segmentation" in payload and args.reject_segmentation_field:
+                        payload["segmentation_unknown_to_this_server"] = payload.pop("segmentation")
+                        changed = True
+                    elif "segmentation" in payload and args.emulate_segmentation:
+                        held["end_silence_ms"] = payload.pop("segmentation").get("end_silence_ms")
+                        changed = True
+                    if changed:
                         message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
             return message
 
         async def wrapped_send(message):
             mtype = message["type"]
-            if (args.hide_stable_capability and base["path"] == "/v1/capabilities"
+            rewrite_caps = (args.hide_stable_capability or args.hide_segmentation_capability
+                            or args.emulate_segmentation or args.reject_segmentation_field)
+            if (rewrite_caps and base["path"] == "/v1/capabilities"
                     and mtype in ("http.response.start", "http.response.body")):
                 # Buffer the whole response, drop the optional feature, fix
                 # content-length, then pass it on.
@@ -187,7 +220,14 @@ def main() -> int:
                 body = held["body"]
                 try:
                     doc = json.loads(body)
-                    doc.get("features", {}).pop("stable_transcripts", None)
+                    features = doc.get("features", {})
+                    if args.hide_stable_capability:
+                        features.pop("stable_transcripts", None)
+                    if args.hide_segmentation_capability:
+                        features.pop("segmentation_control", None)
+                    if args.emulate_segmentation or args.reject_segmentation_field:
+                        features["segmentation_control"] = {"end_silence_ms": {
+                            "min": 300, "max": 3000, "default": 900, "default_final_only": 500}}
                     body = json.dumps(doc, ensure_ascii=False).encode()
                 except ValueError:
                     pass
@@ -216,6 +256,13 @@ def main() -> int:
                     payload = json.loads(message["text"])
                 except ValueError:
                     payload = {}
+                if (payload.get("type") == "session.started" and args.emulate_segmentation
+                        and held.get("end_silence_ms") is not None and payload.get("preview_policy")):
+                    payload["preview_policy"]["endpoint_silence_ms"] = held["end_silence_ms"]
+                    message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
+                if payload.get("type") == "session.started":
+                    record({**base, "event": "ws_session_started",
+                            "endpoint_silence_ms": (payload.get("preview_policy") or {}).get("endpoint_silence_ms")})
                 if payload.get("type") == "error":
                     record({**base, "event": "ws_error_event", "code": payload.get("code"),
                             "retryable": payload.get("retryable")})

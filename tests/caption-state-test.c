@@ -129,7 +129,8 @@ static void test_stable_closing_states(void)
 	tea_caption_state_on_stable(st, "s", "div", 0, 1, "今天天氣", "open");
 	tea_caption_state_on_final_indexed(st, "s", "div", 0, 4, "今天天汽很好");
 	expect_render(st, "今天天氣", "a non-extending final never rewrites committed text");
-	expect(tea_caption_state_last_line_is_partial(st), "the line waits for its diverged closing");
+	expect(!tea_caption_state_last_line_is_partial(st),
+	       "the line closes at the final (for fading); the diverged stable may still extend it");
 	tea_caption_state_on_stable(st, "s", "div", 0, 2, "今天天氣很好", "diverged");
 	expect_render(st, "今天天氣很好", "state=diverged appends the final's tail");
 	expect(!tea_caption_state_last_line_is_partial(st), "state=diverged closes the line");
@@ -302,6 +303,7 @@ static void test_unstable_tail(void)
 {
 	tea_caption_state_t *st = tea_caption_state_create();
 	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_set_stable_tail_lines(st, true); /* tails shown */
 
 	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "我們", "open");
 	tea_caption_state_on_partial(st, "s", "seg-a", 2, "我們需要");
@@ -314,45 +316,109 @@ static void test_unstable_tail(void)
 	uint64_t key = snap_line(&snap, 0)->key;
 	tea_caption_snapshot_free(&snap);
 
+	/* Shown text never retracts. A partial that does not start with the
+	 * committed text offers what it has after as many characters as the
+	 * committed text (how the server closes a diverged segment). */
 	tea_caption_state_on_partial(st, "s", "seg-a", 3, "你們需要改");
-	expect_tail(st, "我們", NULL, "a partial that does not start with the committed text shows no tail");
+	expect_tail(st, "我們", "需要改", "a non-prefix partial offers its text after the committed length");
 	expect_render(st, "我們", "and never changes the committed text");
 
 	tea_caption_state_on_partial(st, "s", "seg-a", 4, "我們需要改");
+	expect_tail(st, "我們", "需要改", "the same tail again changes nothing");
+	tea_caption_state_on_partial(st, "s", "seg-a", 5, "我們需");
+	expect_tail(st, "我們", "需要改", "a shorter offer does not retract the shown tail");
+	tea_caption_state_on_partial(st, "s", "seg-a", 6, "我們");
+	expect_tail(st, "我們", "需要改", "a partial with nothing beyond the committed text does not retract");
+	tea_caption_state_on_partial(st, "s", "seg-a", 7, "他們");
+	expect_tail(st, "我們", "需要改", "a short non-prefix partial does not retract either");
+
 	tea_caption_state_on_stable(st, "s", "seg-a", 0, 2, "我們需", "open");
-	expect_tail(st, "我們需", "要改", "the tail shrinks as the committed text catches up");
+	expect_tail(st, "我們需", "要改",
+		    "committing part of the tail moves it into the text, nothing visible changes");
 	tea_caption_state_on_stable(st, "s", "seg-a", 0, 3, "我們需要改", "open");
 	expect_tail(st, "我們需要改", NULL, "no tail once everything is committed");
-	tea_caption_state_on_partial(st, "s", "seg-a", 5, "我們需要改一");
+	tea_caption_state_on_partial(st, "s", "seg-a", 8, "我們需要改一");
 	expect_tail(st, "我們需要改", "一", "a later partial brings a new tail");
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 4, "我們需要改二", "open");
+	expect_tail(st, "我們需要改二", NULL, "a commit that contradicts the tail drops it; committed text wins");
+	tea_caption_state_on_partial(st, "s", "seg-a", 9, "我們需要改二三");
+	tea_caption_state_on_partial(st, "s", "seg-a", 10, "我們需要改二四");
+	expect_tail(st, "我們需要改二", "四", "an offer as long as the tail may correct its words");
+	tea_caption_state_on_partial(st, "s", "seg-a", 11, "我們需要改二四五。");
+	expect_tail(st, "我們需要改二", "四五",
+		    "the hypothesis' closing punctuation is not shown at the unstable edge");
+	tea_caption_state_on_partial(st, "s", "seg-a", 12, "我們需要改二四五六。");
+	expect_tail(st, "我們需要改二", "四五六", "so the next preview only appends");
 
-	tea_caption_state_on_final(st, "s", "seg-a", 6, "我們需要改進");
-	expect_tail(st, "我們需要改進", NULL, "the final replaces the tail with committed text");
-	tea_caption_state_on_partial(st, "s", "seg-a", 7, "我們需要改進了");
-	expect_tail(st, "我們需要改進", NULL, "no tail after the final");
+	tea_caption_state_on_final(st, "s", "seg-a", 13, "我們需要改二四五六。");
+	expect_tail(st, "我們需要改二四五六。", NULL, "a final that extends what is shown becomes the committed text");
+	tea_caption_state_on_partial(st, "s", "seg-a", 14, "我們需要改二四五六。了");
+	expect_tail(st, "我們需要改二四五六。", NULL, "no tail after the final");
 
 	tea_caption_state_snapshot(st, true, &snap);
 	expect(snap_line(&snap, 0)->key == key, "the line keeps its identity while it grows");
 	tea_caption_snapshot_free(&snap);
 
-	/* a closing stable (no final first) also ends the tail */
+	/* a closing stable that does not extend what is shown never takes it back */
 	tea_caption_state_on_stable(st, "s", "seg-b", 1, 1, "下一句", "open");
 	tea_caption_state_on_partial(st, "s", "seg-b", 1, "下一句話");
 	expect_tail(st, "下一句", "話", "second segment shows its own tail");
 	tea_caption_state_on_stable(st, "s", "seg-b", 1, 2, "下一句", "diverged");
-	expect_tail(st, "下一句", NULL, "a closing stable ends the tail");
+	expect_tail(st, "下一句", "話", "a closing stable shorter than what is shown keeps the shown tail");
+	expect(!tea_caption_state_last_line_is_partial(st), "the line is closed");
+
+	/* a final that does not extend the committed text keeps the tail until
+	 * the closing "diverged" stable right behind it: no committed-only gap */
+	tea_caption_state_on_stable(st, "s", "seg-e", 4, 1, "第五句", "open");
+	tea_caption_state_on_partial(st, "s", "seg-e", 1, "第五句話");
+	tea_caption_state_on_final(st, "s", "seg-e", 2, "第五個");
+	expect_tail(st, "第五句", "話", "a final that differs from what is shown never replaces it");
+	expect(!tea_caption_state_last_line_is_partial(st), "but the line closes (for fading)");
+	tea_caption_state_on_stable(st, "s", "seg-e", 4, 2, "第五句個", "diverged");
+	expect_tail(st, "第五句", "話", "nor does the diverged closing stable rewrite it");
+	/* the real-model case: the final drops the phrase the tail showed */
+	tea_caption_state_on_stable(st, "s", "seg-f", 5, 1, "醉人的芬芳。", "open");
+	tea_caption_state_on_partial(st, "s", "seg-f", 1, "醉人的芬芳。步伐踉蹌，險些跌倒在地。");
+	tea_caption_state_on_final(st, "s", "seg-f", 2, "醉人的芬芳。");
+	tea_caption_state_on_stable(st, "s", "seg-f", 5, 2, "醉人的芬芳。", "final");
+	expect_tail(st, "醉人的芬芳。", "步伐踉蹌，險些跌倒在地",
+		    "a final shorter than what is shown keeps the phrase the viewer already read");
+	/* a closing stable that extends what is shown is shown */
+	tea_caption_state_on_stable(st, "s", "seg-g", 6, 1, "好的", "open");
+	tea_caption_state_on_partial(st, "s", "seg-g", 1, "好的謝謝");
+	tea_caption_state_on_final(st, "s", "seg-g", 2, "好的謝謝大家。");
+	expect_tail(st, "好的謝謝大家。", NULL, "a final extending committed + tail replaces the tail seamlessly");
 
 	/* skipped / cancelled / reconnect end the tail too */
-	tea_caption_state_on_stable(st, "s", "seg-c", 2, 1, "第三", "open");
+	tea_caption_state_on_stable(st, "s", "seg-c", 7, 1, "第三", "open");
 	tea_caption_state_on_partial(st, "s", "seg-c", 1, "第三句");
 	tea_caption_state_on_segment_dropped(st, "s", "seg-c");
-	expect_tail(st, "第三", NULL, "a dropped segment keeps its committed text but loses the tail");
-	tea_caption_state_on_stable(st, "s", "seg-d", 3, 1, "第四", "open");
+	expect_tail(st, "第三", "句", "a dropped segment keeps what it shows, tail included");
+	tea_caption_state_on_stable(st, "s", "seg-d", 8, 1, "第四", "open");
 	tea_caption_state_on_partial(st, "s", "seg-d", 1, "第四句");
 	tea_caption_state_hold_for_reconnect(st);
-	expect_tail(st, "第四", NULL, "a connection loss drops the tail, keeps the committed text");
+	expect_tail(st, "第四", "句", "a connection loss freezes what is shown, tail included");
 
 	expect(tea_caption_state_stable_mismatches(st) == 0, "tails never count as contract violations");
+	tea_caption_state_destroy(st);
+}
+
+static void test_close_with_tails_hidden(void)
+{
+	/* Tails not shown: what is shown is the committed text only, so a
+	 * diverged close may still append the final's text after it. */
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "第五句", "open");
+	tea_caption_state_on_partial(st, "s", "seg-a", 1, "第五句話");
+	tea_caption_state_on_final(st, "s", "seg-a", 2, "第五個");
+	expect_render(st, "第五句", "a diverging final keeps the committed text");
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 2, "第五句個", "diverged");
+	expect_render(st, "第五句個", "the diverged closing stable extends what is shown");
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 1 && snap.lines[0].tail == NULL, "no hidden tail is kept after the close");
+	tea_caption_snapshot_free(&snap);
 	tea_caption_state_destroy(st);
 }
 
@@ -388,6 +454,30 @@ static void test_tail_only_lines(void)
 		       snap_line(&snap, 1)->tail && strcmp(snap_line(&snap, 1)->tail, "覽") == 0,
 	       "the first stable fills the same line");
 	tea_caption_snapshot_free(&snap);
+	tea_caption_state_destroy(st);
+}
+
+static void test_activity(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "我們", "open");
+	tea_caption_snapshot_t a, b;
+	tea_caption_state_snapshot(st, true, &a);
+	/* a partial that changes nothing visible is still speech activity */
+	tea_caption_state_on_partial(st, "s", "seg-a", 1, "你們");
+	tea_caption_state_snapshot(st, true, &b);
+	expect(strcmp(b.lines[0].text, "我們") == 0 && b.lines[0].tail == NULL, "nothing visible changed");
+	expect(b.lines[0].activity != a.lines[0].activity, "the line's activity changed");
+	expect(b.activity != a.activity, "the session's activity changed");
+	tea_caption_snapshot_free(&a);
+	tea_caption_snapshot_free(&b);
+	tea_caption_state_snapshot(st, true, &a);
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "我們", "open"); /* duplicate */
+	tea_caption_state_snapshot(st, true, &b);
+	expect(b.activity != a.activity, "even a duplicate stable shows the session is active");
+	tea_caption_snapshot_free(&a);
+	tea_caption_snapshot_free(&b);
 	tea_caption_state_destroy(st);
 }
 
@@ -434,6 +524,8 @@ int main(void)
 	test_snapshot_matches_render();
 	test_unstable_tail();
 	test_tail_only_lines();
+	test_close_with_tails_hidden();
+	test_activity();
 
 	puts("caption state tests passed");
 	return EXIT_SUCCESS;

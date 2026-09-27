@@ -16,13 +16,16 @@
  *                       [--duration-ms MS] [--audio speech|dead|none]
  *                       [--restart-at-ms MS] [--stable on|off]
  *                       [--tail on|off] [--toggle-display-at-ms MS]
+ *                       [--end-silence-ms MS]
  *
  * --stable mirrors the source's "stable captions" setting (plugin default on).
  * --tail mirrors "show not-yet-confirmed text"; --toggle-display-at-ms flips
  * it and changes the line count mid-session, exactly the display-only calls
  * the OBS source makes from update(), so a test can check that they never
  * touch the connection.
- * The final {"event":"done"} line also carries "stable_mismatches" per client.
+ * --end-silence-ms mirrors the "sentence break" setting (0 = server default).
+ * The final {"event":"done"} line also carries "stable_mismatches",
+ * "segmentation_supported" and "end_silence_effective" per client.
  */
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -79,6 +82,7 @@ int main(int argc, char **argv)
 	bool stable = true;
 	bool tail = false;
 	int toggleDisplayAtMs = -1;
+	int endSilenceMs = 0;
 
 	for (int i = 1; i < argc; i++) {
 		auto next = [&](const char *name) -> const char * {
@@ -108,6 +112,8 @@ int main(int argc, char **argv)
 			tail = std::strcmp(next("--tail"), "off") != 0;
 		else if (!std::strcmp(argv[i], "--toggle-display-at-ms"))
 			toggleDisplayAtMs = std::atoi(next("--toggle-display-at-ms"));
+		else if (!std::strcmp(argv[i], "--end-silence-ms"))
+			endSilenceMs = std::atoi(next("--end-silence-ms"));
 		else {
 			std::fprintf(stderr, "unknown argument %s\n", argv[i]);
 			return 2;
@@ -130,6 +136,7 @@ int main(int argc, char **argv)
 		tea_asr_client_set_server(s.client, host.c_str(), port);
 		tea_asr_client_set_token_path(s.client, token.c_str());
 		tea_asr_client_set_stable_captions(s.client, stable);
+		tea_asr_client_set_end_silence_ms(s.client, endSilenceMs);
 		tea_asr_client_start(s.client);
 	}
 
@@ -207,8 +214,13 @@ int main(int argc, char **argv)
 	QTimer::singleShot(durationMs, [&]() {
 		poll.stop();
 		QJsonArray mismatches;
-		for (auto &s : rigs)
+		QJsonArray segmentation;
+		QJsonArray effective;
+		for (auto &s : rigs) {
 			mismatches.append((double)tea_caption_state_stable_mismatches(s.captions));
+			segmentation.append(tea_asr_client_supports_segmentation(s.client, nullptr, nullptr, nullptr));
+			effective.append(tea_asr_client_effective_end_silence_ms(s.client));
+		}
 		for (auto &s : rigs) {
 			tea_asr_client_stop(s.client);
 			tea_asr_client_destroy(s.client);
@@ -217,7 +229,9 @@ int main(int argc, char **argv)
 		}
 		emitLine(QJsonObject{{"t", (double)clock.elapsed()},
 				     {"event", "done"},
-				     {"stable_mismatches", mismatches}});
+				     {"stable_mismatches", mismatches},
+				     {"segmentation_supported", segmentation},
+				     {"end_silence_effective", effective}});
 		app.quit();
 	});
 

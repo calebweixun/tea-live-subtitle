@@ -71,9 +71,14 @@ public:
 	bool supportsPartialTranscripts() const;
 	bool supportsStableTranscripts() const;
 	bool stableCaptionsActive() const;
+	/* capabilities.features.segmentation_control.end_silence_ms, if any. */
+	bool supportsSegmentationControl(int *min_ms, int *max_ms, int *default_ms) const;
+	/* preview_policy.endpoint_silence_ms of the running session, -1 if unknown. */
+	int effectiveEndSilenceMs() const;
 
-	/* Takes effect on the next start(). */
+	/* Take effect on the next start(). */
 	void setStableCaptions(bool enabled);
+	void setEndSilenceMs(int ms);
 
 public slots:
 	void doStart();
@@ -203,6 +208,19 @@ private:
 	bool stableRequested_ = false;
 	std::atomic<bool> stableActive_{false};
 	bool stableMismatchLogged_ = false;
+
+	/* Sentence break = the server's end-of-segment silence
+	 * (session.start.segmentation.end_silence_ms, docs/04「切段控制」).
+	 * Sent only when the server advertises segmentation_control; a server
+	 * that still rejects it is retried without it, like `stable`. */
+	std::atomic<int> endSilencePreferred_{0}; /* 0 = server default */
+	std::atomic<bool> serverSupportsSegmentation_{false};
+	std::atomic<int> segmentationMin_{0};
+	std::atomic<int> segmentationMax_{0};
+	std::atomic<int> segmentationDefault_{0};
+	bool segmentationRejected_ = false;
+	int segmentationRequested_ = 0; /* value sent in the last session.start, 0 = none */
+	std::atomic<int> effectiveEndSilence_{-1};
 	/* A held (frozen) caption is cleared if no new session starts within
 	 * this long: past that it no longer describes anything live. */
 	static const int kStaleCaptionMs = 10000;

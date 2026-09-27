@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "src" / "captions-source.c").read_text(encoding="utf-8")
 layout = (ROOT / "src" / "caption-layout.h").read_text(encoding="utf-8")
+layout_display = (ROOT / "src" / "caption-display.h").read_text(encoding="utf-8")
 
 assert "TEA_LAYOUT_SCHEMA_VERSION 1" in layout
 assert 'TEA_LAYOUT_SCHEMA_KEY "layout_schema_version"' in layout
@@ -33,20 +34,48 @@ assert "obs_data_set_int(settings, TEA_LAYOUT_SCHEMA_KEY, TEA_LAYOUT_SCHEMA_VERS
 render_defaults = [
     'obs_data_set_default_bool(settings, TEA_KEY_FADE_IN, false);',
     'obs_data_set_default_bool(settings, TEA_KEY_FADE_OUT, false);',
-    'obs_data_set_default_int(settings, TEA_KEY_PAUSE_MS, TEA_DEFAULT_PAUSE_MS);',
+    'obs_data_set_default_int(settings, TEA_KEY_END_SILENCE_MS, TEA_DEFAULT_END_SILENCE_MS);',
     'obs_data_set_default_int(settings, TEA_KEY_MAX_ROWS, 0);',
     'obs_data_set_default_bool(settings, TEA_KEY_BG, false);',
     'obs_data_set_default_bool(settings, TEA_KEY_TAIL, false);',
 ]
 for line in render_defaults:
     assert line in source, line
-assert "#define TEA_DEFAULT_PAUSE_MS 0" in source
+assert "#define TEA_DEFAULT_END_SILENCE_MS 0" in source
 new_block = "if (from_new_source_defaults && !obs_data_has_user_value(settings, TEA_RENDER_SCHEMA_KEY)) {"
 assert new_block in source
 block = source[source.index(new_block):]
 block = block[: block.index("}")]
 assert "obs_data_set_int(settings, TEA_RENDER_SCHEMA_KEY, TEA_RENDER_SCHEMA_VERSION);" in block
 assert "obs_data_set_bool(settings, TEA_KEY_FADE_OUT, true);" in block
+# Render schema 2: new sources start with the settings the user settled on
+# in a real broadcast. OBS colours are 0xAABBGGRR: #DBE577 -> 0xFF77E5DB.
+assert "#define TEA_RENDER_SCHEMA_VERSION 2" in source
+assert "#define TEA_NEW_SOURCE_COLOR_BOTTOM 0xFF77E5DB" in source
+for line in ('obs_data_set_int(settings, "color1", TEA_NEW_SOURCE_COLOR_TOP);',
+             'obs_data_set_int(settings, "color2", TEA_NEW_SOURCE_COLOR_BOTTOM);',
+             'obs_data_set_bool(settings, "drop_shadow", true);',
+             'obs_data_set_bool(settings, TEA_KEY_BG, true);',
+             'obs_data_set_int(settings, "caption_width_px", TEA_NEW_SOURCE_CAPTION_WIDTH);',
+             'obs_data_set_int(settings, "max_lines", TEA_NEW_SOURCE_MAX_LINES);',
+             'obs_data_set_int(settings, TEA_KEY_END_SILENCE_MS, TEA_NEW_SOURCE_END_SILENCE_MS);',
+             'obs_data_set_int(settings, TEA_KEY_FADE_DELAY_MS, TEA_NEW_SOURCE_FADE_DELAY_MS);',
+             'obs_data_set_bool(settings, TEA_KEY_TAIL, true);'):
+    assert line in block, line
+for define in ("#define TEA_NEW_SOURCE_CAPTION_WIDTH 1800", "#define TEA_NEW_SOURCE_MAX_LINES 3",
+               "#define TEA_NEW_SOURCE_MAX_ROWS 2", "#define TEA_NEW_SOURCE_END_SILENCE_MS 870",
+               "#define TEA_NEW_SOURCE_FADE_DELAY_MS 1500", "#define TEA_NEW_SOURCE_FADE_MS 200",
+               "#define TEA_NEW_SOURCE_BG_PADDING 0"):
+    assert define in source, define
+
+# The old client-side "sentence break pause" (gaps between text arrivals) is
+# gone; an old value migrates onto the server end-silence setting.
+assert "tea_display_line_add_hard_break" not in layout_display
+assert "uint32_t pause_ms" not in layout_display and "hard_break" not in layout_display
+migration = source[source.index("if (!obs_data_has_user_value(settings, TEA_KEY_END_SILENCE_MS) &&"):]
+migration = migration[: migration.index("}")]
+assert "tea_end_silence_from_legacy_pause(obs_data_get_int(settings, TEA_KEY_LEGACY_PAUSE_MS))" in migration
+assert "obs_data_erase(settings, TEA_KEY_LEGACY_PAUSE_MS);" in migration
 
 # Appearance never reconnects: the only calls that (re)start the ASR session
 # are the connection-policy path and the Tools dialog's "Reconnect All", and
@@ -60,7 +89,8 @@ update_fn = update_fn[: update_fn.index("\n}\n")]
 assert "tea_asr_client_start" not in update_fn and "tea_asr_client_set_stable_captions" not in update_fn
 assert "tea_apply_connection(ctx, settings, false);" in update_fn
 for read in ('obs_data_get_string(settings, "server_host")', 'obs_data_get_int(settings, "server_port")',
-             'obs_data_get_string(settings, "token_path")', 'obs_data_get_bool(settings, "stable_captions")'):
+             'obs_data_get_string(settings, "token_path")', 'obs_data_get_bool(settings, "stable_captions")',
+             'obs_data_get_int(settings, TEA_KEY_END_SILENCE_MS)'):
     assert source.count(read) == apply_fn.count(read) == 1, read
 
 print("layout migration checks passed")
