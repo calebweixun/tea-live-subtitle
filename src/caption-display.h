@@ -526,13 +526,169 @@ static inline int tea_display_chunk_at(const tea_display_line_t *line, size_t at
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-	size_t start;   /* first byte shown on the row */
-	size_t end;     /* one past the last byte shown (trailing spaces trimmed) */
-	size_t next;    /* where the following row starts; everything before it belongs to this row or earlier */
-	uint32_t width; /* sum of advances of [start, end) + outline extra: text_ft2's width for the row */
+	size_t start;     /* first byte shown on the row */
+	size_t end;       /* one past the last byte shown (trailing spaces trimmed) */
+	size_t next;      /* where the following row starts; everything before it belongs to this row or earlier */
+	uint32_t width;   /* sum of advances of [start, end) + outline extra: text_ft2's width for the row */
+	bool punct_break; /* the row ends because of a punctuation line break */
 } tea_wrap_row_t;
 
 #define TEA_WRAP_MISSING_GLYPH (-1)
+
+/* ------------------------------------------------------------------------ */
+/* Punctuation line breaks                                                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Fast speakers rarely pause long enough for the server to end a segment, so
+ * one segment can hold several clauses. With punctuation breaks a row also
+ * ends right after sentence punctuation (and, optionally, a comma); the
+ * punctuation stays at the end of the row it closes and the next row starts
+ * at the next non-space character.
+ *
+ * Nothing on screen ever moves because of it: the decision for a mark is
+ * made from the text up to the first character after the mark (and the row
+ * it is on), so it is known before any character after the mark is shown and
+ * never changes while the text only grows. The server's preview hypothesis
+ * ends with a "。" that is not shown (caption-state.c trims it), so a break
+ * only follows punctuation the viewer can see.
+ */
+#define TEA_PUNCT_BREAK_OFF 0
+#define TEA_PUNCT_BREAK_SENTENCE 1 /* 。？！…；  and . ? ! ; */
+#define TEA_PUNCT_BREAK_COMMA 2    /* the above plus ，、 and , */
+#define TEA_PUNCT_COMMA_MIN_DEFAULT 8
+#define TEA_PUNCT_COMMA_MIN_MAX 40
+
+typedef struct {
+	int mode;            /* TEA_PUNCT_BREAK_* */
+	int comma_min_chars; /* a comma breaks only after this many visible characters on the row */
+} tea_punct_break_t;
+
+static inline bool tea_cp_is_sentence_end(uint32_t c)
+{
+	switch (c) {
+	case '.':
+	case '!':
+	case '?':
+	case ';':
+	case 0x2026: /* … */
+	case 0x3002: /* 。 */
+	case 0xFF0E: /* ． */
+	case 0xFF01: /* ！ */
+	case 0xFF1F: /* ？ */
+	case 0xFF1B: /* ； */
+	case 0xFF61: /* ｡ */
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool tea_cp_is_comma(uint32_t c)
+{
+	return c == ',' || c == 0xFF0C /* ， */ || c == 0x3001 /* 、 */ || c == 0xFE50 /* ﹐ */ ||
+	       c == 0xFE51 /* ﹑ */ || c == 0xFF64 /* ､ */;
+}
+
+static inline bool tea_cp_is_ascii_alnum(uint32_t c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* ASCII word (letters/dots) that ends at byte `end`, lower-cased, into buf. */
+static inline size_t tea_ascii_word_before(const char *text, size_t start, size_t end, char *buf, size_t cap)
+{
+	size_t b = end;
+	while (b > start) {
+		char c = text[b - 1];
+		bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.';
+		if (!letter)
+			break;
+		b--;
+	}
+	size_t n = end - b;
+	if (n >= cap)
+		return 0;
+	for (size_t i = 0; i < n; i++) {
+		char c = text[b + i];
+		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+	}
+	buf[n] = '\0';
+	return n;
+}
+
+/* "Mr." "e.g." "U.S." "J." ...: a period that does not end a sentence. */
+static inline bool tea_is_abbreviation(const char *word, size_t len)
+{
+	static const char *const known[] = {"mr", "mrs", "ms",  "dr", "prof", "st",  "jr",  "sr",  "vs",     "etc",
+					    "no", "inc", "ltd", "co", "mt",   "e.g", "i.e", "fig", "approx", "dept"};
+	if (len == 1)
+		return true; /* an initial */
+	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		if (strcmp(word, known[i]) == 0)
+			return true;
+	}
+	/* dotted acronyms: "u.s", "a.m" -- a dot inside the word */
+	return memchr(word, '.', len) != NULL;
+}
+
+/*
+ * The punctuation mark `cp` occupies text[here, after) on a row that starts
+ * at row_start. Returns the byte offset where the row ends because of it
+ * (after the mark and any punctuation / closing brackets right behind it),
+ * or 0 for no break. No break is decided while nothing follows the mark yet.
+ */
+static inline size_t tea_punct_break_end(const char *text, size_t to, size_t row_start, size_t here, size_t after,
+					 uint32_t cp, const tea_punct_break_t *punct)
+{
+	if (!punct || punct->mode == TEA_PUNCT_BREAK_OFF)
+		return 0;
+	bool sentence = tea_cp_is_sentence_end(cp);
+	bool comma = punct->mode >= TEA_PUNCT_BREAK_COMMA && tea_cp_is_comma(cp);
+	if (!sentence && !comma)
+		return 0;
+
+	/* the whole run of marks: "……" "。」" "?!" */
+	size_t j = after;
+	while (j < to) {
+		size_t peek = j;
+		uint32_t c = tea_utf8_decode(text, to, &peek);
+		if (tea_cp_is_sentence_end(c)) {
+			sentence = true;
+		} else if (!(tea_cp_is_comma(c) || tea_cp_is_closing(c) || tea_cp_is_extend(c))) {
+			break;
+		}
+		j = peek;
+	}
+	if (j >= to)
+		return 0; /* nothing after it yet: decided when the next character arrives */
+	size_t peek = j;
+	const uint32_t next = tea_utf8_decode(text, to, &peek);
+
+	if ((cp == '.' || cp == ',') && j == after) {
+		/* ASCII: "3.5", "1,000", "e.g.x", "U.S.A" never break */
+		if (tea_cp_is_ascii_alnum(next))
+			return 0;
+		if (cp == '.') {
+			char word[16];
+			size_t n = tea_ascii_word_before(text, row_start, here, word, sizeof(word));
+			if (n > 0 && tea_is_abbreviation(word, n))
+				return 0;
+		}
+	}
+	if (!sentence) {
+		/* comma: only when the row already holds enough to be worth it */
+		size_t chars = 0, pos = row_start;
+		while (pos < here) {
+			uint32_t c = tea_utf8_decode(text, here, &pos);
+			if (!tea_cp_is_space(c) && !tea_cp_is_extend(c))
+				chars++;
+		}
+		if (chars < (size_t)(punct->comma_min_chars > 0 ? punct->comma_min_chars : 0))
+			return 0;
+	}
+	return j;
+}
 
 static inline size_t tea_skip_spaces(const char *text, size_t pos, size_t end)
 {
@@ -579,7 +735,8 @@ static inline size_t tea_trim_trailing_spaces(const char *text, size_t start, si
  */
 static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, const size_t *chunk_starts,
 				     int chunk_count, uint32_t max_width, uint32_t outline_extra, bool word_wrap,
-				     const tea_glyph_cache_t *cache, tea_wrap_row_t *rows, int cap, int total)
+				     const tea_punct_break_t *punct, const tea_glyph_cache_t *cache,
+				     tea_wrap_row_t *rows, int cap, int total)
 {
 	size_t pos = tea_skip_spaces(text, from, to);
 	while (pos < to) {
@@ -591,6 +748,7 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 		bool have_prev = false;
 		size_t last_opportunity = 0;
 		bool have_opportunity = false;
+		bool punct_break = false;
 		size_t i = pos;
 		while (i < to) {
 			size_t here = i;
@@ -617,6 +775,9 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 					}
 					cut = after;
 					resume = after;
+					punct_break = punct && punct->mode != TEA_PUNCT_BREAK_OFF &&
+						      (tea_cp_is_sentence_end(cp) ||
+						       (punct->mode >= TEA_PUNCT_BREAK_COMMA && tea_cp_is_comma(cp)));
 					break;
 				}
 				size_t floor = row_start;
@@ -636,6 +797,13 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 				break;
 			}
 			width += adv;
+			const size_t stop = tea_punct_break_end(text, to, row_start, here, i, cp, punct);
+			if (stop > 0) {
+				cut = stop;
+				resume = stop;
+				punct_break = true;
+				break;
+			}
 			prev = cp;
 			have_prev = true;
 		}
@@ -651,6 +819,7 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 		row->end = end;
 		row->next = resume;
 		row->width = row_width;
+		row->punct_break = punct_break;
 		total++;
 		pos = resume;
 	}
@@ -662,9 +831,9 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
  * count (the last `cap` rows are in `rows`, oldest first after
  * tea_wrap_rows_in_order()) or TEA_WRAP_MISSING_GLYPH.
  */
-static inline int tea_wrap_line(const tea_display_line_t *line, const char *text, uint32_t max_width,
-				uint32_t outline_extra, bool word_wrap, const tea_glyph_cache_t *cache,
-				tea_wrap_row_t *rows, int cap)
+static inline int tea_wrap_line_ex(const tea_display_line_t *line, const char *text, uint32_t max_width,
+				   uint32_t outline_extra, bool word_wrap, const tea_punct_break_t *punct,
+				   const tea_glyph_cache_t *cache, tea_wrap_row_t *rows, int cap)
 {
 	size_t starts[TEA_DISPLAY_MAX_CHUNKS + 1];
 	int n = 0;
@@ -676,7 +845,15 @@ static inline int tea_wrap_line(const tea_display_line_t *line, const char *text
 	if (line->visible_from >= line->len)
 		return 0;
 	return tea_wrap_paragraph(text, line->visible_from, line->len, starts, n, max_width, outline_extra, word_wrap,
-				  cache, rows, cap, 0);
+				  punct, cache, rows, cap, 0);
+}
+
+/* tea_wrap_line_ex() without punctuation breaks. */
+static inline int tea_wrap_line(const tea_display_line_t *line, const char *text, uint32_t max_width,
+				uint32_t outline_extra, bool word_wrap, const tea_glyph_cache_t *cache,
+				tea_wrap_row_t *rows, int cap)
+{
+	return tea_wrap_line_ex(line, text, max_width, outline_extra, word_wrap, NULL, cache, rows, cap);
 }
 
 /* After tea_wrap_line() returned `total` rows into a ring of `cap`, copies
