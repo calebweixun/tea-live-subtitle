@@ -13,12 +13,13 @@ Every red CI run sends the user a GitHub failure email. All of the failures belo
 2. **C code must be strict C11.** Linux CI uses `-std=c11 -Werror`, which rejects POSIX-only calls. Use `bstrdup`/`bmem`, not `strdup`.
 3. **No deprecated OBS APIs.** The Linux plugin build turns deprecation warnings into errors; for example, use `obs_properties_add_button2`, not `obs_properties_add_button`. Compile locally with `-Werror -Werror=deprecated-declarations`.
 4. **Headers shared with C++ must be C++17-clean for MSVC.** Don't use designated initializers (`{ .x = ... }`) in any `.h` that a `.cpp` includes. To check, compile a stub `.cpp` that includes the header: `c++ -std=c++17 -Wpedantic -Wc++20-designator -fsyntax-only -Isrc -Itests/stubs stub.cpp`.
-5. **Formatting.** Run `uvx --from clang-format==19.1.1 clang-format --dry-run -Werror <file>` one file at a time; passing several files per call fails in the uvx wrapper. Run gersemi only if CMake files changed.
-6. **End-to-end.**
+5. **Range-for over Qt containers must bind by value when the element is a proxy.** macOS CI (Xcode clang, `-Werror`) rejects `for (const QJsonValue &v : jsonArray)` with `-Wrange-loop-bind-reference`, because iterating a `QJsonArray` yields temporaries. Write `for (const QJsonValue v : jsonArray)`. A local Homebrew-Qt build may not warn, so don't rely on it.
+6. **Formatting.** Run `uvx --from clang-format==19.1.1 clang-format --dry-run -Werror <file>` one file at a time; passing several files per call fails in the uvx wrapper. Run gersemi only if CMake files changed.
+7. **End-to-end.**
    - Build: `cmake -S tests/e2e -B <scratch> -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" && cmake --build <scratch>`
    - Run: `python3 tests/e2e/run_e2e.py --driver <scratch>/asr-client-e2e --service-dir /Users/c2leb/Codes/tea-asr-service`
    - Every scenario must pass.
-7. **Caption behaviour changes.** Also run the replay tool in `tests/replay/` against real-model traces (see its README). Visible text of an open segment must never shrink.
+8. **Caption behaviour changes.** Also run the replay tool in `tests/replay/` against real-model traces (see its README). Visible text of an open segment must never shrink.
 
 ## Never
 
