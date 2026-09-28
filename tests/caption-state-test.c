@@ -676,6 +676,74 @@ static void test_real_trace_sequences(void)
 	bfree(s15);
 }
 
+/* The two plugin-side duplications the church soak (round 6) found, rebuilt
+ * with neutral text: the shapes are those of the private traces. */
+static const tea_trace_ev_t k_window_moved[] = {
+	/* the committed text ends in 我們; the next preview starts there */
+	{TEA_EV_P, 1, "好的，我們", NULL},
+	{TEA_EV_S, 1, "好的", "open"},
+	{TEA_EV_P, 2, "好的，我們。", NULL},
+	{TEA_EV_S, 2, "好的，我們", "open"},
+	{TEA_EV_P, 3, "我們開始", NULL},
+	{TEA_EV_P, 4, "我們開始今天的聚會。", NULL},
+	/* and the final starts two characters before the committed end's run */
+	{TEA_EV_F, 5, "是的我們開始今天的聚會。", NULL},
+	{TEA_EV_S, 3, "好的，我們開始今天的聚會。", "diverged"},
+};
+
+static const tea_trace_ev_t k_restated_end[] = {
+	/* committed 大家跟旁邊的朋友; the model restates it, the last two
+	 * characters and the first ones heard differently */
+	{TEA_EV_P, 1, "大家跟旁邊的朋友。", NULL},
+	{TEA_EV_S, 1, "大家跟旁邊的朋友", "open"},
+	{TEA_EV_P, 2, "大家跟你們旁邊來，一起一起，唱詩歌。", NULL},
+	{TEA_EV_P, 3, "他家跟旁邊的彭友，一起唱詩歌。", NULL},
+	{TEA_EV_P, 4, "打架跟旁邊的彭友，一起唱詩歌讚美。", NULL},
+	{TEA_EV_F, 5, "打架跟旁邊的彭友，一起唱詩歌讚美。", NULL},
+	{TEA_EV_S, 2, "大家跟旁邊的朋友，一起唱詩歌讚美。", "diverged"},
+};
+
+static void test_restatement_sequences(void)
+{
+	char *a = play_segment(k_window_moved, TEA_N(k_window_moved), "是的我們開始今天的聚會。", "moved");
+	expect(strcmp(a, "好的，我們開始今天的聚會。") == 0,
+	       "a preview starting at the committed end continues it; so does a final shifted before it");
+	bfree(a);
+	char *b = play_segment(k_restated_end, TEA_N(k_restated_end), "打架跟旁邊的彭友，一起唱詩歌讚美。", "restated");
+	expect(strcmp(b, "大家跟旁邊的朋友，一起唱詩歌讚美。") == 0,
+	       "a restatement of the committed end heard differently continues after it, never appended whole");
+	bfree(b);
+
+	/* the head rule: a preview that begins like the committed text but
+	 * cannot be placed is not shown as new speech */
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_set_stable_tail_lines(st, true);
+	tea_caption_state_on_stable(st, "s", "h", 1, 1, "大家跟旁邊的朋友", "open");
+	tea_caption_state_on_partial(st, "s", "h", 1, "大家跟你們旁邊來，一起一起，唱詩歌。");
+	expect_tail(st, "大家跟旁邊的朋友", NULL, "a whole-sentence restatement heard differently is not appended");
+	tea_caption_state_destroy(st);
+}
+
+static void test_audio_ack_progress(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_on_stable(st, "s", "a", 1, 1, "還在說", "open");
+	const uint64_t rev = tea_caption_state_revision(st);
+	const uint64_t p0 = tea_caption_state_server_progress(st);
+	tea_caption_state_on_audio_ack(st, 1600);
+	const uint64_t p1 = tea_caption_state_server_progress(st);
+	expect(p1 != p0, "an ack that moves the acknowledged position is progress");
+	tea_caption_state_on_audio_ack(st, 1600);
+	expect(tea_caption_state_server_progress(st) == p1, "the same position again is not");
+	tea_caption_state_on_audio_ack(st, 3200);
+	expect(tea_caption_state_server_progress(st) != p1, "a later position is");
+	expect(tea_caption_state_revision(st) == rev, "acks never cause a re-render");
+	expect(tea_caption_state_last_line_is_partial(st), "and never close the open line");
+	tea_caption_state_destroy(st);
+}
+
 int main(void)
 {
 	tea_caption_state_t *state = tea_caption_state_create();
@@ -710,6 +778,8 @@ int main(void)
 	tea_caption_state_destroy(state);
 
 	test_stable_append_only();
+	test_restatement_sequences();
+	test_audio_ack_progress();
 	test_stable_segment_isolation();
 	test_stable_closing_states();
 	test_stable_rejects_non_extension();

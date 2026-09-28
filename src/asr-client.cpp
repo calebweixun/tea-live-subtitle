@@ -1289,7 +1289,10 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 	}
 
 	if (type == QLatin1String("audio.ack")) {
-		/* Diagnostics only in v0.1 (no resend-on-nack); nothing to do. */
+		/* No resend-on-nack in v0.1. The server still taking audio keeps a
+		 * still-open caption line up (TEA_OPEN_LINE_TIMEOUT_MS). */
+		tea_caption_state_on_audio_ack(captions_,
+					       (uint64_t)obj.value(QStringLiteral("received_sample")).toDouble(0));
 		return;
 	}
 

@@ -528,29 +528,61 @@ static void test_open_lines_do_not_fade_while_speaking()
 		session = t * kMs;
 		tea_display_line_note_activity(&line, 1 + t, true, t * kMs);
 	}
+	const uint32_t timeout = TEA_OPEN_LINE_TIMEOUT_MS;
 	uint64_t now = 2500 * kMs; /* 2.5 s since the text last changed */
-	uint64_t ref = tea_display_line_fade_ref(&line, session);
+	uint64_t ref = tea_display_line_fade_ref(&line, session, 0, delay, timeout);
 	expect(tea_fade_out_alpha(true, now, ref, delay, fade) == 1.0f,
 	       "an open line with ongoing partials is fully visible even though its text is 2.5 s old");
 	expect(!tea_fade_out_done(true, now, ref, delay, fade), "and is never removed mid-speech");
 	expect(tea_fade_out_alpha(true, now, line.changed_ns, delay, fade) == 0.0f,
 	       "(the old rule -- time since the last text change -- had already faded it out)");
 
+	/* church soak: the segment stays open, its text and every transcript
+	 * event stop for 5 s (singing, a pause, the VAD holding speech over
+	 * music), audio.ack keeps coming: the line stays */
+	tea_display_line_t held;
+	tea_display_line_init(&held, 11, 3, 3, 0);
+	tea_display_line_note_activity(&held, 1, true, 0);
+	for (uint64_t t = 0; t <= 30000; t += 100) {
+		const uint64_t r = tea_display_line_fade_ref(&held, 0, t * kMs, delay, timeout);
+		if (tea_fade_out_alpha(true, t * kMs, r, delay, fade) != 1.0f) {
+			expect(false, "an open line never fades while audio.ack progresses (30 s without any text)");
+			break;
+		}
+	}
+	/* the same line with no transcript event and no ack progress: the
+	 * user's 1.5 s delay no longer applies, the safety timeout does */
+	expect(tea_fade_out_alpha(true, 1800 * kMs, tea_display_line_fade_ref(&held, 0, 0, delay, timeout), delay,
+				  fade) == 1.0f,
+	       "an open line does not fade after the user's delay when nothing at all arrives");
+	expect(tea_fade_out_alpha(true, (timeout - 1) * (uint64_t)kMs,
+				  tea_display_line_fade_ref(&held, 0, 0, delay, timeout), delay, fade) == 1.0f,
+	       "an open line is fully visible until the safety timeout");
+	expect(tea_fade_out_done(true, (uint64_t)(timeout + fade) * kMs,
+				 tea_display_line_fade_ref(&held, 0, 0, delay, timeout), delay, fade),
+	       "an open line with no sign of life for the safety timeout fades out");
+	expect(tea_fade_out_done(true, (uint64_t)(4000 + timeout + fade) * kMs,
+				 tea_display_line_fade_ref(&held, 0, 4000 * kMs, delay, timeout), delay, fade) &&
+		       !tea_fade_out_done(true, (uint64_t)(4000 + timeout) * kMs,
+					  tea_display_line_fade_ref(&held, 0, 4000 * kMs, delay, timeout), delay, fade),
+	       "the safety timeout counts from the last ack progress");
+	/* a safety timeout shorter than the user's delay never shortens it */
+	expect(tea_display_line_fade_ref(&held, 0, 0, delay, 500) == 0, "the user's delay is the minimum");
+
 	/* activity of *another* segment also keeps an open line up: the
 	 * session is still talking */
 	tea_display_line_t quiet;
 	tea_display_line_init(&quiet, 10, 3, 3, 0);
 	tea_display_line_note_activity(&quiet, 1, true, 0);
-	expect(tea_fade_out_alpha(true, 2500 * kMs, tea_display_line_fade_ref(&quiet, 2400 * kMs), delay, fade) == 1.0f,
+	expect(tea_fade_out_alpha(true, 2500 * kMs, tea_display_line_fade_ref(&quiet, 2400 * kMs, 0, delay, timeout),
+				  delay, fade) == 1.0f,
 	       "session activity keeps every open line visible");
-	/* an open line with no activity anywhere for the delay may fade */
-	expect(tea_fade_out_done(true, 1800 * kMs, tea_display_line_fade_ref(&quiet, 0), delay, fade),
-	       "an open line with no activity at all for the delay fades out");
 
-	/* closing counts as activity: a closed line gets the full delay from then */
+	/* closing counts as activity: a closed line gets the user's delay from
+	 * then, whatever the session or the server does afterwards */
 	tea_display_line_note_activity(&quiet, 1, false, 5000 * kMs);
-	uint64_t closed_ref = tea_display_line_fade_ref(&quiet, 9000 * kMs);
-	expect(closed_ref == 5000 * kMs, "a closed line ignores later session activity");
+	uint64_t closed_ref = tea_display_line_fade_ref(&quiet, 9000 * kMs, 9000 * kMs, delay, timeout);
+	expect(closed_ref == 5000 * kMs, "a closed line ignores later session activity and ack progress");
 	expect(tea_fade_out_alpha(true, 6400 * kMs, closed_ref, delay, fade) == 1.0f &&
 		       tea_fade_out_done(true, 6700 * kMs, closed_ref, delay, fade),
 	       "a closed line fades out `delay` after it closed");

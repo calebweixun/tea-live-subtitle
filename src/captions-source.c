@@ -306,6 +306,8 @@ struct tea_captions_source {
 	uint64_t caption_rev_seen;
 	uint64_t session_activity;    /* snapshot activity counter last seen */
 	uint64_t session_activity_ns; /* when it last changed: the session is talking */
+	uint64_t server_progress;     /* tea_caption_state_server_progress() last seen */
+	uint64_t server_progress_ns;  /* when it last changed: the server takes audio */
 	bool force_snapshot;
 	bool layout_dirty;
 
@@ -1209,8 +1211,27 @@ static void tea_sync_lines(struct tea_captions_source *ctx, uint64_t now)
 	ctx->layout_dirty = true;
 }
 
-/* Lines idle for longer than delay + fade have faded out completely. An
- * open line only counts as idle when the whole session has been quiet (see
+/* audio.ack progress, polled every tick (it does not bump the revision). */
+static void tea_sync_server_progress(struct tea_captions_source *ctx, uint64_t now)
+{
+	if (!ctx->captions)
+		return;
+	const uint64_t progress = tea_caption_state_server_progress(ctx->captions);
+	if (progress != ctx->server_progress) {
+		ctx->server_progress = progress;
+		ctx->server_progress_ns = now;
+	}
+}
+
+static uint64_t tea_line_fade_ref(const struct tea_captions_source *ctx, const tea_display_line_t *meta)
+{
+	return tea_display_line_fade_ref(meta, ctx->session_activity_ns, ctx->server_progress_ns,
+					 ctx->config->fade_delay_ms, TEA_OPEN_LINE_TIMEOUT_MS);
+}
+
+/* Lines idle for longer than delay + fade have faded out completely. A line
+ * whose segment is still open only counts as idle once the server has shown
+ * no sign of life for TEA_OPEN_LINE_TIMEOUT_MS (see
  * tea_display_line_fade_ref()), so a sentence never fades out mid-speech. */
 static void tea_expire_lines(struct tea_captions_source *ctx, uint64_t now)
 {
@@ -1221,7 +1242,7 @@ static void tea_expire_lines(struct tea_captions_source *ctx, uint64_t now)
 		struct tea_rline *line = &ctx->lines[i];
 		if (!line->used || line->meta.persistent || !tea_display_line_has_visible_text(&line->meta))
 			continue;
-		const uint64_t ref = tea_display_line_fade_ref(&line->meta, ctx->session_activity_ns);
+		const uint64_t ref = tea_line_fade_ref(ctx, &line->meta);
 		if (tea_fade_out_done(true, now, ref, cfg->fade_delay_ms, cfg->fade_ms)) {
 			tea_display_line_retire(&line->meta);
 			ctx->layout_dirty = true;
@@ -1358,7 +1379,7 @@ static void tea_layout(struct tea_captions_source *ctx)
 		row->y = (int32_t)tea_caption_frame_row_y(&geo, frame->row_count);
 		row->w = wr->width;
 		row->h = geo.row_height;
-		row->changed = tea_display_line_fade_ref(&line->meta, ctx->session_activity_ns);
+		row->changed = tea_line_fade_ref(ctx, &line->meta);
 		row->key = line->meta.key;
 		row->persistent = line->meta.persistent;
 		row->born = UINT64_MAX;
@@ -1528,6 +1549,7 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 
 	tea_collect_measurements(ctx);
 	tea_sync_lines(ctx, now);
+	tea_sync_server_progress(ctx, now);
 	tea_expire_lines(ctx, now);
 	if (ctx->layout_dirty)
 		tea_layout(ctx);
@@ -1543,7 +1565,9 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 
 /* The fade-out reference is looked up live: the frame on screen may be a
  * few frames older than the caption state (while new glyphs are measured
- * or rendered), and activity that arrived since must still keep it up. */
+ * or rendered), and activity that arrived since must still keep it up.
+ * The live value replaces the frame's: it can also move back, when the
+ * segment closes and the open-line timeout gives way to the user's delay. */
 static float tea_row_alpha(const struct tea_captions_source *ctx, const struct tea_draw_row *row, uint64_t now)
 {
 	const struct tea_render_config *cfg = ctx->config;
@@ -1551,11 +1575,8 @@ static float tea_row_alpha(const struct tea_captions_source *ctx, const struct t
 		return 1.0f;
 	uint64_t ref = row->changed;
 	int idx = tea_line_find((struct tea_captions_source *)ctx, row->key);
-	if (idx >= 0) {
-		uint64_t live = tea_display_line_fade_ref(&ctx->lines[idx].meta, ctx->session_activity_ns);
-		if (live > ref)
-			ref = live;
-	}
+	if (idx >= 0)
+		ref = tea_line_fade_ref(ctx, &ctx->lines[idx].meta);
 	return tea_fade_out_alpha(cfg->fade_out, now, ref, cfg->fade_delay_ms, cfg->fade_ms);
 }
 

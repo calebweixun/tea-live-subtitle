@@ -479,20 +479,43 @@ static inline void tea_display_line_note_activity(tea_display_line_t *line, uint
 }
 
 /*
- * The moment a line's fade-out delay counts from. A closed line fades
- * `delay` after its last change. A line whose server segment is still open
- * never fades while the session shows speech activity: stable commits need
- * two agreeing previews at the server's ~800 ms preview cadence, so the
- * committed text can stand still for 1.6-2.4 s or more while the speaker is
- * talking. Every transcript event of the session (session_activity_ns)
- * keeps an open line visible; only an open line with no activity at all
- * for the delay may fade.
+ * A line whose server segment is still open stays up this long after the
+ * last sign of life -- an event of its segment, any transcript event of the
+ * session, or audio.ack progress -- before it may fade: a safety net for a
+ * segment the server never closes. Not a user setting.
  */
-static inline uint64_t tea_display_line_fade_ref(const tea_display_line_t *line, uint64_t session_activity_ns)
+#define TEA_OPEN_LINE_TIMEOUT_MS 10000
+
+/*
+ * The moment a line's fade-out delay (`fade_delay_ms`, the user's setting)
+ * counts from.
+ *
+ * A closed line fades `delay` after its last change (closing counts as a
+ * change: tea_display_line_note_activity()).
+ *
+ * A line whose server segment is still open never fades while the server
+ * shows it is alive. The text of an open segment can stand still for many
+ * seconds while the speaker is talking, pausing, singing, or the VAD holds
+ * speech over music: the server does not resend an identical preview, and
+ * stable commits need agreeing previews. So an open line only fades
+ * `open_timeout_ms` after the latest of its own activity, the session's
+ * transcript activity (session_activity_ns) and audio.ack progress
+ * (server_progress_ns). The result is shifted so that the usual
+ * `ref + fade_delay_ms` arithmetic gives that moment.
+ */
+static inline uint64_t tea_display_line_fade_ref(const tea_display_line_t *line, uint64_t session_activity_ns,
+						 uint64_t server_progress_ns, uint32_t fade_delay_ms,
+						 uint32_t open_timeout_ms)
 {
 	uint64_t ref = line->changed_ns > line->activity_ns ? line->changed_ns : line->activity_ns;
-	if (line->open && session_activity_ns > ref)
+	if (!line->open)
+		return ref;
+	if (session_activity_ns > ref)
 		ref = session_activity_ns;
+	if (server_progress_ns > ref)
+		ref = server_progress_ns;
+	if (open_timeout_ms > fade_delay_ms)
+		ref += (uint64_t)(open_timeout_ms - fade_delay_ms) * 1000000ULL;
 	return ref;
 }
 

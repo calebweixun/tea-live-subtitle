@@ -29,6 +29,8 @@ normalising away punctuation and spaces) when that segment's final does not repe
 tails kept over a different final, and finals whose remainder replaced the tail, with examples. The largest burst
 counts only characters that are new in a frame (outside the longest common subsequence with the previous frame), so
 scrolling a row away does not count.
+`audio.ack` events feed the server-progress signal that keeps a still-open line up (the plugin's 10 s open-line
+timeout); `--ignore-acks` replays as if the server sent none, so only the timeout applies.
 `--selftest-width-change W MS` switches the box width at MS as a real reflow, to check that the detector notices moves.
 
 To compare with an older plugin, extract its `src/` and `tests/stubs/` (for example with
