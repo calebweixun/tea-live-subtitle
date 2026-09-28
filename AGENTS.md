@@ -7,7 +7,7 @@ The workflow rules (who dispatches, worktree + PR, acceptance, CI failure log) l
 Every red CI run sends the user a GitHub failure email. All of the failures below happened, and all of them can be caught locally.
 
 1. **Protocol tests.** Extract the commands from `.github/workflows/protocol-tests.yaml` unchanged and run them with `RUNNER_TEMP` set:
-   - `sed -n '25,39p' .github/workflows/protocol-tests.yaml | sed 's/^ *//' > ci.sh`
+   - `sed -n '25,42p' .github/workflows/protocol-tests.yaml | sed 's/^ *//' > ci.sh`
    - `RUNNER_TEMP=<scratch> bash -e ci.sh`
    - Check the line range against the yaml first.
 2. **C code must be strict C11.** Linux CI uses `-std=c11 -Werror`, which rejects POSIX-only calls. Use `bstrdup`/`bmem`, not `strdup`.

@@ -5,6 +5,7 @@
 
 #include "audio-tap.h"
 #include "caption-state.h"
+#include "recognition-hints.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -123,6 +124,71 @@ void tea_asr_client_get_diag(tea_asr_client_t *client, tea_asr_client_diag_t *ou
  * in the {"t_ms", "event"} format tests/replay reads (size-capped). NULL or ""
  * turns it off. Takes effect on the next session. */
 void tea_asr_client_set_trace_dir(tea_asr_client_t *client, const char *dir);
+
+/* ---- recognition hints (辨識提示, docs/recognition-hints.md) ---- */
+
+/* The source's hint settings, raw as typed: the dictionary profile (blank or
+ * the "none" entry = none), the domain description, the hotwords and
+ * replacement fields, and an optional hints file re-read at every session
+ * start. Sent as session.start.context only when the server advertises
+ * features.context_biasing. NULLs are empty. Takes effect on the next
+ * tea_asr_client_start(). */
+void tea_asr_client_set_hints(tea_asr_client_t *client, const char *profile, const char *domain, const char *hotwords,
+			      const char *replacements, const char *file_path);
+
+#define TEA_HINTS_REASON_MAX 192
+#define TEA_HINTS_NAME_MAX 64
+
+typedef struct {
+	int capability;            /* TEA_HINTS_CAP_* (recognition-hints.h) */
+	tea_hints_limits_t limits; /* capabilities.features.context_limits */
+	bool sent;                 /* the last session.start carried a context */
+	bool rejected;             /* the server refused it; the session runs without */
+	char reject_reason[TEA_HINTS_REASON_MAX];
+	bool applied;     /* session.started echoed a context */
+	bool unconfirmed; /* the session started but did not echo the context it was sent */
+	char applied_profile[TEA_HINTS_NAME_MAX];
+	int applied_domain_chars;
+	int applied_hotwords;
+	int applied_replacements;
+	int applied_prompt_tokens; /* -1 = not reported */
+	/* the server put the domain and hotwords into the model prompt
+	 * (TEA_ASR_CONTEXT_PROMPT); replacements apply either way */
+	bool prompt_applied;
+	/* what was cut or refused when the last context was built */
+	tea_hints_report_t report;
+	int invalid_lines;
+	char invalid[TEA_HINTS_ISSUES_MAX];
+	bool file_error; /* the hints file is set but could not be read */
+} tea_asr_client_hints_status_t;
+
+/* Safe from any thread. */
+void tea_asr_client_get_hints_status(tea_asr_client_t *client, tea_asr_client_hints_status_t *out);
+
+/* GET /v1/dictionaries: the server's dictionary files a profile can name. */
+#define TEA_DICT_UNKNOWN 0  /* never fetched */
+#define TEA_DICT_FETCHING 1 /* request in flight */
+#define TEA_DICT_OK 2
+#define TEA_DICT_FAILED 3
+#define TEA_DICT_MAX 64
+
+typedef struct {
+	char name[TEA_HINTS_NAME_MAX];
+	int hotwords_count;
+	int replacements_count;
+} tea_dictionary_entry_t;
+
+/* `done(param)` runs on the client's thread once the request finished
+ * (whatever the outcome) or was dropped (client destroyed, newer request);
+ * it is called exactly once. Uses the server and token of the last start.
+ * Never blocks. */
+typedef void (*tea_asr_dictionaries_done_t)(void *param);
+void tea_asr_client_fetch_dictionaries(tea_asr_client_t *client, tea_asr_dictionaries_done_t done, void *param);
+/* State (TEA_DICT_*); fills up to `max` entries (*count), and `error` (may be
+ * NULL) with why a fetch failed. `age_ms` (may be NULL) gets the time since
+ * the last completed fetch, -1 if none. Safe from any thread. */
+int tea_asr_client_dictionaries(tea_asr_client_t *client, tea_dictionary_entry_t *out, int max, int *count, char *error,
+				size_t error_size, int64_t *age_ms);
 
 #ifdef __cplusplus
 }

@@ -52,18 +52,19 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 class FakeServer:
-    def __init__(self, work: Path, port: int, service_dir: Path, extra: list[str]):
+    def __init__(self, work: Path, port: int, service_dir: Path, extra: list[str], env: dict | None = None):
         self.work = work
         self.port = port
         self.service_dir = service_dir
         self.extra = extra
+        self.env = env or {}
         self.state = work / "state"
         self.request_log = work / "requests.jsonl"
         self.proc: subprocess.Popen | None = None
 
     def start(self) -> None:
         python = self.service_dir / ".venv" / "bin" / "python"
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", **self.env)
         stderr = (self.work / "server.stderr").open("a")
         self.proc = subprocess.Popen(
             [str(python), str(HERE / "fake_asr_server.py"), "--service-dir", str(self.service_dir),
@@ -735,6 +736,286 @@ def sc_segmentation_real(ctx) -> Checker:
     return c, run
 
 
+# --------------------------------------------------------------------------- recognition hints
+
+HINT_KEYS = {"profile", "domain", "hotwords", "replacements"}
+HINTS_HOTWORDS = "聖靈\n# 註解\n\n以弗所書\r\n"
+HINTS_REPLACEMENTS = "盛家 => 聖經\r\n聖家=>聖經\n恩點\t恩典\n# 註解 => 不算\n呃 =>\n"
+HINTS_FILE = "\ufeff# 講道提示檔\n[專有詞]\n以弗所書\n哥林多前書\n[對照表]\n盛家 => 聖經課\n星際 => 聖經\n"
+HINTS_DOMAIN = "  主日講道：以弗所書\n第二章  "
+# what the plugin must send for the settings above: the file first, then the
+# fields (hotwords unioned, a field pair overriding the file's by `from`)
+HINTS_EXPECTED = {
+    "profile": "church",
+    "domain": "主日講道：以弗所書\n第二章",
+    "hotwords": ["以弗所書", "哥林多前書", "聖靈"],
+    "replacements": [{"from": "盛家", "to": "聖經"}, {"from": "星際", "to": "聖經"}, {"from": "聖家", "to": "聖經"},
+                     {"from": "恩點", "to": "恩典"}, {"from": "呃", "to": ""}],
+}
+
+
+def hint_args(ctx, profile: str = "church", fetch_at_ms: int | None = 1500) -> tuple[str, ...]:
+    (ctx.work / "hotwords.txt").write_text(HINTS_HOTWORDS, encoding="utf-8")
+    (ctx.work / "replacements.txt").write_text(HINTS_REPLACEMENTS, encoding="utf-8")
+    (ctx.work / "hints.txt").write_text(HINTS_FILE, encoding="utf-8")
+    args = ["--hints-profile", profile, "--hints-domain", HINTS_DOMAIN,
+            "--hints-hotwords-file", str(ctx.work / "hotwords.txt"),
+            "--hints-replacements-file", str(ctx.work / "replacements.txt"),
+            "--hints-file", str(ctx.work / "hints.txt")]
+    if fetch_at_ms is not None:
+        args += ["--fetch-dictionaries-at-ms", str(fetch_at_ms)]
+    return tuple(args)
+
+
+def hints_done(run: Run) -> dict:
+    return (done_field(run, "hints") or [{}])[0]
+
+
+def session_starts(run: Run) -> list[dict]:
+    return [r for r in run.requests if r["event"] == "ws_session_start"]
+
+
+def dictionary_lines(run: Run) -> list[dict]:
+    return [l for l in run.lines if l.get("event") == "dictionaries"]
+
+
+def no_hint_text_logged(run: Run) -> bool:
+    words = ["聖靈", "以弗所書", "哥林多前書", "盛家", "聖經", "恩典", "主日講道"]
+    return not any(w in line for w in words for line in run.log)
+
+
+def sc_hints_on(ctx) -> Checker:
+    """Server offers context_biasing: the hints go out in session.start,
+    well-formed and equal to the settings (file merged first), the echo is
+    read back, and the dictionary list is fetched."""
+    c = Checker("hints_on")
+    srv = ctx.server(["--revisable", "--growing-text", "--emulate-context"])
+    run = ctx.drive(srv, srv.token_file, 8000, extra_args=hint_args(ctx))
+    starts = session_starts(run)
+    first = starts[0] if starts else {}
+    context = first.get("context")
+    c.check(hints_done(run).get("capability") == 3, f"the client saw context_biasing on ({hints_done(run)})")
+    c.check(first.get("has_context") is True and isinstance(context, dict) and set(context) <= HINT_KEYS,
+            f"session.start carries a context with only the contract's keys ({sorted(context or {})})")
+    c.check(context == HINTS_EXPECTED, f"the context matches the settings, file merged first ({context})")
+    c.check(not any(r["event"] == "ws_context_refused" for r in run.requests), "the server accepts it")
+    c.check(len(starts) == 1 and first.get("stable") == {"agreement": 2}, "one session, stable captions kept")
+    h = hints_done(run)
+    c.check(h.get("applied") is True and h.get("applied_profile") == "church" and h.get("applied_hotwords") == 3
+            and h.get("applied_replacements") == 5, f"session.started's echo is read back ({h})")
+    c.check(run.any_status("recognition hints: 3 hotwords, 5 replacements"), "the Tools status shows it")
+    dl = dictionary_lines(run)
+    names = [e["name"] for e in (dl[0]["entries"] if dl else [])]
+    c.check(bool(dl) and dl[0]["state"] == 2 and names == ["church", "youth"],
+            f"GET /v1/dictionaries is fetched and parsed ({dl[:1]})")
+    got = [r for r in run.requests if r["event"] == "http" and r["path"] == "/v1/dictionaries"]
+    c.check(bool(got) and got[0]["has_auth"] and got[0]["status"] == 200, f"with the bearer token ({got[:1]})")
+    c.check(run.log_lines("sending recognition hints: profile=yes domain=13 chars hotwords=3 replacements=5") != [],
+            "the OBS log has the counts")
+    c.check(no_hint_text_logged(run), "no hint text in the OBS log")
+    return c, run
+
+
+def sc_hints_limits(ctx) -> Checker:
+    """Small advertised limits: the client cuts to them (never sends what the
+    server would refuse), reports it, and logs a WARN with counts."""
+    c = Checker("hints_limits")
+    limits = {"max_domain_chars": 4, "max_hotwords": 2, "max_hotword_chars": 4,
+              "max_replacements": 3, "max_replacement_chars": 2}
+    srv = ctx.server(["--revisable", "--growing-text", "--emulate-context", "--context-limits", json.dumps(limits)])
+    run = ctx.drive(srv, srv.token_file, 6000, extra_args=hint_args(ctx, fetch_at_ms=None))
+    starts = session_starts(run)
+    context = starts[0].get("context") if starts else None
+    c.check(not any(r["event"] == "ws_context_refused" for r in run.requests),
+            "what is sent fits the limits (the server accepts it)")
+    c.check(bool(context) and context.get("domain") == "主日講道", f"the domain is cut to 4 characters ({context})")
+    c.check(bool(context) and context.get("hotwords") == ["以弗所書", "聖靈"],
+            f"hotwords longer than 4 chars dropped, then cut to 2 ({(context or {}).get('hotwords')})")
+    c.check(bool(context) and [p["from"] for p in context.get("replacements", [])] == ["盛家", "星際", "聖家"],
+            f"replacements cut to the first 3 ({(context or {}).get('replacements')})")
+    h = hints_done(run)
+    c.check(h.get("domain_cut") == 9 and h.get("too_long") == 1 and h.get("replacements_over") == 2,
+            f"the client reports what it cut ({h})")
+    warn = run.log_lines("WARN recognition hints cut to the server's limits")
+    c.check(len(warn) == 1 and "domain 4 of 13 chars" in warn[0], f"one WARN with counts ({warn})")
+    c.check(no_hint_text_logged(run), "no hint text in the OBS log")
+    return c, run
+
+
+def sc_hints_rejected(ctx) -> Checker:
+    """The server refuses the context (an unknown profile): reconnect without
+    it, keep every other setting, and say why."""
+    c = Checker("hints_rejected")
+    srv = ctx.server(["--revisable", "--growing-text", "--emulate-context"])
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=hint_args(ctx, profile="nosuch", fetch_at_ms=None))
+    starts = session_starts(run)
+    refused = [r for r in run.requests if r["event"] == "ws_context_refused"]
+    errs = [r for r in run.requests if r["event"] == "ws_error_event"]
+    c.check(bool(starts) and starts[0].get("has_context") is True, "the first session.start carries the context")
+    c.check(bool(refused) and refused[0]["why"] == "unknown profile" and bool(errs),
+            f"the server refuses it ({refused[:1]}, {[(e['code']) for e in errs[:1]]})")
+    c.check(len(starts) >= 2 and starts[1].get("has_context") is False, "the next attempt goes without it")
+    c.check(len(starts) >= 2 and starts[1].get("stable") == {"agreement": 2}, "stable captions are kept")
+    c.check(run.any_status("rejected the recognition hints"), "the status says why")
+    c.check(run.any_status("session active"), "and the session runs")
+    h = hints_done(run)
+    c.check(h.get("rejected") is True and h.get("reject_reason", "") != "", f"the hints status has the reason ({h})")
+    c.check(len(run.log_lines("WARN server rejected the recognition hints")) == 1, "one WARN in the OBS log")
+    return c, run
+
+
+def sc_hints_off(ctx) -> Checker:
+    """Against the server in --service-dir as-is (context_biasing off or not
+    known): hints configured, but no context is ever sent and nothing breaks."""
+    c = Checker("hints_off")
+    srv = ctx.server(["--revisable", "--growing-text"])
+    run = ctx.drive(srv, srv.token_file, 6000, extra_args=hint_args(ctx))
+    starts = session_starts(run)
+    cap = hints_done(run).get("capability")
+    if cap == 3:
+        c.check(True, "SKIPPED: this server has context_biasing on (hints_on covers it)")
+        run.notes.append("the server in --service-dir enables context_biasing")
+        return c, run
+    c.check(cap in (1, 2), f"the client saw the feature off or absent ({cap})")
+    c.check(bool(starts) and all(r.get("has_context") is False for r in starts),
+            f"no context field is sent ({[r.get('has_context') for r in starts]})")
+    c.check(run.any_status("session active"), "the session runs")
+    dl = dictionary_lines(run)
+    c.check(bool(dl) and dl[0]["state"] in (2, 3), f"a dictionary request still ends, never hangs ({dl[:1]})")
+    return c, run
+
+
+def sc_hints_absent(ctx) -> Checker:
+    """A server that predates the feature (no context_biasing field)."""
+    c = Checker("hints_absent")
+    srv = ctx.server(["--revisable", "--growing-text", "--hide-context-capability"])
+    run = ctx.drive(srv, srv.token_file, 5000, extra_args=hint_args(ctx, fetch_at_ms=None))
+    starts = session_starts(run)
+    c.check(hints_done(run).get("capability") == 1, f"the client saw the feature absent ({hints_done(run)})")
+    c.check(bool(starts) and all(r.get("has_context") is False for r in starts), "no context field is sent")
+    c.check(run.any_status("session active"), "the session runs")
+    return c, run
+
+
+# The real server implementation (TEA_ASR_CONTEXT_HINTS=1, no emulation). A
+# server dictionary in the harness's support dir; the fake backend's
+# --growing-text sentence contains 公園 and 散步, so the replacements show up
+# in real finals.
+REAL_DICTIONARY = """domain = "主日講道"
+hotwords = ["聖經", "以弗所書"]
+
+[[replacements]]
+from = "公園"
+to = "花園"
+"""
+REAL_FIELD_REPLACEMENTS = "散步 => 散心\n"
+
+
+def real_hints_server(ctx, prompt: bool = False) -> FakeServer:
+    dictionaries = ctx.work / "state" / "dictionaries"
+    dictionaries.mkdir(parents=True, exist_ok=True)
+    (dictionaries / "church.toml").write_text(REAL_DICTIONARY, encoding="utf-8")
+    env = {"TEA_ASR_CONTEXT_HINTS": "1", "TEA_ASR_CONTEXT_PROMPT": "1" if prompt else "0"}
+    return ctx.server(["--revisable", "--growing-text"], env=env)
+
+
+def real_hint_args(ctx, profile: str) -> tuple[str, ...]:
+    (ctx.work / "real-hotwords.txt").write_text("聖靈\n", encoding="utf-8")
+    (ctx.work / "real-replacements.txt").write_text(REAL_FIELD_REPLACEMENTS, encoding="utf-8")
+    return ("--hints-profile", profile, "--hints-domain", "主日講道：以弗所書",
+            "--hints-hotwords-file", str(ctx.work / "real-hotwords.txt"),
+            "--hints-replacements-file", str(ctx.work / "real-replacements.txt"),
+            "--fetch-dictionaries-at-ms", "1500")
+
+
+def skip_without_real_hints(c: Checker, run: Run) -> bool:
+    if hints_done(run).get("capability") == 3:
+        return False
+    c.check(True, f"SKIPPED: the server in --service-dir has no recognition hints ({hints_done(run)})")
+    run.notes.append("needs the server with TEA_ASR_CONTEXT_HINTS (agent/context-hints) to run for real")
+    return True
+
+
+def sc_hints_real(ctx) -> Checker:
+    """Against the real implementation: capability and limits, the real
+    /v1/dictionaries shape, the context accepted, the echo (prompt_applied),
+    and replacements applied in the finals."""
+    c = Checker("hints_real")
+    srv = real_hints_server(ctx)
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=real_hint_args(ctx, "church"))
+    if skip_without_real_hints(c, run):
+        return c, run
+    h = hints_done(run)
+    c.check(h.get("max_hotwords") == 200, f"the advertised limits are read ({h})")
+    dl = dictionary_lines(run)
+    c.check(bool(dl) and dl[0]["state"] == 2 and
+            dl[0]["entries"] == [{"name": "church", "hotwords_count": 2, "replacements_count": 1}],
+            f"the real /v1/dictionaries answer is parsed ({dl[:1]})")
+    starts = session_starts(run)
+    c.check(len(starts) == 1 and starts[0].get("context") == {
+        "profile": "church", "domain": "主日講道：以弗所書", "hotwords": ["聖靈"],
+        "replacements": [{"from": "散步", "to": "散心"}]}, f"the context sent ({starts[:1]})")
+    errs = [r for r in run.requests if r["event"] == "ws_error_event"]
+    c.check(not errs and run.any_status("session active"), f"the real server accepts it ({errs[:1]})")
+    echo = next((r.get("context") for r in run.requests if r["event"] == "ws_session_started"), None)
+    c.check(echo == {"profile": "church", "domain_chars": 9, "hotwords_count": 3, "replacements_count": 2,
+                     "prompt_applied": False}, f"session.started.context: profile merged first ({echo})")
+    c.check(h.get("applied") is True and h.get("applied_hotwords") == 3 and h.get("applied_replacements") == 2
+            and h.get("prompt_applied") is False, f"the client reads the echo back ({h})")
+    finals = [r for r in run.requests if r["event"] == "ws_final"]
+    replaced = [r for r in finals if "花園" in (r.get("text") or "")]
+    c.check(bool(replaced) and all("公園" not in (r.get("text") or "") for r in finals),
+            f"the profile's replacement is applied to finals ({[r.get('text') for r in finals][:3]})")
+    c.check(any("公園" in (r.get("raw_text") or "") for r in replaced), "raw_text keeps what was heard")
+    c.check(any("replacements_applied" in (r.get("warnings") or []) for r in replaced),
+            "finals carry the replacements_applied warning")
+    c.check(bool(replaced) and all("花園散心" in (r.get("text") or "") for r in replaced),
+            "the field's replacement is applied too, merged with the profile's")
+    shown = [l.get("caption", "") for l in run.captions()]
+    c.check(any("花園" in t for t in shown) and not any("公園" in t for t in shown),
+            "the plugin shows the replaced text, never the heard one")
+    c.check(done_field(run, "stable_mismatches") == [0], "replaced previews keep the stable contract")
+    c.check(no_hint_text_logged(run), "no hint text in the OBS log")
+    return c, run
+
+
+def sc_hints_real_prompt(ctx) -> Checker:
+    """Real server with TEA_ASR_CONTEXT_PROMPT=1: the echo says the prompt is applied."""
+    c = Checker("hints_real_prompt")
+    srv = real_hints_server(ctx, prompt=True)
+    run = ctx.drive(srv, srv.token_file, 6000, extra_args=real_hint_args(ctx, "church"))
+    if skip_without_real_hints(c, run):
+        return c, run
+    echo = next((r.get("context") for r in run.requests if r["event"] == "ws_session_started"), None)
+    c.check(bool(echo) and echo.get("prompt_applied") is True, f"prompt_applied=true ({echo})")
+    c.check(hints_done(run).get("prompt_applied") is True, f"the client reads it ({hints_done(run)})")
+    c.check(run.any_status("session active") and bool([r for r in run.requests if r["event"] == "ws_final"]),
+            "the session runs and finals arrive with the prompt")
+    return c, run
+
+
+def sc_hints_real_unknown_profile(ctx) -> Checker:
+    """Real server, a profile it does not have: its real rejection is
+    attributed to the context and the client reconnects without it."""
+    c = Checker("hints_real_unknown_profile")
+    srv = real_hints_server(ctx)
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=real_hint_args(ctx, "nosuch"))
+    if skip_without_real_hints(c, run):
+        return c, run
+    starts = session_starts(run)
+    errs = [r for r in run.requests if r["event"] == "ws_error_event"]
+    closes = [r.get("close_code") for r in run.requests if r["event"] == "ws_close"]
+    c.check(bool(starts) and starts[0].get("has_context") is True, "the first session.start carries the context")
+    c.check(bool(errs) and errs[0]["code"] == "unsupported_option", f"the real rejection ({errs[:1]}, close {closes[:1]})")
+    c.check(len(starts) >= 2 and starts[1].get("has_context") is False and starts[1].get("stable") == {"agreement": 2},
+            "the next attempt goes without the context, other settings kept")
+    h = hints_done(run)
+    c.check(h.get("rejected") is True and "unsupported_option" in h.get("reject_reason", ""),
+            f"attributed to the context, with the server's reason ({h.get('reject_reason')})")
+    c.check(run.any_status("session active"), "and the session runs")
+    return c, run
+
+
 # --------------------------------------------------------------------------- diagnostics
 
 HEARTBEAT = "asr-client: heartbeat"
@@ -885,6 +1166,14 @@ SCENARIOS = {
     "segmentation_emulated": sc_segmentation_emulated,
     "segmentation_rejected": sc_segmentation_rejected,
     "segmentation_real": sc_segmentation_real,
+    "hints_on": sc_hints_on,
+    "hints_limits": sc_hints_limits,
+    "hints_rejected": sc_hints_rejected,
+    "hints_off": sc_hints_off,
+    "hints_absent": sc_hints_absent,
+    "hints_real": sc_hints_real,
+    "hints_real_prompt": sc_hints_real_prompt,
+    "hints_real_unknown_profile": sc_hints_real_unknown_profile,
     "diag_heartbeat": sc_diag_heartbeat,
     "diag_silence": sc_diag_silence,
     "diag_no_audio": sc_diag_no_audio,
@@ -900,8 +1189,8 @@ class Ctx:
         self.work = work
         self._servers: list[FakeServer] = []
 
-    def server(self, extra: list[str]) -> FakeServer:
-        srv = FakeServer(self.work, free_port(), self.service_dir, extra)
+    def server(self, extra: list[str], env: dict | None = None) -> FakeServer:
+        srv = FakeServer(self.work, free_port(), self.service_dir, extra, env)
         srv.start()
         self._servers.append(srv)
         return srv

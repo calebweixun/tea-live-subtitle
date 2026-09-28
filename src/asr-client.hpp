@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <vector>
 
 #include "audio-tap.h"
 #include "caption-state.h"
@@ -85,6 +86,15 @@ public:
 	void setEndSilenceMs(int ms);
 	void setTraceDir(const QString &dir);
 
+	/* Recognition hints (session.start.context); take effect on the next
+	 * start(). Safe from any thread. */
+	void setHints(const QString &profile, const QString &domain, const QString &hotwords,
+		      const QString &replacements, const QString &filePath);
+	void hintsStatus(tea_asr_client_hints_status_t *out) const;
+	/* GET /v1/dictionaries; see tea_asr_client_fetch_dictionaries(). */
+	void fetchDictionaries(tea_asr_dictionaries_done_t done, void *param);
+	int dictionaries(tea_dictionary_entry_t *out, int max, int *count, QString *error, qint64 *ageMs) const;
+
 	/* Diagnostics snapshot, safe from any thread. */
 	void diagnostics(int *connection, int *speech, double *input_dbfs, bool *input_recent,
 			 int64_t *ms_since_text) const;
@@ -102,6 +112,7 @@ private slots:
 	void onReconnectTimer();
 	void onWatchTimer();
 	void onCapabilitiesReply();
+	void onDictionariesReply();
 	void onStaleCaptionTimer();
 
 private:
@@ -230,6 +241,38 @@ private:
 	bool segmentationRejected_ = false;
 	int segmentationRequested_ = 0; /* value sent in the last session.start, 0 = none */
 	std::atomic<int> effectiveEndSilence_{-1};
+	/* Recognition hints (docs/recognition-hints.md). The settings are
+	 * written from the source's thread, everything else on this thread;
+	 * hintsStatus_ is what hintsStatus() hands out. contextRejected_ works
+	 * like stableRejected_: the next attempts go without a context until an
+	 * explicit restart. */
+	struct HintSettings {
+		QString profile, domain, hotwords, replacements, filePath;
+	};
+	mutable QMutex hintsMutex_;
+	HintSettings hints_;
+	tea_hints_limits_t hintsLimits_{};
+	tea_asr_client_hints_status_t hintsStatus_{};
+	std::atomic<int> hintsCapability_{TEA_HINTS_CAP_UNKNOWN};
+	static const qint64 kMaxHintsFileBytes = 1024 * 1024;
+	bool contextRejected_ = false;
+	bool contextRequested_ = false;
+	/* The context for session.start (empty = send none); fills hintsStatus_. */
+	QJsonObject buildContext();
+	void readHintsCapability(const QJsonObject &features);
+
+	/* GET /v1/dictionaries */
+	mutable QMutex dictMutex_;
+	int dictState_ = TEA_DICT_UNKNOWN;
+	std::vector<tea_dictionary_entry_t> dictEntries_;
+	QString dictError_;
+	qint64 dictDoneMs_ = -1;
+	tea_asr_dictionaries_done_t dictDone_ = nullptr; /* this thread only */
+	void *dictParam_ = nullptr;
+	quint64 dictGen_ = 0;
+	void doFetchDictionaries(tea_asr_dictionaries_done_t done, void *param);
+	void finishDictionaries(int state, const std::vector<tea_dictionary_entry_t> &entries, const QString &error);
+
 	/* A held (frozen) caption is cleared if no new session starts within
 	 * this long: past that it no longer describes anything live. */
 	static const int kStaleCaptionMs = 10000;
@@ -296,7 +339,8 @@ private:
 	tea_pcm_level_t inputLevel_{};
 	qint64 inputLevelStartMs_ = 0;
 	qint64 lastTextMs_ = -1;
-	QByteArray lastSessionStart_; /* the session.start actually sent */
+	QByteArray lastSessionStart_;    /* the session.start actually sent */
+	QByteArray lastSessionStartLog_; /* the same, hint text replaced by counts (for the OBS log) */
 	QJsonObject lastHello_;
 	qint64 lastHelloMs_ = -1;
 	uint16_t lastCloseCode_ = 0;

@@ -1079,9 +1079,9 @@ static inline uint32_t tea_caption_frame_row_y(const tea_caption_frame_t *f, int
 /*
  * Only these settings reach the server (session.start / the WebSocket URL /
  * the bearer token). Everything else is appearance and is applied by
- * redrawing only. `stable` and `end_silence_ms` are here because they are
- * session.start fields: the server cannot switch them inside a running
- * session.
+ * redrawing only. `stable`, `end_silence_ms` and the recognition hints are
+ * here because they are session.start fields: the server cannot switch them
+ * inside a running session.
  */
 typedef struct {
 	const char *host;
@@ -1090,6 +1090,9 @@ typedef struct {
 	bool stable;
 	int end_silence_ms; /* sentence break silence; 0 = server default */
 	bool trace;         /* record the session's events to a file (per session) */
+	/* recognition hints (session.start.context): every hint setting joined
+	 * into one string (tea_hints_signature() in captions-source.c) */
+	const char *hints;
 } tea_connection_settings_t;
 
 static inline bool tea_str_equal_or_both_empty(const char *a, const char *b)
@@ -1105,7 +1108,8 @@ static inline bool tea_connection_settings_equal(const tea_connection_settings_t
 {
 	return tea_str_equal_or_both_empty(a->host, b->host) && a->port == b->port &&
 	       tea_str_equal_or_both_empty(a->token_path, b->token_path) && a->stable == b->stable &&
-	       a->end_silence_ms == b->end_silence_ms && a->trace == b->trace;
+	       a->end_silence_ms == b->end_silence_ms && a->trace == b->trace &&
+	       tea_str_equal_or_both_empty(a->hints, b->hints);
 }
 
 #define TEA_CONNECTION_KEEP 0      /* nothing to do */

@@ -62,6 +62,10 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 | `WARN the server could not transcribe a segment: code=C retryable=R (message); N segment error(s) this session` | server 對某一句回 `segment.error`（這一句沒有字幕） | server 端辨識失敗；每一句都失敗（例如 `code=invalid_ipc`）時字幕會完全停住，要看 server 的 worker |
 | `WARN server preview paused: backend_error`；`server preview paused: load`／`active: normal`（INFO） | server 的 `preview.status` 改變時一行（`backend_error` 每次都記，其他改變最多每 30 秒一行，括號內是沒記到的改變次數） | `backend_error`：server 的辨識後端出錯，通常與上面的 `segment.error` 同時出現；`load`、`long_utterance`：server 為了負載暫停預覽，屬正常 |
 
+辨識提示（`session.start.context`）的記錄行（送出的量、server 回報的套用結果、截斷、被拒絕、提示檔讀不到、字典清單）見
+[`recognition-hints.md`](recognition-hints.md#記錄檔)。提示內容本身從不寫進記錄檔：記錄檔裡的 `session.start` 把
+`context` 換成數量。
+
 `speech.started` 與 `segment.queued` 用來追蹤上面的語音狀態，`preview.status` 只在狀態改變時記一行，都不再寫成 `unhandled event type`。
 
 ## 畫面上的診斷列

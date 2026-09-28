@@ -38,7 +38,7 @@ OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目�
 
 **CI（不需要 OBS）**：`.github/workflows/protocol-tests.yaml` 編譯並執行
 `tests/asr-client-policy-test.cpp`（錯誤分類與重連退避）、`caption-layout-test.cpp`、
-`caption-state-test.c` 與 `tests/*.py` 靜態契約檢查。
+`caption-state-test.c`、`recognition-hints-test.c`（辨識提示的格式、合併與上限）與 `tests/*.py` 靜態契約檢查。
 
 **端到端（本機，需要 tea-asr-service checkout 與桌面版 Qt6）**：用外掛真正的
 `asr-client.cpp`＋`caption-state.c`，連到**目前版本**的 server app（server repo 的測試用
@@ -46,7 +46,8 @@ OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目�
 驗證握手、授權、partial／final，以及 Host 被拒、token revoke／rotate、`rate_limited`、
 連線上限（pre-accept 403）、`concurrent_session_limit`（4029）、`idle_timeout`（4408）、
 server 重啟與 70 秒心跳，以及穩定字幕（`stable*` 情境：要求與收到 `transcript.stable`、畫面只增不改、
-server 不宣告或拒絕 `stable` 時退回 partial、斷線重連不清空畫面）。這個建置只用 Qt，不需要 OBS SDK：
+server 不宣告或拒絕 `stable` 時退回 partial、斷線重連不清空畫面），以及辨識提示（`hints*` 情境：送出的
+`context` 符合設定與上限、server 拒絕時不帶提示重連、功能關閉時不送、字典清單）。這個建置只用 Qt，不需要 OBS SDK：
 
 ```sh
 cmake -S tests/e2e -B /tmp/tea-e2e-build -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
@@ -91,6 +92,14 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   若 10 秒內沒有重新開始 session，就清空畫面，避免過期字幕假裝仍在直播。按「全部重新連線」或改設定仍會立即清空。
 * 關閉此選項時行為與先前相同：單一 preview 行由 `transcript.partial` 整段替換、final 推入上方、斷線即清空。
 
+### 辨識提示（實驗，`session.start.context`）
+
+屬性視窗的「辨識提示（實驗）」群組：字典設定檔（server 上的字典，清單來自 `GET /v1/dictionaries`）、講道情境說明、
+專有詞（一行一個）、對照表（一行一組 `錯字 => 正字`）與選用的提示檔（`[專有詞]`／`[對照表]` 兩段，每次連線重新讀取，
+可以在 OBS 之外持續增補）。只在 server 的 capabilities 宣告 `context_biasing`（server 設定 `TEA_ASR_CONTEXT_HINTS=1`）
+時送出，並先依 `context_limits` 截斷；server 拒絕時自動改為不帶提示重連，其他設定保留。全部是連線類設定，預設為空。
+細節見 [`docs/recognition-hints.md`](docs/recognition-hints.md)。
+
 ## 畫面呈現（逐行渲染）
 
 設計與取捨見 [`docs/phase-b-rendering.md`](docs/phase-b-rendering.md)。重點：
@@ -104,7 +113,7 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   預設）：只在 server 的 `capabilities` 宣告 `segmentation_control` 時送出並夾在其範圍內，否則不送並在屬性視窗
   提示不支援。client 不做 VAD，也不再用文字到達間隔判斷換句。
 * 外觀設定在「屬性」視窗改了就套用（OBS 約 0.5 秒後呼叫 update），只重畫、不重連；伺服器位址／連接埠／
-  Token／穩定字幕／換句偵測時間這類會送到 server 的設定，要按「套用連線設定」或關閉視窗才生效。
+  Token／穩定字幕／換句偵測時間／辨識提示這類會送到 server 的設定，要按「套用連線設定」或關閉視窗才生效。
 * 「標點換行」（關閉／句末／句末＋逗號，外觀類設定）：在 server 同一句裡遇到標點就換到新的一行，給停頓很短、
   觸發不了換句偵測時間的快語速；標點留在行尾，畫面上已出現的字不會移動。新來源預設句末＋逗號（最短 8 字）。
 * 離線重播工具 `tests/replay/`：把真實 server 事件 trace 餵進字幕狀態機與排版政策，檢查畫面上的字是否倒退或消失。
