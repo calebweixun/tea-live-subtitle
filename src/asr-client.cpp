@@ -405,7 +405,7 @@ void TeaAsrClient::onDictionariesReply()
 		return;
 	}
 	std::vector<tea_dictionary_entry_t> entries;
-	for (const QJsonValue &v : list) {
+	for (const QJsonValue v : list) {
 		const QJsonObject o = v.toObject();
 		const QByteArray name = o.value(QStringLiteral("name")).toString().toUtf8();
 		if (name.isEmpty() || entries.size() >= TEA_DICT_MAX)
