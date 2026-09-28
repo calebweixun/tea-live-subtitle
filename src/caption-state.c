@@ -112,7 +112,12 @@ struct tea_caption_state {
 	uint64_t next_key;
 	uint64_t revision;
 	uint64_t activity; /* bumped by every transcript event of the session */
-	int last_close;    /* TEA_CLOSE_* of the newest final (diagnostics / replay) */
+	/* audio.ack progress: bumped whenever the acknowledged position moves.
+	 * Not part of `revision`: nothing to re-render, it only keeps open lines
+	 * up (tea_caption_state_server_progress()). */
+	uint64_t server_progress;
+	uint64_t last_ack_sample;
+	int last_close; /* TEA_CLOSE_* of the newest final (diagnostics / replay) */
 	bool stable_tail_lines;
 };
 
@@ -1020,6 +1025,24 @@ bool tea_caption_state_last_line_is_partial(tea_caption_state_t *state)
 }
 
 /* ---------------- snapshot ---------------- */
+
+void tea_caption_state_on_audio_ack(tea_caption_state_t *state, uint64_t received_sample)
+{
+	pthread_mutex_lock(&state->lock);
+	if (received_sample != state->last_ack_sample) {
+		state->last_ack_sample = received_sample;
+		state->server_progress++;
+	}
+	pthread_mutex_unlock(&state->lock);
+}
+
+uint64_t tea_caption_state_server_progress(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	uint64_t result = state->server_progress;
+	pthread_mutex_unlock(&state->lock);
+	return result;
+}
 
 uint64_t tea_caption_state_revision(tea_caption_state_t *state)
 {

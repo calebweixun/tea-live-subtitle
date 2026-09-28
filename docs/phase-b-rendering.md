@@ -102,10 +102,19 @@ caption-state（執行緒安全）──snapshot──▶ captions-source.c（�
 
 * 真實模型的穩定提交間隔（同一段內，900 ms 設定）：中位數 881 ms、p95 3.8 s、最長 7.1 s（1200 ms 設定最長 9.5 s）。
   若淡出計時只在已確定文字變動時重設，1500 ms 的淡出一定會在說話途中觸發，整行消失、之後才一次冒出來。
+* 29 分鐘的真實直播 soak（講道、三位講者，end_silence 300／600）另外顯示：segment 還開著時，文字可以停住超過
+  1.5 秒——server 不重送相同的預覽、講者停頓或唱詩、VAD 在背景音樂下一直判定為語音。舊規則（「整個 session
+  1.5 秒沒有 transcript 活動就淡出開著的行」）在兩條 trace 裡讓開著的行在說話途中淡出 1／5 次，之後文字繼續或 final
+  才到。
 * 規則（`tea_display_line_fade_ref()`）：
-  - 該段的任何 transcript 事件（partial／stable／final，就算畫面沒變）都算活動，重設該行的計時；
-  - **server segment 還開著的行，只要整個 session 還有 transcript 活動就不淡出**；
-  - 已結束的行從結束那一刻起算延遲；開著但整個 session 都沒有活動超過延遲的行才會淡出。
+  - **server 還沒結束這個 segment（沒有 transcript.final、收尾的 stable、skipped／error／cancelled）而且連線還在時，
+    這一行不淡出。**
+  - 安全網：開著的行只有在 `TEA_OPEN_LINE_TIMEOUT_MS`（10 秒，不是使用者設定）內**什麼都沒收到**——該段沒有事件、
+    整個 session 沒有 transcript 事件、`audio.ack` 的 `received_sample` 也沒有前進——才開始淡出。server 一直收音訊
+    （每 100 ms 左右一則 ack）時，開著的行就一直留著；server 卡住或忘了結束 segment 時，10 秒後照常淡出。
+  - 已結束的行從結束那一刻起算使用者的淡出延遲（預設 1500 ms）；之後的 session 活動或 ack 不再延長它。
+  - 斷線照舊：`hold_for_reconnect()` 把所有行凍結成已結束，之後依淡出設定淡出，長時間斷線仍會清掉。
+  - ack 進度不算字幕修訂（不觸發重新排版），來源每個 tick 讀一次 `tea_caption_state_server_progress()`。
 * 畫面上的版面可能比字幕狀態晚幾個 frame（等量字、畫貼圖），淡出的 alpha 在繪製時用該行最新的活動時間計算。
 
 ## 未確定尾巴：畫面上的字不倒退
@@ -126,6 +135,15 @@ caption-state（執行緒安全）──snapshot──▶ captions-source.c（�
 4. 兩邊共同的連續字不超過 4 個、partial 的開頭也不像已確定文字的任何一段：partial 是新的一句（真實模型常只
    預覽長段落的最後一個片語），整句接在後面；
 5. 其他情況（有一大段相同、但對不上位置）：這個 partial 不用，畫面維持。
+
+4 之前還有三條「重說」規則，都是從 soak trace 找到的外掛端重複（partial 被當成新的一句接在後面）：
+
+* partial 的開頭正好是已確定文字的結尾（至少 2 字，例如已確定「…我們」、partial「我們一起…」）：預覽視窗往前移了，
+  取重疊之後；
+* partial 裡有一段（至少 3 字）與已確定文字的最後幾個字相同，只是最後至多 3 個字聽成別的，而且它在 partial 裡的位置
+  不比在已確定文字裡晚超過 2 字：這是把已確定文字的結尾重說一遍，從那段之後（再跳過已確定文字剩下的字數）接；
+* partial 的開頭像已確定文字的**開頭**，或兩邊共同的一段（至少 3 字）在兩邊的位置差不到 2 字：整句重說但聽得
+  不一樣，不算新的一句（無法對齊就不用這個 partial）。
 
 **去重防護**：任何會讓同一行出現「同一段正規化後 4 字以上的字重複兩次」的尾巴都不採用，除非 server 自己的
 partial 就重複了它（`tea_norm_has_new_repeat()`）。

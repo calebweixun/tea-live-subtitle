@@ -157,6 +157,46 @@ static inline int tea_norm_longest_common(const tea_norm_t *a, const tea_norm_t 
 	return best;
 }
 
+/* Longest m >= min_len with a ending in b's first m characters (0 if none). */
+static inline int tea_norm_suffix_prefix(const tea_norm_t *a, const tea_norm_t *b, int min_len)
+{
+	int most = a->n < b->n ? a->n : b->n;
+	for (int m = most; m >= min_len && m > 0; m--) {
+		if (memcmp(&a->cp[a->n - m], b->cp, sizeof(uint32_t) * (size_t)m) == 0)
+			return m;
+	}
+	return 0;
+}
+
+/*
+ * Longest common run of a and b that ends within the last `max_left`
+ * characters of a (ties: the earliest in b). *a_end / *b_end: index just
+ * after it.
+ */
+static inline int tea_norm_tail_run(const tea_norm_t *a, const tea_norm_t *b, int max_left, int *a_end, int *b_end)
+{
+	int prev[TEA_NORM_MAX + 1];
+	int cur[TEA_NORM_MAX + 1];
+	int best = 0;
+	*a_end = 0;
+	*b_end = 0;
+	for (int j = 0; j <= b->n; j++)
+		prev[j] = 0;
+	for (int i = 1; i <= a->n; i++) {
+		cur[0] = 0;
+		for (int j = 1; j <= b->n; j++) {
+			cur[j] = a->cp[i - 1] == b->cp[j - 1] ? prev[j - 1] + 1 : 0;
+			if (i >= a->n - max_left && cur[j] > best) {
+				best = cur[j];
+				*a_end = i;
+				*b_end = j;
+			}
+		}
+		memcpy(prev, cur, sizeof(int) * (size_t)(b->n + 1));
+	}
+	return best;
+}
+
 /*
  * Semi-global edit distance: the cheapest way to align all of `a` with some
  * prefix b[0, j) of `b`. Returns the cost; *b_len gets that j (the longest j
@@ -249,6 +289,10 @@ static inline size_t tea_norm_byte_after(const tea_norm_t *t, int k)
 /* Fuzzy restatement: at most one edit per this many committed characters. */
 #define TEA_ALIGN_FUZZY_CHARS_PER_EDIT 4
 #define TEA_ALIGN_OVERLAP_MIN 3
+/* Exact committed-end / text-start overlap that counts (e.g. "…我們" / "我們…"). */
+#define TEA_ALIGN_SUFFIX_MIN 2
+/* A restated committed end may miss this many of its last characters. */
+#define TEA_ALIGN_TAIL_RUN_LEFT 3
 /* Same first characters: a restatement may differ in up to half the rest. */
 #define TEA_ALIGN_RESTATE_HEAD 3
 
@@ -304,6 +348,16 @@ static inline int tea_align_after_committed(const char *committed, size_t commit
 	return kind;
 }
 
+/* The first k characters of t match c[s, s + k): exactly, or but for one
+ * from three characters on. */
+static inline bool tea_align_head_at(const tea_norm_t *c, const tea_norm_t *t, int s, int k)
+{
+	int diff = 0;
+	for (int i = 0; i < k; i++)
+		diff += c->cp[s + i] != t->cp[i];
+	return diff == 0 || (k >= 3 && diff <= 1);
+}
+
 static inline int tea_align_after_committed_raw(const char *committed, size_t committed_len, const char *text,
 						size_t text_len, bool final_mode, size_t *start)
 {
@@ -336,24 +390,51 @@ static inline int tea_align_after_committed_raw(const char *committed, size_t co
 		*start = tea_norm_byte_after(&t, j);
 		return TEA_ALIGN_FUZZY;
 	}
+	/* The preview window moved on: the text starts with the committed end. */
+	const int overlap = tea_norm_suffix_prefix(&c, &t, TEA_ALIGN_SUFFIX_MIN);
+	if (overlap > 0) {
+		*start = tea_norm_byte_after(&t, overlap);
+		return TEA_ALIGN_OVERLAP;
+	}
 	int c_end = 0, t_end = 0;
 	int common = tea_norm_longest_common(&c, &t, &c_end, &t_end);
 	if (common >= TEA_ALIGN_OVERLAP_MIN && c_end >= c.n - 1 && t_end - common <= 1) {
 		*start = tea_norm_byte_after(&t, t_end);
 		return TEA_ALIGN_OVERLAP;
 	}
+	/*
+	 * The text restates the end of the committed text, heard slightly
+	 * differently: a run of it that ends at most three characters before the
+	 * committed end, found no later in the text than it could be if what
+	 * precedes it re-hears the committed words before that run. What follows
+	 * starts after the run plus the committed characters left after it.
+	 */
+	{
+		int rc_end = 0, rt_end = 0;
+		const int run = tea_norm_tail_run(&c, &t, TEA_ALIGN_TAIL_RUN_LEFT, &rc_end, &rt_end);
+		const int left = c.n - rc_end;
+		if (run >= TEA_ALIGN_OVERLAP_MIN && left < run && rt_end - run <= rc_end - run + 2) {
+			const int after = rt_end + left < t.n ? rt_end + left : t.n;
+			*start = tea_norm_byte_after(&t, after);
+			return TEA_ALIGN_OVERLAP;
+		}
+	}
 	/* head of the text vs. the committed tail, one edit allowed from 3 characters */
 	bool head_matches = false;
 	int k = c.n < 4 ? c.n : 4;
 	if (k >= 2 && t.n >= k) {
-		for (int s = c.n - k - 4 < 0 ? 0 : c.n - k - 4; s + k <= c.n && !head_matches; s++) {
-			int diff = 0;
-			for (int i = 0; i < k; i++)
-				diff += c.cp[s + i] != t.cp[i];
-			head_matches = diff == 0 || (k >= 3 && diff <= 1);
-		}
+		/* the committed start (a restatement of the whole committed text
+		 * that begins like it, then differs too much to be placed, is not
+		 * new speech), then windows near the committed end */
+		head_matches = tea_align_head_at(&c, &t, 0, k);
+		for (int s = c.n - k - 4 < 1 ? 1 : c.n - k - 4; s + k <= c.n && !head_matches; s++)
+			head_matches = tea_align_head_at(&c, &t, s, k);
 	}
-	if (common <= TEA_ALIGN_NEW_MAX_COMMON && !head_matches)
+	/* A shared run at about the same place in both is a restatement heard
+	 * differently around it, not new speech that happens to share words. */
+	const int shift = (t_end - common) - (c_end - common);
+	const bool same_place = common >= TEA_ALIGN_OVERLAP_MIN && shift >= -2 && shift <= 2;
+	if (common <= TEA_ALIGN_NEW_MAX_COMMON && !head_matches && !same_place)
 		return TEA_ALIGN_NEW;
 	if (final_mode) {
 		*start = tea_norm_byte_after(&t, t_end);

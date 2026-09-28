@@ -156,6 +156,14 @@ typedef struct {
 	uint64_t activity; /* changes on every transcript event of the session */
 } tea_caption_snapshot_t;
 
+/* audio.ack from the server (`received_sample`): the server is still taking
+ * audio. tea_caption_state_server_progress() changes whenever the
+ * acknowledged position moves; the display keeps a still-open line up while
+ * it does (tea_display_line_fade_ref()). Does not change the revision. */
+void tea_caption_state_on_audio_ack(tea_caption_state_t *state, uint64_t received_sample);
+uint64_t tea_caption_state_server_progress(tea_caption_state_t *state);
+#define TEA_CAPTION_STATE_HAS_SERVER_PROGRESS 1
+
 /* Increases on every change that may alter a snapshot or render; lets the
  * render thread skip snapshots when nothing happened. */
 uint64_t tea_caption_state_revision(tea_caption_state_t *state);

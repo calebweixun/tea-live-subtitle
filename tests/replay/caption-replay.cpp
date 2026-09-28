@@ -234,6 +234,7 @@ struct Settings {
 	int width2 = 0;
 	uint64_t width_change_ns = 0;
 	bool quiet = false;
+	bool ignore_acks = false; /* as if the server sent no audio.ack: only the open-line timeout */
 };
 
 uint32_t fake_advance(uint32_t cp, int font_px)
@@ -271,6 +272,8 @@ struct Sim {
 	uint64_t rev_seen = UINT64_MAX;
 	uint64_t session_activity = 0;
 	uint64_t session_activity_ns = 0;
+	uint64_t server_progress = 0;
+	uint64_t server_progress_ns = 0;
 
 	void learn(const std::string &text)
 	{
@@ -286,8 +289,25 @@ struct Sim {
 	{
 #ifdef TEA_REPLAY_LEGACY
 		return line.meta.changed_ns;
+#elif defined(TEA_CAPTION_STATE_HAS_SERVER_PROGRESS)
+		return tea_display_line_fade_ref(&line.meta, session_activity_ns, server_progress_ns, cfg.fade_delay_ms,
+						 TEA_OPEN_LINE_TIMEOUT_MS);
 #else
 		return tea_display_line_fade_ref(&line.meta, session_activity_ns);
+#endif
+	}
+
+	/* tea_sync_server_progress() */
+	void sync_progress(uint64_t now)
+	{
+#ifdef TEA_CAPTION_STATE_HAS_SERVER_PROGRESS
+		const uint64_t progress = tea_caption_state_server_progress(state);
+		if (progress != server_progress) {
+			server_progress = progress;
+			server_progress_ns = now;
+		}
+#else
+		(void)now;
 #endif
 	}
 
@@ -548,7 +568,9 @@ int main(int argc, char **argv)
 		else if (a == "--selftest-width-change") {
 			cfg.width2 = std::atoi(next());
 			cfg.width_change_ns = (uint64_t)std::atoll(next()) * TEA_NS_PER_MS;
-		} else if (a == "--quiet")
+		} else if (a == "--ignore-acks")
+			cfg.ignore_acks = true;
+		else if (a == "--quiet")
 			cfg.quiet = true;
 		else {
 			std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -685,6 +707,11 @@ int main(int argc, char **argv)
 			} else if (type == "segment.skipped" || type == "segment.error") {
 				tea_caption_state_on_segment_dropped(sim.state, session.c_str(), seg.c_str());
 			}
+#ifdef TEA_CAPTION_STATE_HAS_SERVER_PROGRESS
+			else if (type == "audio.ack" && !cfg.ignore_acks) {
+				tea_caption_state_on_audio_ack(sim.state, (uint64_t)e.num("received_sample", 0));
+			}
+#endif
 			if (is_text) {
 				std::map<uint64_t, Shown> after = shown_lines(sim.state, cfg.tail);
 #ifndef TEA_REPLAY_LEGACY
@@ -756,6 +783,7 @@ int main(int argc, char **argv)
 		if (cfg.width2 > 0 && now >= cfg.width_change_ns)
 			sim.cfg.width = cfg.width2;
 		sim.sync(now);
+		sim.sync_progress(now);
 		sim.expire(now);
 		std::vector<RowView> rows = sim.layout(now);
 		std::map<uint64_t, std::string> visible = visible_by_line(rows);
