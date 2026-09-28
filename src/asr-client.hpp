@@ -300,6 +300,11 @@ private:
 	QJsonObject lastHello_;
 	qint64 lastHelloMs_ = -1;
 	uint16_t lastCloseCode_ = 0;
+	uint64_t segmentErrors_ = 0;
+	qint64 lastSegmentErrorLogMs_ = -1;
+	QString lastPreviewStatus_;
+	qint64 lastPreviewLogMs_ = -1;
+	uint64_t previewChangesUnlogged_ = 0;
 
 	/* optional per-session event trace */
 	mutable QMutex traceMutex_;

@@ -59,8 +59,10 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 | `WARN audio is being sent but has been below -60 dBFS for N ms` | 有送音訊，但超過 10 秒都低於 -60 dBFS | 來源被靜音（靜音時外掛送的是靜音）、音量推桿關小、擷取到空的音軌 |
 | `WARN N ms of audible audio sent without speech.started or any transcript -- the server hears no speech` | 送出累計 15 秒以上有聲音的音訊，server 卻沒有回報任何語音或文字 | server 的 VAD 不認為那是語音：音樂、背景音、語言不符 |
 | `WARN sending audio but no event from the server for N ms` | 在送音訊，但超過 5 秒沒有收到任何 server 事件（連 `audio.ack` 都沒有） | 連線或 server 卡住 |
+| `WARN the server could not transcribe a segment: code=C retryable=R (message); N segment error(s) this session` | server 對某一句回 `segment.error`（這一句沒有字幕） | server 端辨識失敗；每一句都失敗（例如 `code=invalid_ipc`）時字幕會完全停住，要看 server 的 worker |
+| `WARN server preview paused: backend_error`；`server preview paused: load`／`active: normal`（INFO） | server 的 `preview.status` 改變時一行（`backend_error` 每次都記，其他改變最多每 30 秒一行，括號內是沒記到的改變次數） | `backend_error`：server 的辨識後端出錯，通常與上面的 `segment.error` 同時出現；`load`、`long_utterance`：server 為了負載暫停預覽，屬正常 |
 
-`speech.started` 與 `segment.queued` 用來追蹤上面的語音狀態，不再寫成 `unhandled event type`。
+`speech.started` 與 `segment.queued` 用來追蹤上面的語音狀態，`preview.status` 只在狀態改變時記一行，都不再寫成 `unhandled event type`。
 
 ## 畫面上的診斷列
 

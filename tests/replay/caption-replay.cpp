@@ -27,6 +27,7 @@
 
 #include "caption-state.h"
 #include "caption-display.h"
+#include "caption-align.h"
 
 #include <algorithm>
 #include <cmath>
@@ -452,6 +453,26 @@ size_t utf8_chars(const std::string &s)
 	return n;
 }
 
+/* Characters of `after` not matched by the longest common subsequence with
+ * `before` (code points, raw). */
+size_t new_chars(const std::string &before, const std::string &after)
+{
+	std::vector<uint32_t> a, b;
+	size_t pos = 0;
+	while (pos < before.size())
+		a.push_back(tea_utf8_decode(before.data(), before.size(), &pos));
+	pos = 0;
+	while (pos < after.size())
+		b.push_back(tea_utf8_decode(after.data(), after.size(), &pos));
+	std::vector<size_t> prev(b.size() + 1, 0), cur(b.size() + 1, 0);
+	for (size_t i = 1; i <= a.size(); i++) {
+		for (size_t j = 1; j <= b.size(); j++)
+			cur[j] = a[i - 1] == b[j - 1] ? prev[j - 1] + 1 : std::max(prev[j], cur[j - 1]);
+		std::swap(prev, cur);
+	}
+	return b.size() - prev[b.size()];
+}
+
 bool starts_with(const std::string &s, const std::string &prefix)
 {
 	return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
@@ -625,6 +646,11 @@ int main(int argc, char **argv)
 	/* segment close audit: what was shown right before the close vs. after */
 	std::map<std::string, uint64_t> seg_key;
 	int close_extends = 0, close_shorter = 0, close_differs = 0, close_changed_shown = 0;
+	/* close outcomes: the final continued the shown text / the shown text was
+	 * kept over a different final / the final replaced (part of) it */
+	int out_extends = 0, out_kept = 0, out_took = 0;
+	std::vector<std::string> kept_examples, took_examples;
+	std::map<uint64_t, std::string> key_final;
 
 	for (uint64_t now = 0; now <= last; now += tick) {
 		while (next_event < events.size() && events[next_event].t_ns <= now) {
@@ -690,6 +716,33 @@ int main(int argc, char **argv)
 					}
 					if (!starts_with(res, d))
 						close_changed_shown++;
+					if (type == "transcript.final") {
+						key_final[k->second] = f;
+						tea_norm_t nd, nf;
+						tea_norm_build(d.data(), d.size(), &nd);
+						tea_norm_build(f.data(), f.size(), &nf);
+						char buf[1024];
+						std::snprintf(buf, sizeof(buf),
+							      "seg %lld: shown [%s] final [%s] -> [%s]",
+							      (long long)e.num("segment_index", -1), d.c_str(),
+							      f.c_str(), res.c_str());
+#ifdef TEA_CAPTION_STATE_HAS_LAST_CLOSE
+						const int outcome = tea_caption_state_last_close(sim.state);
+#else
+						/* older state machine: infer from what the line shows */
+						const int outcome = tea_norm_starts_with(&nf, &nd) ? 1
+												   : (res == d ? 2 : 3);
+#endif
+						if (outcome == 1) {
+							out_extends++;
+						} else if (outcome == 2) {
+							out_kept++;
+							kept_examples.push_back(buf);
+						} else {
+							out_took++;
+							took_examples.push_back(buf);
+						}
+					}
 					std::printf(
 						"   %8.3fs  CLOSE %-17s seg %lld %s: shown [%s] server [%s] -> now [%s]%s\n",
 						(double)now / 1e9, type.c_str(), (long long)e.num("segment_index", -1),
@@ -754,15 +807,17 @@ int main(int argc, char **argv)
 				    after.c_str());
 		}
 
-		/* bursts: how much text appears in one frame */
+		/* bursts: how many characters appear in one frame that were not on
+		 * screen the frame before, per line: the characters of the visible
+		 * text that an alignment with the previous frame's visible text does
+		 * not account for (longest common subsequence). Text that only
+		 * scrolled to another row, or that stayed while a word before it was
+		 * corrected, is not new. */
 		size_t appeared = 0;
 		for (const auto &kv : visible) {
 			const std::string &before = prev_visible.count(kv.first) ? prev_visible[kv.first]
 										 : std::string();
-			/* characters after what stayed the same */
-			size_t same = tea_utf8_common_prefix(before.data(), before.size(), kv.second.data(),
-							     kv.second.size());
-			appeared += utf8_chars(kv.second) - utf8_chars(kv.second.substr(0, same));
+			appeared += new_chars(before, kv.second);
 		}
 		if (appeared > max_burst) {
 			max_burst = appeared;
@@ -892,6 +947,37 @@ int main(int argc, char **argv)
 		    segs ? (double)rows_total / segs : 0.0, rows_max, segs, breaks, at_committed, breaks - at_committed,
 		    within_1s, latencies.empty() ? 0.0 : (double)latencies[latencies.size() / 2] / 1e6,
 		    (double)latency_max / 1e6, layout_moves);
+	/* duplication: a line that showed a normalised run of 4+ characters more
+	 * often than its segment's final has it */
+	int dup_lines = 0;
+	std::vector<std::string> dup_examples;
+	for (const auto &kv : shown_history) {
+		auto f = key_final.find(kv.first);
+		if (f == key_final.end())
+			continue;
+		tea_norm_t nf;
+		tea_norm_build(f->second.data(), f->second.size(), &nf);
+		for (const Snap &h : kv.second) {
+			tea_norm_t nt;
+			tea_norm_build(h.text.data(), h.text.size(), &nt);
+			if (tea_norm_has_new_repeat(&nt, &nf, 4)) {
+				dup_lines++;
+				dup_examples.push_back(h.text + "  (final: " + f->second + ")");
+				break;
+			}
+		}
+	}
+	std::printf("# duplication: lines that showed a repeated 4+ character run their final does not have=%d\n",
+		    dup_lines);
+	for (const std::string &x : dup_examples)
+		std::printf("#   dup: %s\n", x.c_str());
+	std::printf("# close outcomes: final continued the shown text=%d, shown tail kept over a different final=%d, "
+		    "final replaced the tail=%d\n",
+		    out_extends, out_kept, out_took);
+	for (const std::string &x : kept_examples)
+		std::printf("#   kept: %s\n", x.c_str());
+	for (const std::string &x : took_examples)
+		std::printf("#   took: %s\n", x.c_str());
 	std::printf("# close audit: finals that extend what was shown=%d, shorter=%d, different=%d; "
 		    "closes that changed shown text=%d\n",
 		    close_extends, close_shorter, close_differs, close_changed_shown);

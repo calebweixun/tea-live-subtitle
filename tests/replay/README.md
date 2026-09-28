@@ -23,6 +23,12 @@ summary. `--punct off|sentence|comma` and `--comma-min N` select punctuation lin
 The `# rows` line reports visible characters per row, rows per segment, and punctuation breaks: how many happened, whether
 the mark was committed or still in the tail, and how long after the mark first showed. It also counts layout moves:
 a row of a line whose text only grew that lost or changed characters, which must be 0.
+The `# duplication` line counts lines that at some moment showed the same 4+ character run twice (after
+normalising away punctuation and spaces) when that segment's final does not repeat it; each is listed with a
+`#   dup:` line. The `# close outcomes` line splits sentence ends into finals that continued the shown text, shown
+tails kept over a different final, and finals whose remainder replaced the tail, with examples. The largest burst
+counts only characters that are new in a frame (outside the longest common subsequence with the previous frame), so
+scrolling a row away does not count.
 `--selftest-width-change W MS` switches the box width at MS as a real reflow, to check that the detector notices moves.
 
 To compare with an older plugin, extract its `src/` and `tests/stubs/` (for example with
