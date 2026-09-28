@@ -34,6 +34,9 @@ jobs:
             src/caption-state.c tests/caption-state-test.c \
             -o "$RUNNER_TEMP/caption-state-test"
           "$RUNNER_TEMP/caption-state-test"
+          cc -std=c11 -Wall -Wextra -Werror -Itests/stubs -Isrc \
+            tests/recognition-hints-test.c -o "$RUNNER_TEMP/recognition-hints-test"
+          "$RUNNER_TEMP/recognition-hints-test"
           python3 tests/test_font_defaults.py
           python3 tests/test_caption_contract.py
           python3 tests/test_layout_migration.py

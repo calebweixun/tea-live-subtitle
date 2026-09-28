@@ -17,6 +17,9 @@
  *                       [--restart-at-ms MS] [--stable on|off]
  *                       [--tail on|off] [--toggle-display-at-ms MS]
  *                       [--end-silence-ms MS] [--trace-dir DIR]
+ *                       [--hints-profile S] [--hints-domain S]
+ *                       [--hints-hotwords-file P] [--hints-replacements-file P]
+ *                       [--hints-file P] [--fetch-dictionaries-at-ms MS]
  *
  * --stable mirrors the source's "stable captions" setting (plugin default on).
  * --tail mirrors "show not-yet-confirmed text"; --toggle-display-at-ms flips
@@ -25,6 +28,12 @@
  * touch the connection.
  * --end-silence-ms mirrors the "sentence break" setting (0 = server default).
  * --trace-dir mirrors "record recognition events": one JSONL file per session.
+ * --hints-* mirror the 辨識提示 settings (the two multiline fields are read
+ * from files, the hints file is passed as a path like the source does);
+ * --fetch-dictionaries-at-ms asks for GET /v1/dictionaries, as opening the
+ * Properties window does, and prints
+ *   {"t":ms,"client":i,"event":"dictionaries","state":n,"entries":[...],"error":"..."}
+ * The done line also carries "hints": the client's hints status per client.
  * Diagnostics (connection, heartbeat, WARN lines) go to stderr through the
  * obs_log stub, exactly as the plugin writes them to the OBS log.
  * The final {"event":"done"} line also carries "stable_mismatches",
@@ -36,7 +45,9 @@
 #include <QJsonObject>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QFile>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +80,71 @@ void emitLine(const QJsonObject &obj)
 	std::fflush(stdout);
 }
 
+std::string readFile(const std::string &path)
+{
+	QFile f(QString::fromStdString(path));
+	if (!f.open(QIODevice::ReadOnly)) {
+		std::fprintf(stderr, "cannot read %s\n", path.c_str());
+		std::exit(2);
+	}
+	return f.readAll().toStdString();
+}
+
+std::vector<Slot> *g_rigs = nullptr;
+QElapsedTimer *g_clock = nullptr;
+
+/* tea_asr_client_fetch_dictionaries() callback: runs on the client's thread,
+ * so the line is printed from the main thread. */
+void dictionariesDone(void *param)
+{
+	const int index = (int)reinterpret_cast<intptr_t>(param);
+	QMetaObject::invokeMethod(
+		qApp,
+		[index]() {
+			tea_dictionary_entry_t entries[TEA_DICT_MAX];
+			int count = 0;
+			char error[128];
+			const int state = tea_asr_client_dictionaries((*g_rigs)[(size_t)index].client, entries,
+								      TEA_DICT_MAX, &count, error, sizeof(error),
+								      nullptr);
+			QJsonArray list;
+			for (int i = 0; i < count; i++)
+				list.append(QJsonObject{{"name", QString::fromUtf8(entries[i].name)},
+							{"hotwords_count", entries[i].hotwords_count},
+							{"replacements_count", entries[i].replacements_count}});
+			emitLine(QJsonObject{{"t", (double)g_clock->elapsed()},
+					     {"client", index},
+					     {"event", "dictionaries"},
+					     {"state", state},
+					     {"entries", list},
+					     {"error", QString::fromUtf8(error)}});
+		},
+		Qt::QueuedConnection);
+}
+
+QJsonObject hintsStatusJson(tea_asr_client_t *client)
+{
+	tea_asr_client_hints_status_t hs;
+	tea_asr_client_get_hints_status(client, &hs);
+	return QJsonObject{{"capability", hs.capability},
+			   {"max_hotwords", hs.limits.max_hotwords},
+			   {"sent", hs.sent},
+			   {"rejected", hs.rejected},
+			   {"reject_reason", QString::fromUtf8(hs.reject_reason)},
+			   {"applied", hs.applied},
+			   {"applied_profile", QString::fromUtf8(hs.applied_profile)},
+			   {"applied_hotwords", hs.applied_hotwords},
+			   {"applied_replacements", hs.applied_replacements},
+			   {"applied_domain_chars", hs.applied_domain_chars},
+			   {"prompt_applied", hs.prompt_applied},
+			   {"domain_cut", hs.report.domain_cut},
+			   {"hotwords_over", hs.report.hotwords_over},
+			   {"replacements_over", hs.report.replacements_over},
+			   {"too_long", hs.report.too_long},
+			   {"invalid_lines", hs.invalid_lines},
+			   {"file_error", hs.file_error}};
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -87,6 +163,8 @@ int main(int argc, char **argv)
 	int toggleDisplayAtMs = -1;
 	int endSilenceMs = 0;
 	std::string traceDir;
+	std::string hintsProfile, hintsDomain, hintsHotwords, hintsReplacements, hintsFile;
+	int fetchDictionariesAtMs = -1;
 
 	for (int i = 1; i < argc; i++) {
 		auto next = [&](const char *name) -> const char * {
@@ -120,6 +198,18 @@ int main(int argc, char **argv)
 			endSilenceMs = std::atoi(next("--end-silence-ms"));
 		else if (!std::strcmp(argv[i], "--trace-dir"))
 			traceDir = next("--trace-dir");
+		else if (!std::strcmp(argv[i], "--hints-profile"))
+			hintsProfile = next("--hints-profile");
+		else if (!std::strcmp(argv[i], "--hints-domain"))
+			hintsDomain = next("--hints-domain");
+		else if (!std::strcmp(argv[i], "--hints-hotwords-file"))
+			hintsHotwords = readFile(next("--hints-hotwords-file"));
+		else if (!std::strcmp(argv[i], "--hints-replacements-file"))
+			hintsReplacements = readFile(next("--hints-replacements-file"));
+		else if (!std::strcmp(argv[i], "--hints-file"))
+			hintsFile = next("--hints-file");
+		else if (!std::strcmp(argv[i], "--fetch-dictionaries-at-ms"))
+			fetchDictionariesAtMs = std::atoi(next("--fetch-dictionaries-at-ms"));
 		else {
 			std::fprintf(stderr, "unknown argument %s\n", argv[i]);
 			return 2;
@@ -144,6 +234,8 @@ int main(int argc, char **argv)
 		tea_asr_client_set_stable_captions(s.client, stable);
 		tea_asr_client_set_end_silence_ms(s.client, endSilenceMs);
 		tea_asr_client_set_trace_dir(s.client, traceDir.c_str());
+		tea_asr_client_set_hints(s.client, hintsProfile.c_str(), hintsDomain.c_str(), hintsHotwords.c_str(),
+					 hintsReplacements.c_str(), hintsFile.c_str());
 		tea_asr_client_start(s.client);
 	}
 
@@ -218,12 +310,24 @@ int main(int argc, char **argv)
 		});
 	}
 
+	if (fetchDictionariesAtMs >= 0) {
+		g_rigs = &rigs;
+		g_clock = &clock;
+		QTimer::singleShot(fetchDictionariesAtMs, [&]() {
+			for (size_t i = 0; i < rigs.size(); i++)
+				tea_asr_client_fetch_dictionaries(rigs[i].client, dictionariesDone,
+								  reinterpret_cast<void *>(static_cast<intptr_t>(i)));
+		});
+	}
+
 	QTimer::singleShot(durationMs, [&]() {
 		poll.stop();
 		QJsonArray mismatches;
 		QJsonArray segmentation;
 		QJsonArray effective;
+		QJsonArray hints;
 		for (auto &s : rigs) {
+			hints.append(hintsStatusJson(s.client));
 			mismatches.append((double)tea_caption_state_stable_mismatches(s.captions));
 			segmentation.append(tea_asr_client_supports_segmentation(s.client, nullptr, nullptr, nullptr));
 			effective.append(tea_asr_client_effective_end_silence_ms(s.client));
@@ -238,7 +342,8 @@ int main(int argc, char **argv)
 				     {"event", "done"},
 				     {"stable_mismatches", mismatches},
 				     {"segmentation_supported", segmentation},
-				     {"end_silence_effective", effective}});
+				     {"end_silence_effective", effective},
+				     {"hints", hints}});
 		app.quit();
 	});
 

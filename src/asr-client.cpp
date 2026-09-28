@@ -54,6 +54,7 @@ void appendLeU64(QByteArray &out, uint64_t v)
 
 TeaAsrClient::TeaAsrClient(tea_audio_tap_t *tap, tea_caption_state_t *captions) : tap_(tap), captions_(captions)
 {
+	hintsStatus_.applied_prompt_tokens = -1;
 	moveToThread(&thread_);
 	thread_.setObjectName(QStringLiteral("tea-asr-client"));
 	thread_.start();
@@ -106,6 +107,13 @@ TeaAsrClient::~TeaAsrClient()
 		obs_log(LOG_WARNING, "asr-client: worker thread did not quit within 2s; terminating it");
 		thread_.terminate();
 		thread_.wait();
+	}
+	/* The thread is down: a dictionaries request still pending is dropped,
+	 * but its caller is told (exactly once, see the header). */
+	if (dictDone_) {
+		tea_asr_dictionaries_done_t done = dictDone_;
+		dictDone_ = nullptr;
+		done(dictParam_);
 	}
 }
 
@@ -190,6 +198,265 @@ void TeaAsrClient::setTraceDir(const QString &dir)
 	traceDir_ = dir;
 }
 
+void TeaAsrClient::setHints(const QString &profile, const QString &domain, const QString &hotwords,
+			    const QString &replacements, const QString &filePath)
+{
+	QMutexLocker lock(&hintsMutex_);
+	hints_.profile = profile;
+	hints_.domain = domain;
+	hints_.hotwords = hotwords;
+	hints_.replacements = replacements;
+	hints_.filePath = filePath;
+}
+
+void TeaAsrClient::hintsStatus(tea_asr_client_hints_status_t *out) const
+{
+	QMutexLocker lock(&hintsMutex_);
+	*out = hintsStatus_;
+	out->capability = hintsCapability_.load();
+	out->limits = hintsLimits_;
+}
+
+void TeaAsrClient::readHintsCapability(const QJsonObject &features)
+{
+	/* features.context_biasing: absent = a server that predates the
+	 * feature; false = present but off (TEA_ASR_CONTEXT_HINTS unset). */
+	const QJsonValue biasing = features.value(QStringLiteral("context_biasing"));
+	const int capability = biasing.isUndefined() || biasing.isNull() ? TEA_HINTS_CAP_ABSENT
+			       : biasing.toBool(false)                   ? TEA_HINTS_CAP_ON
+									 : TEA_HINTS_CAP_OFF;
+	const QJsonObject limits = features.value(QStringLiteral("context_limits")).toObject();
+	tea_hints_limits_t parsed;
+	parsed.max_domain_chars = limits.value(QStringLiteral("max_domain_chars")).toInt(0);
+	parsed.max_hotwords = limits.value(QStringLiteral("max_hotwords")).toInt(0);
+	parsed.max_hotword_chars = limits.value(QStringLiteral("max_hotword_chars")).toInt(0);
+	parsed.max_replacements = limits.value(QStringLiteral("max_replacements")).toInt(0);
+	parsed.max_replacement_chars = limits.value(QStringLiteral("max_replacement_chars")).toInt(0);
+	{
+		QMutexLocker lock(&hintsMutex_);
+		hintsLimits_ = parsed;
+	}
+	hintsCapability_ = capability;
+}
+
+QJsonObject TeaAsrClient::buildContext()
+{
+	HintSettings settings;
+	tea_hints_limits_t limits;
+	{
+		QMutexLocker lock(&hintsMutex_);
+		settings = hints_;
+		limits = hintsLimits_;
+	}
+
+	/* The file is read again for every session, so it can be edited (and
+	 * grow) outside OBS; it merges before the fields. */
+	bool fileError = false;
+	QByteArray fileText;
+	const QString path = settings.filePath.trimmed();
+	if (!path.isEmpty()) {
+		QFile file(path);
+		if (file.open(QIODevice::ReadOnly)) {
+			fileText = file.read(kMaxHintsFileBytes);
+		} else {
+			fileError = true;
+			obs_log(LOG_WARNING, "asr-client: WARN the recognition hints file cannot be read (%s)",
+				file.errorString().toUtf8().constData());
+		}
+	}
+	const QByteArray hotwords = settings.hotwords.toUtf8();
+	const QByteArray replacements = settings.replacements.toUtf8();
+	tea_hints_t hints;
+	tea_hints_build(&hints, fileText.isEmpty() ? nullptr : fileText.constData(), hotwords.constData(),
+			replacements.constData());
+
+	QString domainText = settings.domain;
+	domainText.replace(QStringLiteral("\r\n"), QStringLiteral("\n")).replace(QLatin1Char('\r'), QLatin1Char('\n'));
+	const QByteArray domainUtf8 = domainText.toUtf8();
+	size_t domainLen = 0;
+	const char *domain = tea_hints_domain(domainUtf8.constData(), &domainLen);
+	size_t domainKeep = 0;
+	tea_hints_report_t report;
+	tea_hints_apply_limits(&hints, domain, domainLen, &limits, &domainKeep, &report);
+
+	QJsonObject context;
+	const QByteArray profile = settings.profile.trimmed().toUtf8();
+	if (!tea_hints_profile_is_none(profile.constData()))
+		context.insert(QStringLiteral("profile"), QString::fromUtf8(profile));
+	if (domainKeep > 0)
+		context.insert(QStringLiteral("domain"), QString::fromUtf8(domain, (qsizetype)domainKeep));
+	if (hints.hotword_count > 0) {
+		QJsonArray words;
+		for (int i = 0; i < hints.hotword_count; i++)
+			words.append(QString::fromUtf8(hints.hotwords[i]));
+		context.insert(QStringLiteral("hotwords"), words);
+	}
+	if (hints.pair_count > 0) {
+		QJsonArray pairs;
+		for (int i = 0; i < hints.pair_count; i++)
+			pairs.append(QJsonObject{{QStringLiteral("from"), QString::fromUtf8(hints.pairs[i].from)},
+						 {QStringLiteral("to"), QString::fromUtf8(hints.pairs[i].to)}});
+		context.insert(QStringLiteral("replacements"), pairs);
+	}
+
+	/* Counts only: hint text is prompt text and never goes to the log. */
+	if (tea_hints_report_cut(&report))
+		obs_log(LOG_WARNING,
+			"asr-client: WARN recognition hints cut to the server's limits: domain %d of %d chars, "
+			"%d hotwords sent (%d over the limit of %d), %d replacements sent (%d over the limit of %d), "
+			"%d entries longer than allowed dropped",
+			report.domain_chars - report.domain_cut, report.domain_chars, hints.hotword_count,
+			report.hotwords_over, limits.max_hotwords, hints.pair_count, report.replacements_over,
+			limits.max_replacements, report.too_long);
+	if (hints.invalid_lines > 0)
+		obs_log(LOG_WARNING, "asr-client: WARN %d recognition hint replacement line(s) are not \"from => to\"",
+			hints.invalid_lines);
+	if (!context.isEmpty())
+		obs_log(LOG_INFO,
+			"asr-client: sending recognition hints: profile=%s domain=%d chars hotwords=%d replacements=%d",
+			context.contains(QStringLiteral("profile")) ? "yes" : "no", tea_hints_chars(domain, domainKeep),
+			hints.hotword_count, hints.pair_count);
+
+	{
+		QMutexLocker lock(&hintsMutex_);
+		hintsStatus_.report = report;
+		hintsStatus_.invalid_lines = hints.invalid_lines;
+		memcpy(hintsStatus_.invalid, hints.invalid, sizeof(hintsStatus_.invalid));
+		hintsStatus_.file_error = fileError;
+	}
+	tea_hints_free(&hints);
+	return context;
+}
+
+void TeaAsrClient::fetchDictionaries(tea_asr_dictionaries_done_t done, void *param)
+{
+	{
+		QMutexLocker lock(&dictMutex_);
+		dictState_ = TEA_DICT_FETCHING;
+	}
+	if (!QMetaObject::invokeMethod(
+		    this, [this, done, param]() { doFetchDictionaries(done, param); }, Qt::QueuedConnection) &&
+	    done)
+		done(param);
+}
+
+void TeaAsrClient::doFetchDictionaries(tea_asr_dictionaries_done_t done, void *param)
+{
+	if (!monotonic_.isValid())
+		monotonic_.start();
+	/* A newer request replaces an older one still in flight. */
+	if (dictDone_) {
+		tea_asr_dictionaries_done_t previous = dictDone_;
+		dictDone_ = nullptr;
+		previous(dictParam_);
+	}
+	dictDone_ = done;
+	dictParam_ = param;
+	const quint64 gen = ++dictGen_;
+
+	/* The token is read without touching the change-detection stamp
+	 * readToken() keeps for the connection loop. */
+	QString token;
+	{
+		QFile f(tokenFilePath());
+		if (f.open(QIODevice::ReadOnly | QIODevice::Text))
+			token = QString::fromUtf8(f.readAll()).trimmed();
+	}
+	if (token.isEmpty()) {
+		finishDictionaries(TEA_DICT_FAILED, {}, QStringLiteral("no token"));
+		return;
+	}
+	if (!nam_)
+		nam_ = new QNetworkAccessManager(this);
+	QUrl url;
+	url.setScheme(QStringLiteral("http"));
+	url.setHost(host_);
+	url.setPort(port_);
+	url.setPath(QStringLiteral("/v1/dictionaries"));
+	QNetworkRequest req(url);
+	req.setRawHeader("Authorization", "Bearer " + token.toUtf8());
+	req.setTransferTimeout(5000);
+	QNetworkReply *reply = nam_->get(req);
+	reply->setProperty("teaDictGen", QVariant::fromValue(gen));
+	connect(reply, &QNetworkReply::finished, this, &TeaAsrClient::onDictionariesReply);
+}
+
+void TeaAsrClient::onDictionariesReply()
+{
+	auto *reply = qobject_cast<QNetworkReply *>(sender());
+	if (!reply)
+		return;
+	reply->deleteLater();
+	if (reply->property("teaDictGen").value<quint64>() != dictGen_)
+		return; /* superseded; its caller was already told */
+	const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+	const QByteArray body = reply->readAll();
+	if (httpStatus != 200) {
+		const QString why = httpStatus == 0 ? reply->errorString() : QStringLiteral("HTTP %1").arg(httpStatus);
+		obs_log(LOG_INFO, "asr-client: GET /v1/dictionaries failed (%s)", why.toUtf8().constData());
+		finishDictionaries(TEA_DICT_FAILED, {}, why);
+		return;
+	}
+	const QJsonDocument doc = QJsonDocument::fromJson(body);
+	const QJsonArray list = doc.isArray() ? doc.array()
+					      : doc.object().value(QStringLiteral("dictionaries")).toArray();
+	if (!doc.isArray() && !doc.object().value(QStringLiteral("dictionaries")).isArray()) {
+		finishDictionaries(TEA_DICT_FAILED, {}, QStringLiteral("unexpected response"));
+		return;
+	}
+	std::vector<tea_dictionary_entry_t> entries;
+	for (const QJsonValue v : list) {
+		const QJsonObject o = v.toObject();
+		const QByteArray name = o.value(QStringLiteral("name")).toString().toUtf8();
+		if (name.isEmpty() || entries.size() >= TEA_DICT_MAX)
+			continue;
+		tea_dictionary_entry_t e;
+		memset(&e, 0, sizeof(e));
+		snprintf(e.name, sizeof(e.name), "%s", name.constData());
+		e.hotwords_count = o.value(QStringLiteral("hotwords_count")).toInt(0);
+		e.replacements_count = o.value(QStringLiteral("replacements_count")).toInt(0);
+		entries.push_back(e);
+	}
+	obs_log(LOG_INFO, "asr-client: the server offers %d recognition hint dictionaries", (int)entries.size());
+	finishDictionaries(TEA_DICT_OK, entries, QString());
+}
+
+void TeaAsrClient::finishDictionaries(int state, const std::vector<tea_dictionary_entry_t> &entries,
+				      const QString &error)
+{
+	{
+		QMutexLocker lock(&dictMutex_);
+		dictState_ = state;
+		if (state == TEA_DICT_OK)
+			dictEntries_ = entries;
+		dictError_ = error;
+		dictDoneMs_ = nowMs();
+	}
+	if (dictDone_) {
+		tea_asr_dictionaries_done_t done = dictDone_;
+		dictDone_ = nullptr;
+		done(dictParam_);
+	}
+}
+
+int TeaAsrClient::dictionaries(tea_dictionary_entry_t *out, int max, int *count, QString *error, qint64 *ageMs) const
+{
+	QMutexLocker lock(&dictMutex_);
+	int n = 0;
+	for (const auto &e : dictEntries_) {
+		if (n >= max)
+			break;
+		out[n++] = e;
+	}
+	if (count)
+		*count = n;
+	if (error)
+		*error = dictError_;
+	if (ageMs)
+		*ageMs = dictDoneMs_ < 0 || !monotonic_.isValid() ? -1 : monotonic_.elapsed() - dictDoneMs_;
+	return dictState_;
+}
+
 void TeaAsrClient::diagnostics(int *connection, int *speech, double *input_dbfs, bool *input_recent,
 			       int64_t *ms_since_text) const
 {
@@ -261,7 +528,7 @@ void TeaAsrClient::diagOnSessionStarted(const QJsonObject &started)
 						     "min_interval_ms=%6")
 					      .arg(host_)
 					      .arg(port_)
-					      .arg(QString::fromUtf8(lastSessionStart_))
+					      .arg(QString::fromUtf8(lastSessionStartLog_))
 					      .arg(started.value(QStringLiteral("transcript_mode")).toString())
 					      .arg(policy.value(QStringLiteral("endpoint_silence_ms")).toInt(-1))
 					      .arg(policy.value(QStringLiteral("min_interval_ms")).toInt(-1)));
@@ -535,6 +802,14 @@ void TeaAsrClient::doStart()
 	 * if a previous server rejected them. */
 	stableRejected_ = false;
 	segmentationRejected_ = false;
+	contextRejected_ = false;
+	{
+		QMutexLocker lock(&hintsMutex_);
+		hintsStatus_.rejected = false;
+		hintsStatus_.reject_reason[0] = '\0';
+		hintsStatus_.applied = false;
+		hintsStatus_.sent = false;
+	}
 
 	if (!pumpTimer_) {
 		pumpTimer_ = new QTimer(this);
@@ -827,11 +1102,18 @@ void TeaAsrClient::onCapabilitiesReply()
 	segmentationMax_ = silenceMax;
 	segmentationDefault_ = silence.value(QStringLiteral("default")).toInt(0);
 	serverSupportsSegmentation_ = silenceMin > 0 && silenceMax >= silenceMin;
-	obs_log(LOG_INFO, "asr-client: capabilities: partial_transcripts=%d stable_transcripts=%d segmentation=%s",
+	readHintsCapability(features);
+	const int hintsCapability = hintsCapability_.load();
+	obs_log(LOG_INFO,
+		"asr-client: capabilities: partial_transcripts=%d stable_transcripts=%d segmentation=%s "
+		"context_biasing=%s",
 		serverSupportsPartial_.load() ? 1 : 0, serverSupportsStable_.load() ? 1 : 0,
 		serverSupportsSegmentation_.load()
 			? QStringLiteral("%1-%2 ms").arg(silenceMin).arg(silenceMax).toUtf8().constData()
-			: "not offered");
+			: "not offered",
+		hintsCapability == TEA_HINTS_CAP_ON    ? "on"
+		: hintsCapability == TEA_HINTS_CAP_OFF ? "off on the server"
+						       : "not offered");
 	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
 	/* W9 LAN mode: every response carries this header. Surface it; the
 	 * bearer token is travelling in cleartext. */
@@ -1267,6 +1549,38 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 			status += QStringLiteral(" -- server rejected stable captions, using partial previews");
 		if (segmentationRejected_)
 			status += QStringLiteral(" -- server rejected the sentence break setting, using its default");
+		{
+			/* session.started.context = {profile, domain_chars, hotwords_count,
+			 * replacements_count, prompt_tokens?}: what the server applied. */
+			const QJsonValue echo = obj.value(QStringLiteral("context"));
+			QMutexLocker lock(&hintsMutex_);
+			hintsStatus_.applied = contextRequested_ && echo.isObject();
+			hintsStatus_.unconfirmed = contextRequested_ && !echo.isObject();
+			if (hintsStatus_.applied) {
+				const QJsonObject c = echo.toObject();
+				snprintf(hintsStatus_.applied_profile, sizeof(hintsStatus_.applied_profile), "%s",
+					 c.value(QStringLiteral("profile")).toString().toUtf8().constData());
+				hintsStatus_.applied_domain_chars = c.value(QStringLiteral("domain_chars")).toInt(0);
+				hintsStatus_.applied_hotwords = c.value(QStringLiteral("hotwords_count")).toInt(0);
+				hintsStatus_.applied_replacements =
+					c.value(QStringLiteral("replacements_count")).toInt(0);
+				hintsStatus_.prompt_applied = c.value(QStringLiteral("prompt_applied")).toBool(false);
+				const QJsonValue tokens = c.value(QStringLiteral("prompt_tokens"));
+				hintsStatus_.applied_prompt_tokens = tokens.isDouble() ? tokens.toInt(-1) : -1;
+				status += QStringLiteral(" (recognition hints: %1 hotwords, %2 replacements)")
+						  .arg(hintsStatus_.applied_hotwords)
+						  .arg(hintsStatus_.applied_replacements);
+				obs_log(LOG_INFO,
+					"asr-client: recognition hints applied: profile=%s domain=%d chars hotwords=%d "
+					"replacements=%d prompt_applied=%d prompt_tokens=%d",
+					hintsStatus_.applied_profile[0] ? "yes" : "none",
+					hintsStatus_.applied_domain_chars, hintsStatus_.applied_hotwords,
+					hintsStatus_.applied_replacements, hintsStatus_.prompt_applied ? 1 : 0,
+					hintsStatus_.applied_prompt_tokens);
+			}
+		}
+		if (contextRejected_)
+			status += QStringLiteral(" -- server rejected the recognition hints, running without them");
 		if (insecureLan_)
 			status += QStringLiteral(
 				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
@@ -1415,6 +1729,31 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		obs_log(LOG_WARNING, "asr-client: server error code=%s retryable=%d", code.toUtf8().constData(),
 			retryable ? 1 : 0);
 
+		if (contextRequested_ && !sessionStarted_ &&
+		    tea_hints_error_is_context(code.toUtf8().constData(), message.toUtf8().constData())) {
+			/* Recognition hints are an optional extra: a server that refuses
+			 * them (an unknown profile, a limit, a server that stopped
+			 * offering them) gets a new session without them, with every
+			 * other setting kept. Checked first: `context` is the newest
+			 * session.start field. */
+			contextRejected_ = true;
+			{
+				QMutexLocker lock(&hintsMutex_);
+				hintsStatus_.rejected = true;
+				snprintf(hintsStatus_.reject_reason, sizeof(hintsStatus_.reject_reason), "%s%s%s",
+					 code.toUtf8().constData(), message.isEmpty() ? "" : ": ",
+					 message.left(120).toUtf8().constData());
+			}
+			obs_log(LOG_WARNING,
+				"asr-client: WARN server rejected the recognition hints (%s); reconnecting without them",
+				code.toUtf8().constData());
+			errorPolicy_.observeError(code.toStdString(), message.toStdString(), true);
+			setStatus(
+				QStringLiteral("server rejected the recognition hints (%1); reconnecting without them")
+					.arg(code));
+			return;
+		}
+
 		if (segmentationRequested_ > 0 && !sessionStarted_ &&
 		    (code == QLatin1String("unsupported_option") || code == QLatin1String("protocol_error"))) {
 			/* Advertised segmentation_control but refused the field (or the
@@ -1530,8 +1869,39 @@ void TeaAsrClient::sendSessionStart()
 		start.insert(QStringLiteral("segmentation"), segmentation);
 	}
 
+	/* Recognition hints: only to a server that offers them, and not again
+	 * after it refused them (until an explicit restart). */
+	contextRequested_ = false;
+	if (hintsCapability_.load() == TEA_HINTS_CAP_ON && !contextRejected_) {
+		const QJsonObject context = buildContext();
+		if (!context.isEmpty()) {
+			start.insert(QStringLiteral("context"), context);
+			contextRequested_ = true;
+		}
+	}
+	{
+		QMutexLocker lock(&hintsMutex_);
+		hintsStatus_.sent = contextRequested_;
+		hintsStatus_.applied = false;
+		hintsStatus_.unconfirmed = false;
+	}
+
 	lastSessionStart_ = QJsonDocument(start).toJson(QJsonDocument::Compact);
 	sendTextFrame(lastSessionStart_);
+	/* The OBS log gets the session.start with the hint text replaced by
+	 * counts: hints are prompt text (see the note at the top). */
+	if (start.contains(QStringLiteral("context"))) {
+		const QJsonObject context = start.value(QStringLiteral("context")).toObject();
+		start.insert(QStringLiteral("context"),
+			     QJsonObject{{QStringLiteral("profile"), context.contains(QStringLiteral("profile"))},
+					 {QStringLiteral("domain_chars"),
+					  (int)context.value(QStringLiteral("domain")).toString().toUcs4().size()},
+					 {QStringLiteral("hotwords"),
+					  (int)context.value(QStringLiteral("hotwords")).toArray().size()},
+					 {QStringLiteral("replacements"),
+					  (int)context.value(QStringLiteral("replacements")).toArray().size()}});
+	}
+	lastSessionStartLog_ = QJsonDocument(start).toJson(QJsonDocument::Compact);
 }
 
 void TeaAsrClient::onPumpTimer()
@@ -1776,4 +2146,57 @@ extern "C" void tea_asr_client_set_trace_dir(tea_asr_client_t *client, const cha
 {
 	if (client)
 		client->impl->setTraceDir(QString::fromUtf8(dir ? dir : ""));
+}
+
+extern "C" void tea_asr_client_set_hints(tea_asr_client_t *client, const char *profile, const char *domain,
+					 const char *hotwords, const char *replacements, const char *file_path)
+{
+	if (!client)
+		return;
+	auto text = [](const char *s) {
+		return QString::fromUtf8(s ? s : "");
+	};
+	client->impl->setHints(text(profile), text(domain), text(hotwords), text(replacements), text(file_path));
+}
+
+extern "C" void tea_asr_client_get_hints_status(tea_asr_client_t *client, tea_asr_client_hints_status_t *out)
+{
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	out->applied_prompt_tokens = -1;
+	if (client)
+		client->impl->hintsStatus(out);
+}
+
+extern "C" void tea_asr_client_fetch_dictionaries(tea_asr_client_t *client, tea_asr_dictionaries_done_t done,
+						  void *param)
+{
+	if (!client) {
+		if (done)
+			done(param);
+		return;
+	}
+	client->impl->fetchDictionaries(done, param);
+}
+
+extern "C" int tea_asr_client_dictionaries(tea_asr_client_t *client, tea_dictionary_entry_t *out, int max, int *count,
+					   char *error, size_t error_size, int64_t *age_ms)
+{
+	if (count)
+		*count = 0;
+	if (error && error_size)
+		error[0] = '\0';
+	if (age_ms)
+		*age_ms = -1;
+	if (!client)
+		return TEA_DICT_UNKNOWN;
+	QString why;
+	qint64 age = -1;
+	const int state = client->impl->dictionaries(out, out ? max : 0, count, &why, &age);
+	if (error && error_size)
+		snprintf(error, error_size, "%s", why.toUtf8().constData());
+	if (age_ms)
+		*age_ms = age;
+	return state;
 }

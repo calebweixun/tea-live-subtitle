@@ -58,11 +58,36 @@ the contract around the unchanged server app:
 * ``--reject-segmentation-field``: advertises the capability like
   ``--emulate-segmentation`` but renames the field to an unknown key, so the
   server answers ``protocol_error`` (a server that advertises but refuses).
+
+Recognition-hint (context) knobs. ``features.context_biasing`` /
+``context_limits``, ``session.start.context``, ``GET /v1/dictionaries`` and
+``session.started.context`` are being added to the server (branch
+agent/context-hints); these emulate that contract around the unchanged app:
+
+* ``--emulate-context``: advertises ``context_biasing: true`` and
+  ``context_limits`` (``--context-limits`` JSON overrides the contract
+  values), serves ``GET /v1/dictionaries`` (bearer token required) from
+  ``--dictionaries``, removes ``context`` from the client's session.start
+  before the server app sees it, checks it like the server would (only the
+  four keys, types, limits, a known profile) and echoes
+  ``session.started.context``. A context the real server would refuse is
+  renamed to an unknown key instead, so the app answers ``protocol_error``
+  exactly like a rejection.
+* ``--reject-context-field``: advertises like ``--emulate-context`` but always
+  refuses the field that way.
+* ``--hide-context-capability``: strips ``features.context_biasing`` and
+  ``context_limits`` (a server that predates the feature).
+
+Without these knobs the real implementation is used as is: the harness passes
+``TEA_ASR_CONTEXT_HINTS`` / ``TEA_ASR_CONTEXT_PROMPT`` from its environment
+into the server config (when the server has those settings), and server
+dictionaries are read from ``<state-dir>/dictionaries/<name>.toml``.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -94,6 +119,15 @@ def main() -> int:
     parser.add_argument("--emulate-segmentation", action="store_true")
     parser.add_argument("--reject-segmentation-field", action="store_true")
     parser.add_argument("--deaf", action="store_true")
+    parser.add_argument("--emulate-context", action="store_true")
+    parser.add_argument("--reject-context-field", action="store_true")
+    parser.add_argument("--hide-context-capability", action="store_true")
+    parser.add_argument("--context-limits", default="")
+    parser.add_argument(
+        "--dictionaries",
+        default='[{"name":"church","domain":"主日講道","hotwords_count":42,"replacements_count":7},'
+                '{"name":"youth","domain":"青年聚會","hotwords_count":5,"replacements_count":0}]',
+    )
     args = parser.parse_args()
 
     if args.port == 8327:
@@ -129,8 +163,10 @@ def main() -> int:
         SENTENCE = "今天天氣很好我們一起去公園散步吧🍵然後喝杯茶再回家休息一下就好了謝謝大家"
         GUESSES = "嗯啊"
 
-        async def transcribe(self, pcm: bytes, *, language: str = "Chinese"):
-            result = await super().transcribe(pcm, language=language)
+        async def transcribe(self, pcm: bytes, *, language: str = "Chinese", **kwargs):
+            # kwargs: system_prompt from a server with recognition hints
+            # (TEA_ASR_CONTEXT_PROMPT=1); passed on only when there is one.
+            result = await super().transcribe(pcm, language=language, **kwargs)
             chars = max(1, min(len(self.SENTENCE), (len(pcm) // 2) // 3200))
             result["text"] = self.SENTENCE[:chars] + self.GUESSES[self.calls % 2]
             return result
@@ -142,11 +178,22 @@ def main() -> int:
     for _ in range(args.prefail):
         limiter.record_failure("127.0.0.1")
 
+    extra_config = {}
+    # Recognition hints of a server that has them (agent/context-hints):
+    # TEA_ASR_CONTEXT_HINTS / TEA_ASR_CONTEXT_PROMPT in this harness's
+    # environment, like the real service reads them. An older server has no
+    # such fields and ignores the variables.
+    config_fields = {f.name for f in dataclasses.fields(ServiceConfig)}
+    for env_name, field_name in (("TEA_ASR_CONTEXT_HINTS", "context_hints_enabled"),
+                                 ("TEA_ASR_CONTEXT_PROMPT", "context_prompt_enabled")):
+        if field_name in config_fields and os.environ.get(env_name) is not None:
+            extra_config[field_name] = os.environ[env_name] == "1"
     config = ServiceConfig(
         revisable_preview=args.revisable,
         max_total_connections=args.max_total_connections,
         max_continuous_sessions=args.max_continuous_sessions,
         idle_unload_s=0,
+        **extra_config,
     )
     app = create_app(
         Path("unused-fake-backend"),
@@ -157,6 +204,40 @@ def main() -> int:
         rate_limiter=limiter,
         paths=paths,
     )
+
+    context_limits = {"max_domain_chars": 300, "max_hotwords": 200, "max_hotword_chars": 32,
+                      "max_replacements": 500, "max_replacement_chars": 32}
+    if args.context_limits:
+        context_limits.update(json.loads(args.context_limits))
+    dictionaries = json.loads(args.dictionaries)
+    advertise_context = args.emulate_context or args.reject_context_field
+
+    def context_problem(ctx) -> str | None:
+        """Why the server (contract of agent/context-hints) would refuse it."""
+        if not isinstance(ctx, dict):
+            return "context must be an object"
+        extra = set(ctx) - {"profile", "domain", "hotwords", "replacements"}
+        if extra:
+            return f"unknown keys {sorted(extra)}"
+        lim = context_limits
+        if "profile" in ctx and ctx["profile"] not in {d["name"] for d in dictionaries}:
+            return "unknown profile"
+        if "domain" in ctx and (not isinstance(ctx["domain"], str) or len(ctx["domain"]) > lim["max_domain_chars"]):
+            return "domain"
+        words = ctx.get("hotwords", [])
+        if not isinstance(words, list) or len(words) > lim["max_hotwords"] or any(
+                not isinstance(w, str) or not w or len(w) > lim["max_hotword_chars"] for w in words):
+            return "hotwords"
+        pairs = ctx.get("replacements", [])
+        if not isinstance(pairs, list) or len(pairs) > lim["max_replacements"]:
+            return "replacements"
+        for pair in pairs:
+            if (not isinstance(pair, dict) or set(pair) != {"from", "to"} or not isinstance(pair["from"], str)
+                    or not pair["from"] or not isinstance(pair["to"], str)
+                    or len(pair["from"]) > lim["max_replacement_chars"]
+                    or len(pair["to"]) > lim["max_replacement_chars"]):
+                return "replacements"
+        return None
 
     log_path = Path(args.request_log)
     start = time.monotonic()
@@ -181,6 +262,19 @@ def main() -> int:
         outcome: dict = {}
         held: dict = {}
 
+        if (scope["type"] == "http" and base["path"] == "/v1/dictionaries" and advertise_context):
+            token = (state_dir / "token").read_text().strip()
+            ok = headers.get("authorization") == f"Bearer {token}"
+            body = json.dumps(dictionaries if ok else {"error": {"code": "unauthenticated"}},
+                              ensure_ascii=False).encode()
+            status = 200 if ok else 401
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            record({**base, "event": "http", "status": status})
+            return
+
         async def wrapped_receive():
             message = await receive()
             if message.get("type") == "websocket.receive" and message.get("text"):
@@ -193,6 +287,8 @@ def main() -> int:
                             "transcript_mode": payload.get("transcript_mode"),
                             "stable": payload.get("stable"),
                             "segmentation": payload.get("segmentation"),
+                            "has_context": "context" in payload,
+                            "context": payload.get("context"),
                             "stable_rewritten": bool(args.reject_stable_field and "stable" in payload)})
                     changed = False
                     if args.reject_stable_field and "stable" in payload:
@@ -204,6 +300,15 @@ def main() -> int:
                     elif "segmentation" in payload and args.emulate_segmentation:
                         held["end_silence_ms"] = payload.pop("segmentation").get("end_silence_ms")
                         changed = True
+                    if "context" in payload and advertise_context:
+                        problem = "refused by --reject-context-field" if args.reject_context_field \
+                            else context_problem(payload["context"])
+                        if problem:
+                            record({**base, "event": "ws_context_refused", "why": problem})
+                            payload["context_refused_" + problem.replace(" ", "_")[:40]] = payload.pop("context")
+                        else:
+                            held["context"] = payload.pop("context")
+                        changed = True
                     if changed:
                         message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
             return message
@@ -211,7 +316,8 @@ def main() -> int:
         async def wrapped_send(message):
             mtype = message["type"]
             rewrite_caps = (args.hide_stable_capability or args.hide_segmentation_capability
-                            or args.emulate_segmentation or args.reject_segmentation_field)
+                            or args.emulate_segmentation or args.reject_segmentation_field
+                            or advertise_context or args.hide_context_capability)
             if (rewrite_caps and base["path"] == "/v1/capabilities"
                     and mtype in ("http.response.start", "http.response.body")):
                 # Buffer the whole response, drop the optional feature, fix
@@ -234,6 +340,12 @@ def main() -> int:
                     if args.emulate_segmentation or args.reject_segmentation_field:
                         features["segmentation_control"] = {"end_silence_ms": {
                             "min": 300, "max": 3000, "default": 900, "default_final_only": 500}}
+                    if advertise_context:
+                        features["context_biasing"] = True
+                        features["context_limits"] = context_limits
+                    if args.hide_context_capability:
+                        features.pop("context_biasing", None)
+                        features.pop("context_limits", None)
                     body = json.dumps(doc, ensure_ascii=False).encode()
                 except ValueError:
                     pass
@@ -271,15 +383,24 @@ def main() -> int:
                         and held.get("end_silence_ms") is not None and payload.get("preview_policy")):
                     payload["preview_policy"]["endpoint_silence_ms"] = held["end_silence_ms"]
                     message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
+                if payload.get("type") == "session.started" and held.get("context") is not None:
+                    ctx = held["context"]
+                    payload["context"] = {"profile": ctx.get("profile"),
+                                          "domain_chars": len(ctx.get("domain", "")),
+                                          "hotwords_count": len(ctx.get("hotwords", [])),
+                                          "replacements_count": len(ctx.get("replacements", [])),
+                                          "prompt_tokens": 17}
+                    message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
                 if payload.get("type") == "session.started":
-                    record({**base, "event": "ws_session_started",
+                    record({**base, "event": "ws_session_started", "context": payload.get("context"),
                             "endpoint_silence_ms": (payload.get("preview_policy") or {}).get("endpoint_silence_ms")})
                 if payload.get("type") == "error":
                     record({**base, "event": "ws_error_event", "code": payload.get("code"),
-                            "retryable": payload.get("retryable")})
+                            "retryable": payload.get("retryable"), "message": payload.get("message")})
                 elif payload.get("type") in ("transcript.partial", "transcript.final"):
                     record({**base, "event": "ws_" + payload["type"].split(".")[1],
-                            "segment_id": payload.get("segment_id"), "text": payload.get("text")})
+                            "segment_id": payload.get("segment_id"), "text": payload.get("text"),
+                            "raw_text": payload.get("raw_text"), "warnings": payload.get("warnings")})
                 elif payload.get("type") == "transcript.stable":
                     record({**base, "event": "ws_stable", "segment_id": payload.get("segment_id"),
                             "segment_index": payload.get("segment_index"),
