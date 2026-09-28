@@ -173,6 +173,13 @@ void tea_caption_state_set_stable_tail_lines(tea_caption_state_t *state, bool en
 void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, tea_caption_snapshot_t *out);
 void tea_caption_snapshot_free(tea_caption_snapshot_t *snapshot);
 
+/* How the newest final closed its line (stable mode): 1 = the final continued
+ * what was shown, 2 = the shown tail was kept (the final dropped a phrase),
+ * 3 = the final replaced the unconfirmed tail. 0 before any final.
+ * Diagnostics / tests/replay only. */
+int tea_caption_state_last_close(tea_caption_state_t *state);
+#define TEA_CAPTION_STATE_HAS_LAST_CLOSE 1
+
 #ifdef __cplusplus
 }
 #endif

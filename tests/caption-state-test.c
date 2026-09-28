@@ -124,15 +124,15 @@ static void test_stable_closing_states(void)
 	tea_caption_state_set_max_lines(st, 3);
 	tea_caption_state_set_stable_mode(st, true);
 
-	/* diverged: the final rewrote committed text; the screen keeps it and
-	 * only gets the final's tail. */
+	/* diverged: the final rewrote a committed character; the screen keeps
+	 * the committed text and gets the final's part after it right away. */
 	tea_caption_state_on_stable(st, "s", "div", 0, 1, "今天天氣", "open");
 	tea_caption_state_on_final_indexed(st, "s", "div", 0, 4, "今天天汽很好");
-	expect_render(st, "今天天氣", "a non-extending final never rewrites committed text");
-	expect(!tea_caption_state_last_line_is_partial(st),
-	       "the line closes at the final (for fading); the diverged stable may still extend it");
+	expect_render(st, "今天天氣很好", "a non-extending final never rewrites committed text, its rest follows");
+	expect(tea_caption_state_last_close(st) == 3, "the final's remainder was taken");
+	expect(!tea_caption_state_last_line_is_partial(st), "the line closes at the final");
 	tea_caption_state_on_stable(st, "s", "div", 0, 2, "今天天氣很好", "diverged");
-	expect_render(st, "今天天氣很好", "state=diverged appends the final's tail");
+	expect_render(st, "今天天氣很好", "the closing diverged stable changes nothing");
 	expect(!tea_caption_state_last_line_is_partial(st), "state=diverged closes the line");
 	expect(tea_caption_state_stable_mismatches(st) == 0, "a diverged final is not a mismatch");
 
@@ -367,15 +367,17 @@ static void test_unstable_tail(void)
 	expect_tail(st, "下一句", "話", "a closing stable shorter than what is shown keeps the shown tail");
 	expect(!tea_caption_state_last_line_is_partial(st), "the line is closed");
 
-	/* a final that does not extend the committed text keeps the tail until
-	 * the closing "diverged" stable right behind it: no committed-only gap */
+	/* a final that differs replaces the tail with its own part after the
+	 * committed text; the closing "diverged" stable behind it changes nothing */
 	tea_caption_state_on_stable(st, "s", "seg-e", 4, 1, "第五句", "open");
 	tea_caption_state_on_partial(st, "s", "seg-e", 1, "第五句話");
-	tea_caption_state_on_final(st, "s", "seg-e", 2, "第五個");
-	expect_tail(st, "第五句", "話", "a final that differs from what is shown never replaces it");
-	expect(!tea_caption_state_last_line_is_partial(st), "but the line closes (for fading)");
-	tea_caption_state_on_stable(st, "s", "seg-e", 4, 2, "第五句個", "diverged");
-	expect_tail(st, "第五句", "話", "nor does the diverged closing stable rewrite it");
+	tea_caption_state_on_final(st, "s", "seg-e", 2, "第五個問題");
+	expect_tail(st, "第五句問題", NULL,
+		    "a final that differs replaces the unconfirmed tail with its own remainder; committed text stays");
+	expect(tea_caption_state_last_close(st) == 3, "the final was taken");
+	expect(!tea_caption_state_last_line_is_partial(st), "the line closes");
+	tea_caption_state_on_stable(st, "s", "seg-e", 4, 2, "第五句個問題", "diverged");
+	expect_tail(st, "第五句問題", NULL, "the diverged closing stable changes nothing");
 	/* the real-model case: the final drops the phrase the tail showed */
 	tea_caption_state_on_stable(st, "s", "seg-f", 5, 1, "醉人的芬芳。", "open");
 	tea_caption_state_on_partial(st, "s", "seg-f", 1, "醉人的芬芳。步伐踉蹌，險些跌倒在地。");
@@ -383,6 +385,23 @@ static void test_unstable_tail(void)
 	tea_caption_state_on_stable(st, "s", "seg-f", 5, 2, "醉人的芬芳。", "final");
 	expect_tail(st, "醉人的芬芳。", "步伐踉蹌，險些跌倒在地",
 		    "a final shorter than what is shown keeps the phrase the viewer already read");
+	expect(tea_caption_state_last_close(st) == 2, "phrase drop: the shown tail was kept");
+	/* the e2e stable_tail case: the audio ends, the last partial falls back to
+	 * the committed text and the final is the shown text minus its end */
+	tea_caption_state_on_stable(st, "s", "seg-h", 5, 1, "然後喝", "open");
+	tea_caption_state_on_partial(st, "s", "seg-h", 1, "然後喝杯茶啊");
+	tea_caption_state_on_partial(st, "s", "seg-h", 2, "然後喝");
+	tea_caption_state_on_final(st, "s", "seg-h", 3, "然後喝");
+	expect_tail(st, "然後喝", "杯茶啊", "a truncated final never retracts the shown tail");
+	expect(tea_caption_state_last_close(st) == 2, "truncation: the shown tail was kept");
+	/* the fake backend's final swaps the last committed character for a
+	 * filler: its remainder after the committed text is empty, so taking it
+	 * would only cut the tail off */
+	tea_caption_state_on_stable(st, "s", "seg-i", 5, 1, "然後喝", "open");
+	tea_caption_state_on_partial(st, "s", "seg-i", 1, "然後喝杯茶嗯");
+	tea_caption_state_on_final(st, "s", "seg-i", 2, "然後啊");
+	expect_tail(st, "然後喝", "杯茶嗯", "a final adding nothing after the committed text keeps the tail");
+	expect(tea_caption_state_last_close(st) == 2, "nothing to take: the shown tail was kept");
 	/* a closing stable that extends what is shown is shown */
 	tea_caption_state_on_stable(st, "s", "seg-g", 6, 1, "好的", "open");
 	tea_caption_state_on_partial(st, "s", "seg-g", 1, "好的謝謝");
@@ -405,16 +424,17 @@ static void test_unstable_tail(void)
 
 static void test_close_with_tails_hidden(void)
 {
-	/* Tails not shown: what is shown is the committed text only, so a
-	 * diverged close may still append the final's text after it. */
+	/* Tails not shown: what is shown is the committed text only; a final
+	 * that rewrites a committed character keeps the committed text and adds
+	 * its own part after it. */
 	tea_caption_state_t *st = tea_caption_state_create();
 	tea_caption_state_set_stable_mode(st, true);
 	tea_caption_state_on_stable(st, "s", "seg-a", 0, 1, "第五句", "open");
 	tea_caption_state_on_partial(st, "s", "seg-a", 1, "第五句話");
-	tea_caption_state_on_final(st, "s", "seg-a", 2, "第五個");
-	expect_render(st, "第五句", "a diverging final keeps the committed text");
-	tea_caption_state_on_stable(st, "s", "seg-a", 0, 2, "第五句個", "diverged");
-	expect_render(st, "第五句個", "the diverged closing stable extends what is shown");
+	tea_caption_state_on_final(st, "s", "seg-a", 2, "第五個問題。");
+	expect_render(st, "第五句問題。", "committed text kept, the final's part after it follows");
+	tea_caption_state_on_stable(st, "s", "seg-a", 0, 2, "第五句問題。", "diverged");
+	expect_render(st, "第五句問題。", "the diverged closing stable changes nothing");
 	tea_caption_snapshot_t snap;
 	tea_caption_state_snapshot(st, true, &snap);
 	expect(snap.count == 1 && snap.lines[0].tail == NULL, "no hidden tail is kept after the close");
@@ -481,6 +501,181 @@ static void test_activity(void)
 	tea_caption_state_destroy(st);
 }
 
+/* ---------------- real sequences from a user's live trace ----------------
+ * tea-trace-20260928-080614-b1636511.jsonl (300 ms preview cadence, end
+ * silence 300 ms), segments 4, 7, 8, 14 and 15, event for event. */
+
+#include "caption-align.h"
+
+enum { TEA_EV_P, TEA_EV_S, TEA_EV_F };
+typedef struct {
+	int kind;
+	uint64_t rev;
+	const char *text;
+	const char *state;
+} tea_trace_ev_t;
+
+/* Plays a segment; after every event checks that the shown text never
+ * repeats a 4+ character run more often than the segment's final has it.
+ * Returns the shown text (committed + tail) after the final, bfree()-able. */
+static char *play_segment(const tea_trace_ev_t *evs, size_t n, const char *final_text, const char *name)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_set_stable_tail_lines(st, true);
+	tea_norm_t fin;
+	tea_norm_build(final_text, strlen(final_text), &fin);
+	for (size_t i = 0; i < n; i++) {
+		const tea_trace_ev_t *e = &evs[i];
+		if (e->kind == TEA_EV_P)
+			tea_caption_state_on_partial(st, "s", name, e->rev, e->text);
+		else if (e->kind == TEA_EV_S)
+			tea_caption_state_on_stable(st, "s", name, 0, e->rev, e->text, e->state);
+		else
+			tea_caption_state_on_final_indexed(st, "s", name, 0, e->rev, e->text);
+		tea_caption_snapshot_t snap;
+		tea_caption_state_snapshot(st, true, &snap);
+		if (snap.count == 1) {
+			char shown[4096];
+			snprintf(shown, sizeof(shown), "%s%s", snap.lines[0].text,
+				 snap.lines[0].tail ? snap.lines[0].tail : "");
+			tea_norm_t norm;
+			tea_norm_build(shown, strlen(shown), &norm);
+			if (tea_norm_has_new_repeat(&norm, &fin, 4)) {
+				fprintf(stderr, "%s event %zu shows [%s]\n", name, i, shown);
+				expect(false, "a real sequence never shows a phrase twice");
+			}
+		}
+		tea_caption_snapshot_free(&snap);
+	}
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	expect(snap.count == 1, "one line");
+	char *shown = bmalloc(strlen(snap.lines[0].text) + (snap.lines[0].tail ? strlen(snap.lines[0].tail) : 0) + 1);
+	strcpy(shown, snap.lines[0].text);
+	if (snap.lines[0].tail)
+		strcat(shown, snap.lines[0].tail);
+	tea_caption_snapshot_free(&snap);
+	tea_caption_state_destroy(st);
+	return shown;
+}
+static const tea_trace_ev_t k_seg4[] = {
+	{TEA_EV_P, 1, "對。", NULL},
+	{TEA_EV_P, 2, "對因為", NULL},
+	{TEA_EV_S, 1, "對", "open"},
+	{TEA_EV_P, 3, "對，因爲我我", NULL},
+	{TEA_EV_P, 4, "對因為我我今天", NULL},
+	{TEA_EV_P, 5, "對因為我我今天也有跟", NULL},
+	{TEA_EV_S, 2, "對因為我我今天", "open"},
+	{TEA_EV_P, 6, "對因為我我今天也有跟大家聊。", NULL},
+	{TEA_EV_S, 3, "對因為我我今天也有跟", "open"},
+	{TEA_EV_P, 7, "對因為我我今天也跟大家聊一聊。", NULL},
+	{TEA_EV_P, 8, "對因為我我今天也跟大家聊一聊。", NULL},
+	{TEA_EV_P, 9, "對因為我我今天也有跟大家聊一聊然後。", NULL},
+	{TEA_EV_P, 10, "對因為我我今天也有跟大家聊一聊然後你也有。", NULL},
+	{TEA_EV_S, 4, "對因為我我今天也有跟大家聊一聊然後", "open"},
+	{TEA_EV_P, 11, "對因為我我今天也有跟大家聊一聊然後你也有談到。", NULL},
+	{TEA_EV_S, 5, "對因為我我今天也有跟大家聊一聊然後你也有", "open"},
+	{TEA_EV_P, 12, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個。", NULL},
+	{TEA_EV_S, 6, "對因為我我今天也有跟大家聊一聊然後你也有談到", "open"},
+	{TEA_EV_P, 13, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個。", NULL},
+	{TEA_EV_S, 7, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個", "open"},
+	{TEA_EV_P, 14, "對，因為我我今天也有跟大家聊一聊，然後你也有談到說那個呃。", NULL},
+	{TEA_EV_P, 15, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個呃你本來。", NULL},
+	{TEA_EV_F, 16, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個呃你本來跟", NULL},
+	{TEA_EV_S, 8, "對因為我我今天也有跟大家聊一聊然後你也有談到說那個呃你本來跟", "final"},
+};
+static const tea_trace_ev_t k_seg7[] = {
+	{TEA_EV_P, 1, "後來。", NULL},
+	{TEA_EV_P, 2, "後來在這。", NULL},
+	{TEA_EV_S, 1, "後來", "open"},
+	{TEA_EV_P, 3, "後來在這三個禮拜", NULL},
+	{TEA_EV_S, 2, "後來在這", "open"},
+	{TEA_EV_P, 4, "後來在這三個禮拜。", NULL},
+	{TEA_EV_S, 3, "後來在這三個禮拜", "open"},
+	{TEA_EV_P, 5, "後來在這三個禮拜突然", NULL},
+	{TEA_EV_P, 6, "後來在這三個禮拜突然。", NULL},
+	{TEA_EV_S, 4, "後來在這三個禮拜突然", "open"},
+	{TEA_EV_P, 7, "後來在這三個禮拜突然找到。", NULL},
+	{TEA_EV_P, 8, "後來在這三個禮拜突然找到你人生。", NULL},
+	{TEA_EV_S, 5, "後來在這三個禮拜突然找到", "open"},
+	{TEA_EV_P, 9, "後來在這三個禮拜突然找到你人生可以。", NULL},
+	{TEA_EV_S, 6, "後來在這三個禮拜突然找到你人生", "open"},
+	{TEA_EV_P, 10, "後來在這三個禮拜突然找到你人生可以做的一些事情。", NULL},
+	{TEA_EV_S, 7, "後來在這三個禮拜突然找到你人生可以", "open"},
+	{TEA_EV_P, 11, "後來在這三個禮拜突然找到你人生可以做的事。", NULL},
+	{TEA_EV_S, 8, "後來在這三個禮拜突然找到你人生可以做的", "open"},
+	{TEA_EV_P, 12, "後來在這三個禮拜突然找到你人生可以做的勢力點。", NULL},
+	{TEA_EV_F, 13, "後來在這三個禮拜突然找到你人生可以做的勢力點。", NULL},
+	{TEA_EV_S, 9, "後來在這三個禮拜突然找到你人生可以做的勢力點。", "final"},
+};
+static const tea_trace_ev_t k_seg8[] = {
+	{TEA_EV_P, 1, "比較。", NULL},     {TEA_EV_P, 2, "比較", NULL},   {TEA_EV_S, 1, "比較", "open"},
+	{TEA_EV_P, 3, "對對對", NULL},     {TEA_EV_P, 4, "對對對", NULL}, {TEA_EV_F, 5, "因為", NULL},
+	{TEA_EV_S, 2, "比較", "diverged"},
+};
+static const tea_trace_ev_t k_seg14[] = {
+	{TEA_EV_P, 1, "啊，給。", NULL},
+	{TEA_EV_P, 2, "okay拜拜收工", NULL},
+	{TEA_EV_P, 3, "okaybyebye so byebye so", NULL},
+	{TEA_EV_F, 4, "啊，可以，快快走，快快走。", NULL},
+	{TEA_EV_S, 1, "啊，可以，快快走，快快走。", "final"},
+};
+static const tea_trace_ev_t k_seg15[] = {
+	{TEA_EV_P, 1, "真正", NULL},
+	{TEA_EV_P, 2, "真正好的。", NULL},
+	{TEA_EV_S, 1, "真正", "open"},
+	{TEA_EV_P, 3, "真正好的教育。", NULL},
+	{TEA_EV_S, 2, "真正好的", "open"},
+	{TEA_EV_P, 4, "真正好的教育當中不", NULL},
+	{TEA_EV_S, 3, "真正好的教育", "open"},
+	{TEA_EV_P, 5, "真正好的教育當中不是讓", NULL},
+	{TEA_EV_S, 4, "真正好的教育當中不", "open"},
+	{TEA_EV_P, 6, "真正好的教育當中不是讓你", NULL},
+	{TEA_EV_S, 5, "真正好的教育當中不是讓", "open"},
+	{TEA_EV_P, 7, "真正好的教育當中不是讓你不學習。", NULL},
+	{TEA_EV_S, 6, "真正好的教育當中不是讓你", "open"},
+	{TEA_EV_P, 8, "真正好的教育當中不是讓你不需要別人。", NULL},
+	{TEA_EV_S, 7, "真正好的教育當中不是讓你不", "open"},
+	{TEA_EV_P, 9, "真正好的教育當中，不是讓你不需要別人。", NULL},
+	{TEA_EV_F, 10, "真正好的教育當中不是讓你不需要別人。", NULL},
+	{TEA_EV_S, 8, "真正好的教育當中不是讓你不需要別人。", "final"},
+};
+
+#define TEA_N(a) (sizeof(a) / sizeof((a)[0]))
+
+static void test_real_trace_sequences(void)
+{
+	/* seg 4: the partials restate the committed text with commas added;
+	 * matched ignoring punctuation, nothing is shown twice, and the final
+	 * (which continues the committed text) is what the line ends with. */
+	char *s4 = play_segment(k_seg4, TEA_N(k_seg4), k_seg4[TEA_N(k_seg4) - 2].text, "seg4");
+	expect(strcmp(s4, k_seg4[TEA_N(k_seg4) - 2].text) == 0, "seg 4 ends with its final, once");
+	bfree(s4);
+
+	/* seg 7: the dim tail said 一些事情, the final 勢力點: the final wins */
+	char *s7 = play_segment(k_seg7, TEA_N(k_seg7), k_seg7[TEA_N(k_seg7) - 2].text, "seg7");
+	expect(strcmp(s7, "後來在這三個禮拜突然找到你人生可以做的勢力點。") == 0,
+	       "seg 7: the final replaces the dim tail");
+	bfree(s7);
+
+	/* seg 8: committed 比較, dim 對對對, final 因為 (does not contain the
+	 * committed text): committed text stays, the final follows it */
+	char *s8 = play_segment(k_seg8, TEA_N(k_seg8), k_seg8[TEA_N(k_seg8) - 2].text, "seg8");
+	expect(strcmp(s8, "比較因為") == 0, "seg 8: committed text kept, the final replaces the dim tail");
+	bfree(s8);
+
+	/* seg 14: no committed text, dim "okaybyebye so byebye so", a different final */
+	char *s14 = play_segment(k_seg14, TEA_N(k_seg14), "okaybyebye so byebye so", "seg14");
+	expect(strcmp(s14, "啊，可以，快快走，快快走。") == 0, "seg 14: the final replaces an unrelated dim tail");
+	bfree(s14);
+
+	/* seg 15: a comma inside a restatement used to duplicate the sentence */
+	char *s15 = play_segment(k_seg15, TEA_N(k_seg15), k_seg15[TEA_N(k_seg15) - 2].text, "seg15");
+	expect(strcmp(s15, "真正好的教育當中不是讓你不需要別人。") == 0, "seg 15 ends with its final, once");
+	bfree(s15);
+}
+
 int main(void)
 {
 	tea_caption_state_t *state = tea_caption_state_create();
@@ -526,6 +721,7 @@ int main(void)
 	test_tail_only_lines();
 	test_close_with_tails_hidden();
 	test_activity();
+	test_real_trace_sequences();
 
 	puts("caption state tests passed");
 	return EXIT_SUCCESS;

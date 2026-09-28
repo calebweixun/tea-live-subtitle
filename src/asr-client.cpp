@@ -493,6 +493,11 @@ void TeaAsrClient::resetProtocolStateLocked()
 	stableRequested_ = false;
 	stableActive_ = false;
 	stableMismatchLogged_ = false;
+	segmentErrors_ = 0;
+	lastSegmentErrorLogMs_ = -1;
+	lastPreviewStatus_.clear();
+	lastPreviewLogMs_ = -1;
+	previewChangesUnlogged_ = 0;
 	segmentationRequested_ = 0;
 	effectiveEndSilence_ = -1;
 	nextSeq_ = 0;
@@ -1341,6 +1346,48 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		QString segId = obj.value(QStringLiteral("segment_id")).toString();
 		tea_caption_state_on_segment_dropped(captions_, sessionId_.toUtf8().constData(),
 						     segId.toUtf8().constData());
+		if (type == QLatin1String("segment.error")) {
+			/* Every segment failing (e.g. code invalid_ipc: the server's
+			 * worker is broken) means no captions at all: say so, at most
+			 * once per 30 s, with a count. */
+			segmentErrors_++;
+			const qint64 now = nowMs();
+			if (lastSegmentErrorLogMs_ < 0 || now - lastSegmentErrorLogMs_ >= TEA_WARN_REPEAT_MS) {
+				obs_log(LOG_WARNING,
+					"asr-client: WARN the server could not transcribe a segment: code=%s retryable=%d "
+					"(%s); %llu segment error(s) this session",
+					obj.value(QStringLiteral("code")).toString().toUtf8().constData(),
+					obj.value(QStringLiteral("retryable")).toBool(false) ? 1 : 0,
+					obj.value(QStringLiteral("message")).toString().toUtf8().constData(),
+					(unsigned long long)segmentErrors_);
+				lastSegmentErrorLogMs_ = now;
+			}
+		}
+		return;
+	}
+
+	if (type == QLatin1String("preview.status")) {
+		/* Server-side preview state. Logged when it changes, at most once per
+		 * 30 s (load pauses may come and go), except that a pause for
+		 * backend_error is always logged, as a warning. */
+		const QString state = obj.value(QStringLiteral("state")).toString();
+		const QString reason = obj.value(QStringLiteral("reason")).toString();
+		const QString combined = state + QLatin1Char('/') + reason;
+		if (combined != lastPreviewStatus_) {
+			lastPreviewStatus_ = combined;
+			const bool backendError = reason == QLatin1String("backend_error");
+			const qint64 now = nowMs();
+			if (backendError || lastPreviewLogMs_ < 0 || now - lastPreviewLogMs_ >= TEA_WARN_REPEAT_MS) {
+				obs_log(backendError ? LOG_WARNING : LOG_INFO,
+					"asr-client: %sserver preview %s: %s (%llu earlier change(s) not logged)",
+					backendError ? "WARN " : "", state.toUtf8().constData(),
+					reason.toUtf8().constData(), (unsigned long long)previewChangesUnlogged_);
+				lastPreviewLogMs_ = now;
+				previewChangesUnlogged_ = 0;
+			} else {
+				previewChangesUnlogged_++;
+			}
+		}
 		return;
 	}
 

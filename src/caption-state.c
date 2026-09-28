@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "caption-state.h"
+#include "caption-align.h"
 
 #include <util/threading.h>
 #include <util/bmem.h>
@@ -35,7 +36,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * trivial ~20KB memory cost. This is still a fixed-size table, not true
  * whole-session dedup -- it just pushes the failure window from minutes to
  * well beyond what v0.1's once-only, TCP-ordered wire protocol is expected
- * to need. */
+ * to need.
+ * With short segments (end_silence_ms 300, a 300 ms preview cadence) a
+ * session makes ~15 segments a minute (63 in the 4-minute user trace of
+ * 2026-09-28), so 256 slots hold ~17 minutes, not an hour. That is still
+ * enough: an entry only matters while events for its segment can arrive,
+ * and in the real traces at most one other segment starts between a
+ * segment's first and last event, and no event arrives after a segment's
+ * final. Replaying those traces with 2 or 16 slots gives output
+ * identical to 256. */
 #define TEA_MAX_TRACKED_SEGMENTS 256
 #define TEA_ID_BUF 64
 /* Order key = (session epoch << TEA_ORDER_EPOCH_SHIFT) | segment_index, so
@@ -67,7 +76,8 @@ typedef struct {
 	 * taken from this segment's partials and kept until a newer valid one
 	 * replaces it (see tea_hold_tail_locked()). Never copied into `text`. */
 	char *partial;
-	uint64_t activity; /* bumped by every transcript event of this segment */
+	char *last_partial; /* the newest partial of the segment, as received */
+	uint64_t activity;  /* bumped by every transcript event of this segment */
 	bool open;
 	/* The shown text (committed + tail) is what the line ends with: nothing
 	 * may change it any more. Set when the segment closes. */
@@ -102,6 +112,7 @@ struct tea_caption_state {
 	uint64_t next_key;
 	uint64_t revision;
 	uint64_t activity; /* bumped by every transcript event of the session */
+	int last_close;    /* TEA_CLOSE_* of the newest final (diagnostics / replay) */
 	bool stable_tail_lines;
 };
 
@@ -124,6 +135,7 @@ static void tea_drop_oldest_line_locked(tea_caption_state_t *st)
 		return;
 	bfree(st->lines[0].text);
 	bfree(st->lines[0].partial);
+	bfree(st->lines[0].last_partial);
 	memmove(&st->lines[0], &st->lines[1], sizeof(tea_caption_line_t) * (size_t)(st->line_count - 1));
 	st->line_count--;
 	memset(&st->lines[st->line_count], 0, sizeof(tea_caption_line_t));
@@ -134,8 +146,10 @@ static void tea_clear_finalized_locked(tea_caption_state_t *st)
 	for (int i = 0; i < st->line_count; i++) {
 		bfree(st->lines[i].text);
 		bfree(st->lines[i].partial);
+		bfree(st->lines[i].last_partial);
 		st->lines[i].text = NULL;
 		st->lines[i].partial = NULL;
+		st->lines[i].last_partial = NULL;
 	}
 	memset(st->lines, 0, sizeof(st->lines));
 	st->line_count = 0;
@@ -203,83 +217,39 @@ static size_t tea_utf8_count(const char *text, size_t len)
 	return n;
 }
 
-/* Byte offset of the code point after the first `chars` code points. */
-static size_t tea_utf8_skip(const char *text, size_t len, size_t chars)
+/* Normalised copy of committed + candidate tail, for the duplicate guard. */
+static void tea_norm_concat(const char *a, size_t a_len, const char *b, size_t b_len, tea_norm_t *out)
 {
-	size_t i = 0;
-	while (i < len && chars > 0) {
-		i++;
-		while (i < len && ((unsigned char)text[i] & 0xC0) == 0x80)
-			i++;
-		chars--;
+	tea_norm_t tail;
+	tea_norm_build(a, a_len, out);
+	tea_norm_build(b, b_len, &tail);
+	for (int i = 0; i < tail.n && out->n < TEA_NORM_MAX; i++) {
+		out->cp[out->n] = tail.cp[i];
+		out->end[out->n] = 0; /* positions are not needed for the guard */
+		out->n++;
 	}
-	return chars == 0 ? i : len;
 }
 
-static size_t tea_utf8_next(const char *text, size_t len, size_t i)
-{
-	i++;
-	while (i < len && ((unsigned char)text[i] & 0xC0) == 0x80)
-		i++;
-	return i;
-}
+/* Showing `committed` + `tail` must not repeat a run of this many normalised
+ * characters more often than the server's own text (`ref`) has it. */
+#define TEA_DUP_GUARD_CHARS 4
+/* A new offer that differs from the shown tail by at most one edit per this
+ * many characters (at least one) only appends to it. */
+#define TEA_TAIL_KEEP_CHARS_PER_EDIT 10
 
-/* Byte length of leading sentence punctuation (see tea_trim_hypothesis_end()). */
-static size_t tea_leading_marks(const char *text, size_t len)
+static bool tea_would_duplicate(const char *committed, const char *tail, size_t tail_len, const char *ref)
 {
-	size_t i = 0;
-	while (i < len) {
-		size_t next = tea_utf8_next(text, len, i);
-		if (tea_trim_hypothesis_end(text + i, next - i) != 0)
-			break;
-		i = next;
-	}
-	return i;
-}
-
-/*
- * Where the text after the committed text starts inside a partial:
- *   1. the partial starts with the committed text: right after it;
- *   2. the partial starts with the end of the committed text (at least two
- *      characters): after that overlap -- the preview window moved on;
- *   3. the partial restates the committed text with some characters changed
- *      (at least half of the first characters agree): after as many
- *      characters as the committed text has -- how the server itself closes
- *      a diverged segment;
- *   4. otherwise the partial is new speech (the real model often previews
- *      only the latest phrase of a long segment): all of it.
- */
-static size_t tea_tail_start(const char *committed, size_t committed_len, const char *partial, size_t partial_len)
-{
-	if (partial_len >= committed_len && memcmp(partial, committed, committed_len) == 0)
-		return committed_len;
-	for (size_t s = committed_len > 0 ? tea_utf8_next(committed, committed_len, 0) : 0; s < committed_len;
-	     s = tea_utf8_next(committed, committed_len, s)) {
-		size_t overlap = committed_len - s;
-		if (tea_utf8_count(committed + s, overlap) < 2)
-			break;
-		if (partial_len >= overlap && memcmp(partial, committed + s, overlap) == 0)
-			return overlap;
-	}
-	size_t chars = tea_utf8_count(committed, committed_len);
-	size_t same = 0, ci = 0, pi = 0;
-	for (size_t n = 0; n < chars && ci < committed_len && pi < partial_len; n++) {
-		size_t cn = tea_utf8_next(committed, committed_len, ci);
-		size_t pn = tea_utf8_next(partial, partial_len, pi);
-		if (cn - ci == pn - pi && memcmp(committed + ci, partial + pi, cn - ci) == 0)
-			same++;
-		ci = cn;
-		pi = pn;
-	}
-	if (chars > 0 && same * 2 >= chars)
-		return tea_utf8_skip(partial, partial_len, chars);
-	return 0;
+	tea_norm_t display, reference;
+	tea_norm_concat(committed, strlen(committed), tail, tail_len, &display);
+	tea_norm_build(ref, strlen(ref), &reference);
+	return tea_norm_has_new_repeat(&display, &reference, TEA_DUP_GUARD_CHARS);
 }
 
 /*
  * Must hold state->lock. A new transcript.partial for an open stable line
- * offers a new unstable tail: the text it has after the committed text (see
- * tea_tail_start()). Shown text must never go backwards, so:
+ * offers a new unstable tail: the text it has after the committed text,
+ * found punctuation-insensitively (tea_align_after_committed() in
+ * caption-align.h). Shown text must never go backwards, so:
  *   - trailing sentence punctuation of the hypothesis is not shown (see
  *     tea_trim_hypothesis_end());
  *   - an offer that, ignoring leading punctuation, continues the tail on
@@ -294,24 +264,54 @@ static void tea_hold_tail_locked(tea_caption_line_t *line, const char *partial)
 {
 	if (!partial)
 		return;
+	bfree(line->last_partial);
+	line->last_partial = bstrdup(partial);
 	size_t shown = strlen(line->text);
 	size_t incoming = strlen(partial);
-	size_t from = tea_tail_start(line->text, shown, partial, incoming);
+	size_t from = 0;
+	if (tea_align_after_committed(line->text, shown, partial, incoming, false, &from) == TEA_ALIGN_NONE)
+		return; /* restates committed words in a way that cannot be placed: offer nothing */
 	if (from >= incoming)
 		return;
 	const char *candidate = partial + from;
 	size_t candidate_len = tea_trim_hypothesis_end(candidate, incoming - from);
 	if (candidate_len == 0)
 		return;
+	if (tea_would_duplicate(line->text, candidate, candidate_len, partial))
+		return; /* never show a phrase twice that the server says once */
 	if (line->partial) {
 		size_t held = strlen(line->partial);
-		size_t lead = tea_leading_marks(candidate, candidate_len);
-		if (candidate_len - lead >= held && memcmp(candidate + lead, line->partial, held) == 0) {
-			candidate += lead; /* continues the shown tail: keep it, append */
-			candidate_len -= lead;
-		} else if (tea_utf8_count(candidate, candidate_len) < tea_utf8_count(line->partial, held)) {
+		/* An offer that restates the shown tail with at most a tiny change
+		 * (a filler "啊" coming and going, a comma) keeps the shown words and
+		 * only appends what is new: the whole dim line does not shift. */
+		tea_norm_t held_norm, cand_norm;
+		tea_norm_build(line->partial, held, &held_norm);
+		tea_norm_build(candidate, candidate_len, &cand_norm);
+		int keep = 0, j = 0;
+		tea_norm_agreeing_prefix(&held_norm, &cand_norm, TEA_TAIL_KEEP_CHARS_PER_EDIT, &keep, &j);
+		if (keep > 0) {
+			/* keep the shown words the offer agrees with (up to tiny
+			 * changes), take the offer's text only after that point */
+			const size_t keep_bytes = keep == held_norm.n ? held : tea_norm_byte_after(&held_norm, keep);
+			const size_t from_byte = tea_norm_byte_after(&cand_norm, j);
+			const size_t rest = from_byte < candidate_len ? candidate_len - from_byte : 0;
+			if (keep == held_norm.n && rest == 0)
+				return; /* nothing new */
+			char *merged = bmalloc(keep_bytes + rest + 1);
+			memcpy(merged, line->partial, keep_bytes);
+			memcpy(merged + keep_bytes, candidate + from_byte, rest);
+			merged[keep_bytes + rest] = '\0';
+			if (tea_utf8_count(merged, keep_bytes + rest) < tea_utf8_count(line->partial, held) ||
+			    tea_would_duplicate(line->text, merged, keep_bytes + rest, partial)) {
+				bfree(merged); /* would retract, or repeat a phrase */
+				return;
+			}
+			bfree(line->partial);
+			line->partial = merged;
 			return;
 		}
+		if (tea_utf8_count(candidate, candidate_len) < tea_utf8_count(line->partial, held))
+			return;
 		if (candidate_len == held && memcmp(line->partial, candidate, held) == 0)
 			return;
 	}
@@ -338,6 +338,18 @@ static void tea_rebase_tail_locked(tea_caption_line_t *line, size_t old_committe
 		return;
 	if (grown < tail && memcmp(line->partial, line->text + old_committed_len, grown) == 0) {
 		char *rest = tea_strdup_n(line->partial + grown, tail - grown);
+		bfree(line->partial);
+		line->partial = rest;
+		return;
+	}
+	/* The commit may differ from the tail in punctuation only ("聊一聊，然後"
+	 * shown, "聊一聊然後" committed): align the new committed part with the
+	 * tail ignoring punctuation and keep what follows. */
+	size_t from = 0;
+	const char *added = line->text + old_committed_len;
+	if (tea_align_after_committed(added, grown, line->partial, tail, false, &from) == TEA_ALIGN_PREFIX &&
+	    from < tail) {
+		char *rest = tea_strdup_n(line->partial + from, tail - from);
 		bfree(line->partial);
 		line->partial = rest;
 		return;
@@ -373,6 +385,84 @@ static void tea_settle_line_locked(tea_caption_state_t *st, tea_caption_line_t *
 	line->settled = true;
 	if (!st->stable_tail_lines)
 		tea_clear_partial(line); /* not shown: nothing to keep */
+}
+
+/*
+ * Must hold state->lock. The segment's final arrived: decide what the line
+ * ends with. Committed text is never removed. What the viewer sees is
+ * shown = committed + tail (the tail only when tails are shown).
+ *
+ *   1. The final continues what is shown (ignoring punctuation): show it.
+ *   2. Phrase drop -- the final adds nothing to what is shown and is shorter,
+ *      and the tail still agrees with the newest partial: the real model
+ *      often drops a whole phrase of a two-phrase segment from its final
+ *      (seen in real traces); the tail is then the only place those words
+ *      exist, and replacing it would take back text the viewer read. Keep
+ *      the shown text.
+ *   3. Otherwise the final wins over the dim, unconfirmed tail: the line
+ *      becomes committed text + the final's part after the committed text
+ *      (aligned punctuation-insensitively; if the final does not contain the
+ *      committed text at all, all of it follows, minus anything that would
+ *      repeat committed words). Correcting dim words is the tail's nature.
+ *
+ * Returns what happened, for the replay tool's close audit.
+ */
+#define TEA_CLOSE_EXTENDS 1
+#define TEA_CLOSE_KEPT_TAIL 2
+#define TEA_CLOSE_TOOK_FINAL 3
+static int tea_close_with_final_locked(tea_caption_state_t *st, tea_caption_line_t *line, const char *final_text)
+{
+	const char *tail = (st->stable_tail_lines && line->partial) ? line->partial : "";
+	const size_t committed_len = strlen(line->text);
+	const size_t tail_len = strlen(tail);
+	const size_t final_len = final_text ? strlen(final_text) : 0;
+	if (!final_text)
+		return TEA_CLOSE_KEPT_TAIL;
+
+	tea_norm_t shown, fin;
+	tea_norm_concat(line->text, committed_len, tail, tail_len, &shown);
+	tea_norm_build(final_text, final_len, &fin);
+
+	int result;
+	if (tea_norm_starts_with(&fin, &shown)) {
+		result = TEA_CLOSE_EXTENDS;
+	} else if (tail_len > 0 && fin.n < shown.n && tea_norm_contains(&shown, &fin)) {
+		tea_norm_t latest, tail_norm;
+		tea_norm_build(line->last_partial ? line->last_partial : "",
+			       line->last_partial ? strlen(line->last_partial) : 0, &latest);
+		tea_norm_build(tail, tail_len, &tail_norm);
+		/* Keep the tail while the model still offers it. */
+		result = tea_norm_contains(&latest, &tail_norm) ? TEA_CLOSE_KEPT_TAIL : TEA_CLOSE_TOOK_FINAL;
+	} else {
+		result = TEA_CLOSE_TOOK_FINAL;
+	}
+	if (result == TEA_CLOSE_KEPT_TAIL)
+		return result;
+
+	/* committed text + the final's part after it */
+	size_t from = 0;
+	tea_align_after_committed(line->text, committed_len, final_text, final_len, true, &from);
+	if (from > final_len)
+		from = final_len;
+	if (result == TEA_CLOSE_TOOK_FINAL && tail_len > 0) {
+		/* A result that is what is shown minus its end corrects nothing:
+		 * taking it would only retract words (the model dropped the last
+		 * phrase, or the audio ended and the final stops at the committed
+		 * text). */
+		tea_norm_t taken;
+		tea_norm_concat(line->text, committed_len, final_text + from, final_len - from, &taken);
+		if (taken.n < shown.n && tea_norm_starts_with(&shown, &taken))
+			return TEA_CLOSE_KEPT_TAIL;
+	}
+	if (from < final_len) {
+		char *grown = bmalloc(committed_len + (final_len - from) + 1);
+		memcpy(grown, line->text, committed_len);
+		memcpy(grown + committed_len, final_text + from, final_len - from + 1);
+		bfree(line->text);
+		line->text = grown;
+	}
+	tea_clear_partial(line);
+	return result;
 }
 
 /* Must hold state->lock. Any transcript event for a segment is activity:
@@ -777,26 +867,16 @@ void tea_caption_state_on_final_indexed(tea_caption_state_t *state, const char *
 	seg->revision = revision;
 
 	if (state->stable_mode) {
-		/* A final that extends what is shown (committed text + tail) is shown
-		 * at once and ends the line; the closing "final" stable that follows
-		 * is then a no-op. A final that does not -- shorter, or different
-		 * (the real model's final often drops a whole phrase of a two-phrase
-		 * segment) -- is not allowed to take back or rewrite text a viewer
-		 * has read: the line closes (for fading) but keeps what it shows.
-		 * With tails hidden, the closing "diverged" stable that follows may
-		 * still append the final's text after the committed length, as it
-		 * extends what is shown. Transcripts/exports use transcript.final;
-		 * this is display only. */
+		/* The final decides what the line ends with (see
+		 * tea_close_with_final_locked()); the closing stable that follows is
+		 * then a no-op. Transcripts/exports use transcript.final; this is
+		 * display only. */
 		tea_caption_line_t *line = seg->stable_closed ? NULL
 							      : tea_stable_line_locked(state, seg, segment_index);
 		line = tea_stable_fix_order_locked(state, line, segment_index);
 		if (line && !line->settled) {
-			if (tea_extends_shown_locked(state, line, text) && tea_stable_extend_locked(line, text)) {
-				tea_clear_partial(line);
-				tea_settle_line_locked(state, line);
-			} else {
-				line->open = false; /* closed for fading; the closing stable settles it */
-			}
+			state->last_close = tea_close_with_final_locked(state, line, text);
+			tea_settle_line_locked(state, line);
 		}
 		tea_touch_locked(state, line ? line : tea_find_line_locked(state, segment_id));
 		pthread_mutex_unlock(&state->lock);
@@ -1017,4 +1097,12 @@ void tea_caption_snapshot_free(tea_caption_snapshot_t *snapshot)
 		bfree(snapshot->lines[i].tail);
 	}
 	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+int tea_caption_state_last_close(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	int result = state->last_close;
+	pthread_mutex_unlock(&state->lock);
+	return result;
 }
