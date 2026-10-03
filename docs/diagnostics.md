@@ -66,6 +66,11 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 [`recognition-hints.md`](recognition-hints.md#記錄檔)。提示內容本身從不寫進記錄檔：記錄檔裡的 `session.start` 把
 `context` 換成數量。
 
+隱藏字幕（[`phase-b-rendering.md`](phase-b-rendering.md#隱藏字幕唱詩歌與暫停)）的狀態改變也寫 INFO：
+`captions paused (hotkey|button|scene)`／`captions resumed (...)`，以及「自動」模式下
+`captions: singing detected, hiding sung captions`／`captions: speech again, captions shown`。字幕不見時先看有沒有這幾行：
+暫停或唱詩歌隱藏不是故障。capabilities 那一行的 `singing_detection=0/1` 說明 server 有沒有歌唱偵測。
+
 `speech.started` 與 `segment.queued` 用來追蹤上面的語音狀態，`preview.status` 只在狀態改變時記一行，都不再寫成 `unhandled event type`。
 
 ## 畫面上的診斷列
@@ -77,7 +82,8 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 ```
 
 依序是連線狀態、語音狀態、目前輸入音量（最近約 0.5 秒從音訊來源取到的音訊；沒有音訊時顯示「沒有音訊輸入」）、
-距離上次出字的秒數。這一行不淡出、不在文字底色裡，也不算在行數上限裡。建議在預覽用的場景打開，直播場景關閉。
+距離上次出字的秒數。字幕暫停時最後多一段「字幕已暫停」；「唱詩歌時的字幕」是自動、而 server 判定目前在唱歌時多一段
+「♪ 唱詩歌中：字幕隱藏」。這一行不淡出、不在文字底色裡，也不算在行數上限裡。建議在預覽用的場景打開，直播場景關閉。
 
 ## 辨識事件記錄檔
 

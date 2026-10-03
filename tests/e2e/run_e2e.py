@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import secrets
 import signal
@@ -1016,6 +1017,188 @@ def sc_hints_real_unknown_profile(ctx) -> Checker:
     return c, run
 
 
+# --------------------------------------------------------------------------- singing / pause
+
+TAG = re.compile(r"§(\d+)")
+
+
+def caption_tags(run: Run, t_from: float = -1, t_to: float = 1e12) -> set[int]:
+    """Segment tags (--tag-segments) in what the plugin renders, in (t_from, t_to]."""
+    out: set[int] = set()
+    for l in run.captions():
+        if t_from < l["t"] <= t_to:
+            out |= {int(m) for m in TAG.findall(l.get("caption", ""))}
+    return out
+
+
+def snapshot_tags(run: Run, t_to: float = 1e12) -> set[int]:
+    """Tags of every snapshot line (hidden ones too) up to t_to."""
+    out: set[int] = set()
+    for s in run.snapshots():
+        if s["t"] <= t_to:
+            for line in s["snapshot"]:
+                out |= {int(m) for m in TAG.findall(line["text"] + (line["tail"] or ""))}
+    return out
+
+
+def audio_class_events(run: Run, emulated: bool | None = None) -> list[dict]:
+    """Labels the client got (scripted ones, or the real server's)."""
+    return [r for r in run.requests if r["event"] == "ws_audio_class" and not r.get("dropped")
+            and (emulated is None or r.get("emulated") == emulated)]
+
+
+SINGING_SERVER = ["--revisable", "--growing-text", "--tag-segments"]
+
+
+def sc_singing_auto(ctx) -> Checker:
+    """Automatic: a segment labelled singing before any text never shows; one
+    labelled after its first words were shown is hidden from then on; speech
+    shows as always."""
+    c = Checker("singing_auto")
+    srv = ctx.server(SINGING_SERVER + ["--emulate-singing", "1:singing@0,2:singing@3"])
+    run = ctx.drive(srv, srv.token_file, 18000, extra_args=("--tail", "on"))
+    c.check(done_field(run, "singing_supported") == [True], "the client saw singing_detection")
+    labels = {(r["segment_index"], r["class"]) for r in audio_class_events(run, True)}
+    c.check({(1, "singing"), (2, "singing")} <= labels, f"the server labelled segments 1 and 2 singing ({sorted(labels)})")
+    shown = caption_tags(run)
+    c.check(1 not in shown, f"segment 1 (singing before any text) is never shown ({sorted(shown)})")
+    c.check(0 in shown and 3 in shown, f"speech segments are shown ({sorted(shown)})")
+    last = run.captions()[-1]["caption"] if run.captions() else ""
+    c.check("§2" not in last and "§1" not in last, f"no sung text on screen at the end ({last!r})")
+    hidden2 = [line for s in run.snapshots() for line in s["snapshot"]
+               if "§2" in line["text"] + (line["tail"] or "") and line["hidden"]]
+    c.check(bool(hidden2), "segment 2 is flagged hidden once labelled (the display fades it out)")
+    c.check(done_field(run, "singing_segments") == [2], f"two singing segments ({done_field(run, 'singing_segments')})")
+    c.check(len([r for r in run.requests if r["event"] == "ws_accept"]) == 1, "no reconnect")
+    return c, run
+
+
+def sc_singing_show(ctx) -> Checker:
+    """'Always show': the same singing segments are shown."""
+    c = Checker("singing_show")
+    srv = ctx.server(SINGING_SERVER + ["--emulate-singing", "1:singing@0"])
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=("--tail", "on", "--singing", "show"))
+    shown = caption_tags(run)
+    c.check(done_field(run, "singing_supported") == [True] and 1 in shown,
+            f"segment 1 is labelled singing and shown anyway ({sorted(shown)})")
+    c.check(not any(line["hidden"] for s in run.snapshots() for line in s["snapshot"]), "nothing is hidden")
+    return c, run
+
+
+def sc_singing_revision(ctx) -> Checker:
+    """A revision back to speech shows the segment, like a new line."""
+    c = Checker("singing_revision")
+    srv = ctx.server(SINGING_SERVER + ["--emulate-singing", "1:singing@0+speech@4"])
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=("--tail", "on"))
+    revs = [(r["class"], r["revision"]) for r in audio_class_events(run, True) if r["segment_index"] == 1]
+    c.check(revs[:2] == [("singing", 0), ("speech", 1)], f"labelled singing, then revised to speech ({revs})")
+    states = [line["hidden"] for s in run.snapshots() for line in s["snapshot"]
+              if "§1" in line["text"] + (line["tail"] or "")]
+    first_shown = states.index(False) if False in states else -1
+    c.check(bool(states) and states[0] is True and first_shown > 0,
+            f"hidden first, shown after the revision ({states[:3]} ... )")
+    c.check(1 in caption_tags(run), "segment 1 is rendered after the revision")
+    return c, run
+
+
+def sc_singing_absent(ctx) -> Checker:
+    """A server without singing_detection (an older one, or one missing the
+    YAMNet asset): 'automatic' shows everything."""
+    c = Checker("singing_absent")
+    srv = ctx.server(SINGING_SERVER + ["--hide-singing-capability"])
+    run = ctx.drive(srv, srv.token_file, 12000, extra_args=("--tail", "on"))
+    c.check(done_field(run, "singing_supported") == [False], "the client saw no singing_detection")
+    shown = caption_tags(run)
+    c.check({0, 1} <= shown, f"every segment is shown ({sorted(shown)})")
+    c.check(not any(line["hidden"] for s in run.snapshots() for line in s["snapshot"]), "nothing is hidden")
+    return c, run
+
+
+def sc_pause_resume(ctx) -> Checker:
+    """Manual pause (hotkey / button) hides everything at once without
+    touching the session; resuming shows only segments that start after it."""
+    c = Checker("pause_resume")
+    srv = ctx.server(SINGING_SERVER)
+    run = ctx.drive(srv, srv.token_file, 18000,
+                    extra_args=("--tail", "on", "--pause-at-ms", "5000", "--resume-at-ms", "10000"))
+    t_pause, t_resume = run.event_time("pause"), run.event_time("resume")
+    c.check(t_pause is not None and t_resume is not None, f"paused at {t_pause} ms, resumed at {t_resume} ms")
+    # the render changes in the same poll as the pause (same ms) and stays empty
+    during = [l["caption"] for l in run.captions() if t_pause is not None and t_pause <= l["t"] <= (t_resume or 0)]
+    c.check(bool(during) and all(text == "" for text in during), f"nothing is rendered while paused ({during[:3]})")
+    before_resume = snapshot_tags(run, t_resume or 0)
+    after = caption_tags(run, t_resume or 0)
+    c.check(bool(after) and not (after & before_resume),
+            f"after the resume only new segments show ({sorted(after)}; known before: {sorted(before_resume)})")
+    c.check(len([r for r in run.requests if r["event"] == "ws_accept"]) == 1 and len(session_starts(run)) == 1,
+            "the session never reconnects for the pause")
+    finals = [r for r in run.requests if r["event"] == "ws_final"]
+    c.check(len(finals) >= 3, f"recognition kept running through the pause ({len(finals)} finals)")
+    return c, run
+
+
+def sc_singing_real(ctx) -> Checker:
+    """The real implementation (on by default when the YAMNet asset is
+    there; TEA_ASR_SINGING_DETECTION=1 forces the setting on): its
+    segment.audio_class events are read and singing segments are hidden.
+    Skipped when the server in --service-dir does not have the feature."""
+    c = Checker("singing_real")
+    srv = ctx.server(SINGING_SERVER, env={"TEA_ASR_SINGING_DETECTION": "1"})
+    run = ctx.drive(srv, srv.token_file, 14000, extra_args=("--tail", "on"))
+    if done_field(run, "singing_supported") != [True]:
+        c.check(True, "SKIPPED: the server in --service-dir has no singing detection")
+        run.notes.append("needs the server with TEA_ASR_SINGING_DETECTION (agent/singing-detect) to run for real")
+        return c, run
+    events = audio_class_events(run, False)
+    c.check(bool(events), f"the real server sends segment.audio_class ({events[:2]})")
+    ever_singing = {r["segment_index"] for r in events if r["class"] == "singing"}
+    c.check(done_field(run, "singing_segments") == [len(ever_singing)],
+            f"the client counted the segments labelled singing ({sorted(ever_singing)})")
+    last: dict[int, str] = {}
+    for r in events:
+        last[r["segment_index"]] = r["class"]
+    sung = {i for i, cls in last.items() if cls == "singing"}
+    final_caption = run.captions()[-1]["caption"] if run.captions() else ""
+    on_screen = {int(m) for m in TAG.findall(final_caption)}
+    c.check(not (on_screen & sung), f"no segment labelled singing is on screen at the end (labels {last}, "
+            f"shown {sorted(on_screen)})")
+    return c, run
+
+
+# A private recording of congregational singing (not in git): 16 kHz mono WAV.
+MUSIC_WAV = Path(os.environ.get("TEA_E2E_MUSIC_WAV",
+                                "/Users/c2leb/Codes/tea-asr-service/.soak/audio/music-0123.wav"))
+
+
+def sc_singing_real_music(ctx) -> Checker:
+    """The real detector on real singing: the plugin plays a recording of a
+    congregation singing; the server's own YAMNet labels decide what shows.
+    Skipped without the recording or without the feature."""
+    c = Checker("singing_real_music")
+    if not MUSIC_WAV.exists():
+        c.check(True, f"SKIPPED: no singing recording at {MUSIC_WAV} (set TEA_E2E_MUSIC_WAV)")
+        return c, Run(lines=[], requests=[], notes=["needs a singing recording"])
+    srv = ctx.server(SINGING_SERVER)
+    run = ctx.drive(srv, srv.token_file, 40000, audio=f"file:{MUSIC_WAV}", extra_args=("--tail", "on"))
+    if done_field(run, "singing_supported") != [True]:
+        c.check(True, "SKIPPED: the server in --service-dir has no singing detection")
+        run.notes.append("needs the server with singing detection (YAMNet asset) to run for real")
+        return c, run
+    events = audio_class_events(run, False)
+    last: dict[int, str] = {}
+    for r in events:
+        last[r["segment_index"]] = r["class"]
+    sung = {i for i, cls in last.items() if cls == "singing"}
+    c.check(bool(sung), f"the real detector labels the singing ({last})")
+    final_caption = run.captions()[-1]["caption"] if run.captions() else ""
+    on_screen = {int(m) for m in TAG.findall(final_caption)}
+    c.check(bool(sung) and not (on_screen & sung), f"no sung segment is on screen at the end (shown {sorted(on_screen)})")
+    hidden = {int(m) for s in run.snapshots() for line in s["snapshot"] if line["hidden"]
+              for m in TAG.findall(line["text"] + (line["tail"] or ""))}
+    c.check(sung <= hidden, f"every sung segment is flagged hidden ({sorted(hidden)})")
+    return c, run
+
+
 # --------------------------------------------------------------------------- diagnostics
 
 HEARTBEAT = "asr-client: heartbeat"
@@ -1174,6 +1357,13 @@ SCENARIOS = {
     "hints_real": sc_hints_real,
     "hints_real_prompt": sc_hints_real_prompt,
     "hints_real_unknown_profile": sc_hints_real_unknown_profile,
+    "singing_auto": sc_singing_auto,
+    "singing_show": sc_singing_show,
+    "singing_revision": sc_singing_revision,
+    "singing_absent": sc_singing_absent,
+    "pause_resume": sc_pause_resume,
+    "singing_real": sc_singing_real,
+    "singing_real_music": sc_singing_real_music,
     "diag_heartbeat": sc_diag_heartbeat,
     "diag_silence": sc_diag_silence,
     "diag_no_audio": sc_diag_no_audio,

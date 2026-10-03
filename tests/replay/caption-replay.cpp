@@ -234,7 +234,8 @@ struct Settings {
 	int width2 = 0;
 	uint64_t width_change_ns = 0;
 	bool quiet = false;
-	bool ignore_acks = false; /* as if the server sent no audio.ack: only the open-line timeout */
+	bool ignore_acks = false;  /* as if the server sent no audio.ack: only the open-line timeout */
+	bool singing_show = false; /* --singing show: "Always show" instead of automatic */
 };
 
 uint32_t fake_advance(uint32_t cp, int font_px)
@@ -274,6 +275,10 @@ struct Sim {
 	uint64_t session_activity_ns = 0;
 	uint64_t server_progress = 0;
 	uint64_t server_progress_ns = 0;
+	/* hiding (singing / pause) */
+	int hidden_started = 0; /* lines hidden while in the display */
+	int hidden_faded = 0;   /* ... of which had text on screen and faded out */
+	int shown_again = 0;    /* hidden lines shown again (revision back to speech) */
 
 	void learn(const std::string &text)
 	{
@@ -338,6 +343,30 @@ struct Sim {
 			learn(display);
 			auto it = lines.find(s.key);
 			Line line;
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+			/* tea_sync_line(): a hidden line not on screen never appears;
+			 * one on screen keeps its text and fades out */
+			if (s.hidden) {
+				if (it == lines.end())
+					continue;
+				line = it->second;
+				if (tea_display_line_note_hidden(&line.meta, true, now) == TEA_HIDE_STARTED) {
+					hidden_started++;
+					if (!tea_display_line_has_visible_text(&line.meta))
+						tea_display_line_retire(&line.meta);
+					else
+						hidden_faded++;
+				}
+				next[s.key] = line;
+				order.push_back(s.key);
+				continue;
+			}
+			if (it != lines.end() && it->second.meta.hidden) {
+				lines.erase(it); /* shown again: a new line from scratch */
+				it = lines.end();
+				shown_again++;
+			}
+#endif
 			if (it == lines.end()) {
 				tea_display_line_init(&line.meta, s.key, display.size(), locked, now);
 			} else {
@@ -568,6 +597,8 @@ int main(int argc, char **argv)
 		else if (a == "--selftest-width-change") {
 			cfg.width2 = std::atoi(next());
 			cfg.width_change_ns = (uint64_t)std::atoll(next()) * TEA_NS_PER_MS;
+		} else if (a == "--singing") {
+			cfg.singing_show = std::strcmp(next(), "show") == 0;
 		} else if (a == "--ignore-acks")
 			cfg.ignore_acks = true;
 		else if (a == "--quiet")
@@ -608,6 +639,10 @@ int main(int argc, char **argv)
 	sim.state = tea_caption_state_create();
 	tea_caption_state_set_max_lines(sim.state, cfg.max_lines);
 	tea_caption_state_set_stable_tail_lines(sim.state, cfg.tail);
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+	/* the plugin's default: automatic (hides only what the server labels singing) */
+	tea_caption_state_set_hide_singing(sim.state, !cfg.singing_show);
+#endif
 
 	std::string session;
 	bool stable = false;
@@ -621,6 +656,7 @@ int main(int argc, char **argv)
 	std::map<uint64_t, bool> prev_open;
 	std::map<uint64_t, size_t> prev_visible_from;
 	int flags_fade = 0, flags_evict = 0, flags_hidden = 0, flags_rewrite = 0, flags_other = 0, final_shrinks = 0;
+	int flags_hidden_by_class = 0, singing_events = 0;
 	/* layout stability and row statistics */
 	struct PrevRow {
 		size_t start;
@@ -701,6 +737,12 @@ int main(int argc, char **argv)
 							    (uint64_t)e.num("stable_revision", 0),
 							    e.str("text").c_str(), e.str("state").c_str());
 			} else if (type == "transcript.final") {
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+				if (!e.str("audio_class").empty())
+					tea_caption_state_on_audio_class(sim.state, session.c_str(), seg.c_str(),
+									 seg_index, e.str("audio_class").c_str(),
+									 TEA_AUDIO_CLASS_REVISION_FINAL);
+#endif
 				tea_caption_state_on_final_indexed(sim.state, session.c_str(), seg.c_str(), seg_index,
 								   (uint64_t)e.num("revision", 1),
 								   e.str("text").c_str());
@@ -710,6 +752,15 @@ int main(int argc, char **argv)
 #ifdef TEA_CAPTION_STATE_HAS_SERVER_PROGRESS
 			else if (type == "audio.ack" && !cfg.ignore_acks) {
 				tea_caption_state_on_audio_ack(sim.state, (uint64_t)e.num("received_sample", 0));
+			}
+#endif
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+			else if (type == "segment.audio_class") {
+				tea_caption_state_on_audio_class(sim.state, session.c_str(), seg.c_str(), seg_index,
+								 e.str("class").c_str(),
+								 (uint64_t)e.num("revision", 0));
+				if (e.str("class") == "singing")
+					singing_events++;
 			}
 #endif
 			if (is_text) {
@@ -801,6 +852,15 @@ int main(int argc, char **argv)
 			if (!was_open && !open_now)
 				continue; /* a closed line leaving the screen is the normal end of a sentence */
 			std::string why;
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+			if (line_it != sim.lines.end() && line_it->second.meta.hidden) {
+				/* intended: singing / paused, not a mid-speech failure */
+				flags_hidden_by_class++;
+				std::printf("   %8.3fs  HIDDEN (singing)  [%s] -> [%s]\n", (double)now / 1e9,
+					    before.c_str(), after.c_str());
+				continue;
+			}
+#endif
 			if (line_it == sim.lines.end()) {
 				flags_other++;
 				why = "line left the caption state while open";
@@ -1009,6 +1069,15 @@ int main(int argc, char **argv)
 	std::printf("# close audit: finals that extend what was shown=%d, shorter=%d, different=%d; "
 		    "closes that changed shown text=%d\n",
 		    close_extends, close_shorter, close_differs, close_changed_shown);
+#ifdef TEA_CAPTION_STATE_HAS_HIDING
+	std::printf(
+		"# singing: segment.audio_class singing events=%d, singing segments=%llu, hide=%s, lines hidden while "
+		"on screen=%d (faded out=%d, never shown text=%d), shown again after a revision=%d, open-line changes "
+		"from hiding=%d\n",
+		singing_events, (unsigned long long)tea_caption_state_singing_segments(sim.state),
+		cfg.singing_show ? "off (--singing show)" : "auto", sim.hidden_started, sim.hidden_faded,
+		sim.hidden_started - sim.hidden_faded, sim.shown_again, flags_hidden_by_class);
+#endif
 	std::printf("# summary: open-line shrink events: fade-out=%d row-limit=%d retract(tail hidden/shortened)=%d "
 		    "tail-rewrite=%d other=%d | final corrections=%d | largest burst=%zu chars at %.3fs, "
 		    "frames with >=8 new chars=%d\n",

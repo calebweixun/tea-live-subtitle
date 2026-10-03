@@ -172,6 +172,11 @@ bool TeaAsrClient::supportsPartialTranscripts() const
 	return serverSupportsPartial_.load(std::memory_order_relaxed);
 }
 
+bool TeaAsrClient::supportsSingingDetection() const
+{
+	return serverSupportsSinging_.load(std::memory_order_relaxed);
+}
+
 bool TeaAsrClient::supportsStableTranscripts() const
 {
 	return serverSupportsStable_.load(std::memory_order_relaxed);
@@ -889,6 +894,7 @@ void TeaAsrClient::beginAttempt()
 	capabilitiesKnown_ = false;
 	serverSupportsStable_ = false;
 	serverSupportsSegmentation_ = false;
+	serverSupportsSinging_ = false;
 	waitMode_ = WaitMode::None;
 	if (watchTimer_)
 		watchTimer_->stop();
@@ -1103,17 +1109,21 @@ void TeaAsrClient::onCapabilitiesReply()
 	segmentationDefault_ = silence.value(QStringLiteral("default")).toInt(0);
 	serverSupportsSegmentation_ = silenceMin > 0 && silenceMax >= silenceMin;
 	readHintsCapability(features);
+	/* features.singing_detection: present (true) only when the server labels
+	 * segments speech / singing (segment.audio_class). */
+	serverSupportsSinging_ = features.value(QStringLiteral("singing_detection")).toBool(false);
 	const int hintsCapability = hintsCapability_.load();
 	obs_log(LOG_INFO,
 		"asr-client: capabilities: partial_transcripts=%d stable_transcripts=%d segmentation=%s "
-		"context_biasing=%s",
+		"context_biasing=%s singing_detection=%d",
 		serverSupportsPartial_.load() ? 1 : 0, serverSupportsStable_.load() ? 1 : 0,
 		serverSupportsSegmentation_.load()
 			? QStringLiteral("%1-%2 ms").arg(silenceMin).arg(silenceMax).toUtf8().constData()
 			: "not offered",
 		hintsCapability == TEA_HINTS_CAP_ON    ? "on"
 		: hintsCapability == TEA_HINTS_CAP_OFF ? "off on the server"
-						       : "not offered");
+						       : "not offered",
+		serverSupportsSinging_.load() ? 1 : 0);
 	maxTotalConnections_ = limits.value(QStringLiteral("max_total_connections")).toInt(0);
 	/* W9 LAN mode: every response carries this header. Surface it; the
 	 * bearer token is travelling in cleartext. */
@@ -1626,9 +1636,33 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 		uint64_t segIndex = index.isDouble() && index.toDouble() >= 0 ? (uint64_t)index.toDouble()
 									      : TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
 		QString text = obj.value(QStringLiteral("text")).toString();
+		/* transcript.final.audio_class: the segment's last label, applied
+		 * before the text so a singing final never shows. */
+		const QString finalClass = obj.value(QStringLiteral("audio_class")).toString();
+		if (!finalClass.isEmpty())
+			tea_caption_state_on_audio_class(captions_, sessionId_.toUtf8().constData(),
+							 segId.toUtf8().constData(), segIndex,
+							 finalClass.toUtf8().constData(),
+							 TEA_AUDIO_CLASS_REVISION_FINAL);
 		tea_caption_state_on_final_indexed(captions_, sessionId_.toUtf8().constData(),
 						   segId.toUtf8().constData(), segIndex, rev,
 						   text.toUtf8().constData());
+		return;
+	}
+
+	if (type == QLatin1String("segment.audio_class")) {
+		/* {segment_id, segment_index, class, confidence, revision}: the
+		 * server's speech / singing label, first ~1.5 s after
+		 * speech.started, at most once more (revision 1) if it changes.
+		 * The server still transcribes singing; hiding is ours. */
+		const QString segId = obj.value(QStringLiteral("segment_id")).toString();
+		const QJsonValue index = obj.value(QStringLiteral("segment_index"));
+		const uint64_t segIndex = index.isDouble() && index.toDouble() >= 0 ? (uint64_t)index.toDouble()
+										    : TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
+		const QString cls = obj.value(QStringLiteral("class")).toString();
+		const uint64_t rev = (uint64_t)obj.value(QStringLiteral("revision")).toDouble(0);
+		tea_caption_state_on_audio_class(captions_, sessionId_.toUtf8().constData(), segId.toUtf8().constData(),
+						 segIndex, cls.toUtf8().constData(), rev);
 		return;
 	}
 
@@ -2091,6 +2125,11 @@ extern "C" void tea_asr_client_set_stable_captions(tea_asr_client_t *client, boo
 {
 	if (client)
 		client->impl->setStableCaptions(enabled);
+}
+
+extern "C" bool tea_asr_client_supports_singing_detection(tea_asr_client_t *client)
+{
+	return client && client->impl->supportsSingingDetection();
 }
 
 extern "C" bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *client)

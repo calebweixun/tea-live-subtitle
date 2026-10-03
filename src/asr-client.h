@@ -84,6 +84,10 @@ bool tea_asr_client_supports_partial_transcripts(tea_asr_client_t *client);
 void tea_asr_client_set_stable_captions(tea_asr_client_t *client, bool enabled);
 /* Only meaningful once capabilities are known. */
 bool tea_asr_client_supports_stable_transcripts(tea_asr_client_t *client);
+/* capabilities.features.singing_detection: the server labels segments
+ * speech / singing (segment.audio_class), so "captions while singing:
+ * automatic" can hide singing. Only meaningful once capabilities are known. */
+bool tea_asr_client_supports_singing_detection(tea_asr_client_t *client);
 /* True while the current session was started with `stable`. */
 bool tea_asr_client_stable_captions_active(tea_asr_client_t *client);
 

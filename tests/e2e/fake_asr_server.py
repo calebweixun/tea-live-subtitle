@@ -78,6 +78,23 @@ agent/context-hints); these emulate that contract around the unchanged app:
 * ``--hide-context-capability``: strips ``features.context_biasing`` and
   ``context_limits`` (a server that predates the feature).
 
+Singing knobs (``features.singing_detection``, ``segment.audio_class``,
+``transcript.final.audio_class``; a server with the YAMNet asset labels
+every segment by default):
+
+* ``--hide-singing-capability``: a server without the feature: strips the
+  capability, drops the real labels and the finals' ``audio_class``.
+* ``--emulate-singing SPEC``: advertises ``singing_detection: true`` and
+  sends scripted ``segment.audio_class`` events instead of the real ones
+  (which are dropped). SPEC is a comma list of
+  ``INDEX:CLASS@N`` (``+CLASS@M`` adds a ``revision=1`` change): the event
+  for segment INDEX goes out right before that segment's next transcript
+  event once N of its partials have been sent (``@0``: before any text).
+  Unlisted segments get ``speech@1``. Finals carry ``audio_class``.
+* ``--tag-segments``: prefixes every transcript text of segment i with
+  ``§i`` (stable / partial / final alike, so stable stays append-only), so a
+  test can tell which segment a caption came from.
+
 Without these knobs the real implementation is used as is: the harness passes
 ``TEA_ASR_CONTEXT_HINTS`` / ``TEA_ASR_CONTEXT_PROMPT`` from its environment
 into the server config (when the server has those settings), and server
@@ -123,6 +140,9 @@ def main() -> int:
     parser.add_argument("--reject-context-field", action="store_true")
     parser.add_argument("--hide-context-capability", action="store_true")
     parser.add_argument("--context-limits", default="")
+    parser.add_argument("--emulate-singing", default=None)
+    parser.add_argument("--hide-singing-capability", action="store_true")
+    parser.add_argument("--tag-segments", action="store_true")
     parser.add_argument(
         "--dictionaries",
         default='[{"name":"church","domain":"主日講道","hotwords_count":42,"replacements_count":7},'
@@ -185,7 +205,8 @@ def main() -> int:
     # such fields and ignores the variables.
     config_fields = {f.name for f in dataclasses.fields(ServiceConfig)}
     for env_name, field_name in (("TEA_ASR_CONTEXT_HINTS", "context_hints_enabled"),
-                                 ("TEA_ASR_CONTEXT_PROMPT", "context_prompt_enabled")):
+                                 ("TEA_ASR_CONTEXT_PROMPT", "context_prompt_enabled"),
+                                 ("TEA_ASR_SINGING_DETECTION", "singing_detection_enabled")):
         if field_name in config_fields and os.environ.get(env_name) is not None:
             extra_config[field_name] = os.environ[env_name] == "1"
     config = ServiceConfig(
@@ -238,6 +259,13 @@ def main() -> int:
                     or len(pair["to"]) > lim["max_replacement_chars"]):
                 return "replacements"
         return None
+
+    # --emulate-singing: {index: [(class, after_partials), ...]}
+    singing_plan: dict[int, list[tuple[str, int]]] = {}
+    if args.emulate_singing:
+        for item in args.emulate_singing.split(","):
+            index, steps = item.split(":", 1)
+            singing_plan[int(index)] = [(step.split("@")[0], int(step.split("@")[1])) for step in steps.split("+")]
 
     log_path = Path(args.request_log)
     start = time.monotonic()
@@ -317,7 +345,8 @@ def main() -> int:
             mtype = message["type"]
             rewrite_caps = (args.hide_stable_capability or args.hide_segmentation_capability
                             or args.emulate_segmentation or args.reject_segmentation_field
-                            or advertise_context or args.hide_context_capability)
+                            or advertise_context or args.hide_context_capability
+                            or args.emulate_singing is not None or args.hide_singing_capability)
             if (rewrite_caps and base["path"] == "/v1/capabilities"
                     and mtype in ("http.response.start", "http.response.body")):
                 # Buffer the whole response, drop the optional feature, fix
@@ -343,6 +372,10 @@ def main() -> int:
                     if advertise_context:
                         features["context_biasing"] = True
                         features["context_limits"] = context_limits
+                    if args.emulate_singing is not None:
+                        features["singing_detection"] = True
+                    if args.hide_singing_capability:
+                        features.pop("singing_detection", None)
                     if args.hide_context_capability:
                         features.pop("context_biasing", None)
                         features.pop("context_limits", None)
@@ -374,6 +407,49 @@ def main() -> int:
                     payload = json.loads(message["text"])
                 except ValueError:
                     payload = {}
+                ptype = payload.get("type")
+                if ptype == "speech.started" and payload.get("segment_id"):
+                    held.setdefault("seg_index", {})[payload["segment_id"]] = payload.get("segment_index", 0)
+                if ptype == "segment.audio_class":  # a real server's label
+                    dropped = args.emulate_singing is not None or args.hide_singing_capability
+                    record({**base, "event": "ws_audio_class", "segment_id": payload.get("segment_id"),
+                            "segment_index": payload.get("segment_index"), "class": payload.get("class"),
+                            "revision": payload.get("revision"), "emulated": False, "dropped": dropped})
+                    if dropped:
+                        return
+                if (ptype == "transcript.final" and args.hide_singing_capability
+                        and "audio_class" in payload):
+                    payload.pop("audio_class")
+                    message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
+                if (ptype in ("transcript.partial", "transcript.stable", "transcript.final")
+                        and payload.get("segment_id")):
+                    seg_id = payload["segment_id"]
+                    index = payload.get("segment_index", held.get("seg_index", {}).get(seg_id, -1))
+                    if args.emulate_singing is not None:
+                        state = held.setdefault("singing", {}).setdefault(
+                            seg_id, {"partials": 0, "next": 0, "class": None})
+                        steps = singing_plan.get(index, [("speech", 1)])
+                        while state["next"] < len(steps) and (
+                                steps[state["next"]][1] <= state["partials"] or ptype == "transcript.final"):
+                            cls = steps[state["next"]][0]
+                            event = {"type": "segment.audio_class", "session_id": payload.get("session_id"),
+                                     "event_id": 0, "segment_id": seg_id, "segment_index": index,
+                                     "class": cls, "confidence": 0.99, "revision": state["next"]}
+                            await send({"type": "websocket.send", "text": json.dumps(event)})
+                            record({**base, "event": "ws_audio_class", "segment_id": seg_id,
+                                    "segment_index": index, "class": cls, "revision": state["next"],
+                                    "emulated": True})
+                            state["class"] = cls
+                            state["next"] += 1
+                        if ptype == "transcript.partial":
+                            state["partials"] += 1
+                        if ptype == "transcript.final":
+                            payload.pop("audio_class", None)
+                            if state["class"]:
+                                payload["audio_class"] = state["class"]
+                    if args.tag_segments and payload.get("text"):
+                        payload["text"] = f"§{index}" + payload["text"]
+                    message = {**message, "text": json.dumps(payload, ensure_ascii=False)}
                 if args.deaf and payload.get("type") in (
                         "speech.started", "segment.queued", "transcript.partial", "transcript.stable",
                         "transcript.final", "segment.skipped", "segment.error"):
@@ -400,7 +476,8 @@ def main() -> int:
                 elif payload.get("type") in ("transcript.partial", "transcript.final"):
                     record({**base, "event": "ws_" + payload["type"].split(".")[1],
                             "segment_id": payload.get("segment_id"), "text": payload.get("text"),
-                            "raw_text": payload.get("raw_text"), "warnings": payload.get("warnings")})
+                            "raw_text": payload.get("raw_text"), "warnings": payload.get("warnings"),
+                            "audio_class": payload.get("audio_class")})
                 elif payload.get("type") == "transcript.stable":
                     record({**base, "event": "ws_stable", "segment_id": payload.get("segment_id"),
                             "segment_index": payload.get("segment_index"),

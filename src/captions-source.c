@@ -117,6 +117,16 @@ static const char *const k_text_ft2_ids[] = {
 /* the dictionary list is fetched again when the Properties window opens
  * and the last answer is older than this */
 #define TEA_DICT_REFRESH_MS 15000
+/* Captions while singing (appearance: applies at once). Automatic hides
+ * segments the server labels singing (segment.audio_class); it does
+ * nothing on a server without features.singing_detection. */
+#define TEA_KEY_SINGING "singing_captions"
+#define TEA_SINGING_SHOW 0
+#define TEA_SINGING_AUTO 1
+/* Program scenes in which captions are paused (one name per line). */
+#define TEA_KEY_PAUSE_SCENES "pause_scenes"
+/* hide-state INFO lines: at most one per this long per kind */
+#define TEA_HIDE_LOG_MIN_NS (10ull * 1000000000ull)
 #define TEA_OVERLAY_KEY_BIT (UINT64_C(1) << 63) /* texture keys of the status line */
 #define TEA_OVERLAY_SCALE 0.5f
 #define TEA_OVERLAY_GAP 6
@@ -350,6 +360,25 @@ struct tea_captions_source {
 	 * service object, see the architecture comment at the top of this
 	 * file). Guarded by g_registry_lock, not ctx-specific. */
 	struct tea_captions_source *registry_next;
+
+	/* ---- hiding captions (docs/phase-b-rendering.md) ----
+	 * Manual pause from the hotkey / the Properties button, and the pause
+	 * of the listed program scenes, both end in
+	 * tea_caption_state_set_paused(); the ASR session keeps running. Not
+	 * saved: a pause forgotten at the end of a service must not silently
+	 * hide every caption of the next one. */
+	obs_hotkey_id pause_hotkey;
+	volatile long manual_paused;
+	volatile long scene_paused;
+	volatile long singing_mode; /* TEA_SINGING_* */
+	pthread_mutex_t hide_lock;  /* pause_scenes, the pause log limiter */
+	char *pause_scenes;
+	uint64_t pause_log_ns;
+	int pause_log_skipped;
+	/* render thread: logging of the singing indicator */
+	bool singing_logged;
+	uint64_t singing_log_ns;
+	int singing_log_skipped;
 };
 
 /* Draws a cached text texture with a uniform opacity. The texture holds
@@ -442,6 +471,111 @@ void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *i
 		bfree(status_text);
 	}
 	pthread_mutex_unlock(&g_registry_lock);
+}
+
+/* ---- hiding captions: pause (manual and by scene) ---- */
+
+static pthread_mutex_t g_scene_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *g_program_scene = NULL; /* last program scene name from the frontend */
+
+/* Whether `name` is one of the scene names in `list` (one per line; commas
+ * and "、" also separate; surrounding spaces ignored). */
+static bool tea_scene_listed(const char *list, const char *name)
+{
+	if (!list || !name || !name[0])
+		return false;
+	const size_t name_len = strlen(name);
+	const char *p = list;
+	while (*p) {
+		const char *end = p;
+		while (*end && *end != '\n' && *end != '\r' && *end != ',' && strncmp(end, "、", 3) != 0)
+			end++;
+		const char *a = p, *b = end;
+		while (a < b && (*a == ' ' || *a == '\t'))
+			a++;
+		while (b > a && (b[-1] == ' ' || b[-1] == '\t'))
+			b--;
+		if ((size_t)(b - a) == name_len && memcmp(a, name, name_len) == 0)
+			return true;
+		if (!*end)
+			break;
+		p = end + (strncmp(end, "、", 3) == 0 ? 3 : 1);
+	}
+	return false;
+}
+
+/* Applies manual || scene pause to the caption state and logs a change
+ * (INFO, at most once a second; skipped changes are counted in the next). */
+static void tea_apply_pause(struct tea_captions_source *ctx, const char *why)
+{
+	if (!ctx->captions)
+		return;
+	const bool paused = os_atomic_load_long(&ctx->manual_paused) || os_atomic_load_long(&ctx->scene_paused);
+	if (tea_caption_state_paused(ctx->captions) == paused)
+		return;
+	tea_caption_state_set_paused(ctx->captions, paused);
+	pthread_mutex_lock(&ctx->hide_lock);
+	const uint64_t now = os_gettime_ns();
+	if (now - ctx->pause_log_ns >= 1000000000ull || ctx->pause_log_ns == 0) {
+		obs_log(LOG_INFO, "captions %s (%s)%s", paused ? "paused" : "resumed", why,
+			ctx->pause_log_skipped ? "; earlier changes not logged" : "");
+		ctx->pause_log_ns = now;
+		ctx->pause_log_skipped = 0;
+	} else {
+		ctx->pause_log_skipped++;
+	}
+	pthread_mutex_unlock(&ctx->hide_lock);
+}
+
+static void tea_set_manual_pause(struct tea_captions_source *ctx, bool paused, const char *why)
+{
+	os_atomic_set_long(&ctx->manual_paused, paused ? 1 : 0);
+	tea_apply_pause(ctx, why);
+}
+
+/* Must hold no lock but g_registry_lock (or own ctx exclusively). */
+static void tea_eval_scene_pause(struct tea_captions_source *ctx)
+{
+	pthread_mutex_lock(&g_scene_lock);
+	pthread_mutex_lock(&ctx->hide_lock);
+	const bool listed = tea_scene_listed(ctx->pause_scenes, g_program_scene);
+	pthread_mutex_unlock(&ctx->hide_lock);
+	pthread_mutex_unlock(&g_scene_lock);
+	if ((os_atomic_load_long(&ctx->scene_paused) != 0) != listed) {
+		os_atomic_set_long(&ctx->scene_paused, listed ? 1 : 0);
+		tea_apply_pause(ctx, "scene");
+	}
+}
+
+void tea_captions_source_program_scene_changed(const char *scene_name)
+{
+	pthread_mutex_lock(&g_scene_lock);
+	bfree(g_program_scene);
+	g_program_scene = bstrdup(scene_name ? scene_name : "");
+	pthread_mutex_unlock(&g_scene_lock);
+	pthread_mutex_lock(&g_registry_lock);
+	for (struct tea_captions_source *ctx = g_registry_head; ctx; ctx = ctx->registry_next)
+		tea_eval_scene_pause(ctx);
+	pthread_mutex_unlock(&g_registry_lock);
+}
+
+void tea_captions_source_shutdown(void)
+{
+	pthread_mutex_lock(&g_scene_lock);
+	bfree(g_program_scene);
+	g_program_scene = NULL;
+	pthread_mutex_unlock(&g_scene_lock);
+}
+
+/* The "TEA captions: pause / resume" hotkey of this source. */
+static void tea_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	(void)id;
+	(void)hotkey;
+	struct tea_captions_source *ctx = data;
+	if (!pressed || !ctx)
+		return;
+	tea_set_manual_pause(ctx, !os_atomic_load_long(&ctx->manual_paused), "hotkey");
 }
 
 void tea_captions_source_reconnect_all(void)
@@ -720,7 +854,17 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 	if (ctx->captions) {
 		tea_caption_state_set_max_lines(ctx->captions, ctx->max_lines);
 		tea_caption_state_set_stable_tail_lines(ctx->captions, obs_data_get_bool(settings, TEA_KEY_TAIL));
+		/* captions while singing: appearance, applies at once */
+		const long singing = obs_data_get_int(settings, TEA_KEY_SINGING) == TEA_SINGING_SHOW ? TEA_SINGING_SHOW
+												     : TEA_SINGING_AUTO;
+		os_atomic_set_long(&ctx->singing_mode, singing);
+		tea_caption_state_set_hide_singing(ctx->captions, singing == TEA_SINGING_AUTO);
 	}
+	pthread_mutex_lock(&ctx->hide_lock);
+	bfree(ctx->pause_scenes);
+	ctx->pause_scenes = bstrdup(obs_data_get_string(settings, TEA_KEY_PAUSE_SCENES));
+	pthread_mutex_unlock(&ctx->hide_lock);
+	tea_eval_scene_pause(ctx);
 
 	/* --- audio source: re-attaches the tap, the session keeps running --- */
 	const char *audio_source_name = obs_data_get_string(settings, "audio_source_name");
@@ -1172,11 +1316,31 @@ static char *tea_display_text(const char *text, const char *tail, size_t *len_ou
 }
 
 static void tea_sync_line(struct tea_captions_source *ctx, bool *keep, uint64_t key, const char *text, const char *tail,
-			  bool persistent, bool open, uint64_t activity, uint64_t now)
+			  bool persistent, bool open, uint64_t activity, bool hidden, uint64_t now)
 {
+	int idx = tea_line_find(ctx, key);
+	if (hidden) {
+		/* Singing or paused (tea_caption_snapshot_line_t.hidden): a line
+		 * not on screen yet never appears; one on screen keeps its text
+		 * and fades out (tea_display_line_note_hidden()). */
+		if (idx < 0)
+			return;
+		struct tea_rline *line = &ctx->lines[idx];
+		if (tea_display_line_note_hidden(&line->meta, true, now) == TEA_HIDE_STARTED &&
+		    !tea_display_line_has_visible_text(&line->meta))
+			tea_display_line_retire(&line->meta);
+		keep[idx] = true;
+		if (ctx->order_count < TEA_MAX_LINES)
+			ctx->order[ctx->order_count++] = idx;
+		return;
+	}
+	if (idx >= 0 && ctx->lines[idx].meta.hidden) {
+		/* shown again (a revision back to speech): a new line from scratch */
+		tea_line_free(&ctx->lines[idx]);
+		idx = -1;
+	}
 	size_t len = 0, locked = 0;
 	char *display = tea_display_text(text, tail, &len, &locked);
-	int idx = tea_line_find(ctx, key);
 	if (idx < 0) {
 		idx = tea_line_alloc(ctx);
 		if (idx < 0) {
@@ -1220,7 +1384,9 @@ static void tea_sync_lines(struct tea_captions_source *ctx, uint64_t now)
 	/* Lines that left the snapshot are dropped first, so their slots can be
 	 * reused by lines that just arrived. */
 	bool keep[TEA_MAX_LINES] = {false};
-	bool any_text = false;
+	/* hidden lines count: hiding captions never brings up the waiting
+	 * prompt, and neither does a pause */
+	bool any_text = tea_caption_state_paused(ctx->captions);
 	for (int i = 0; i < snap.count; i++) {
 		const tea_caption_snapshot_line_t *s = &snap.lines[i];
 		if (s->text[0] || (s->tail && s->tail[0]))
@@ -1248,10 +1414,10 @@ static void tea_sync_lines(struct tea_captions_source *ctx, uint64_t now)
 	ctx->order_count = 0;
 	for (int i = 0; i < snap.count; i++) {
 		const tea_caption_snapshot_line_t *s = &snap.lines[i];
-		tea_sync_line(ctx, keep, s->key, s->text, s->tail, false, s->open, s->activity, now);
+		tea_sync_line(ctx, keep, s->key, s->text, s->tail, false, s->open, s->activity, s->hidden, now);
 	}
 	if (use_placeholder)
-		tea_sync_line(ctx, keep, TEA_PLACEHOLDER_KEY, placeholder, NULL, true, false, 0, now);
+		tea_sync_line(ctx, keep, TEA_PLACEHOLDER_KEY, placeholder, NULL, true, false, 0, false, now);
 	tea_caption_snapshot_free(&snap);
 	ctx->layout_dirty = true;
 }
@@ -1281,12 +1447,18 @@ static uint64_t tea_line_fade_ref(const struct tea_captions_source *ctx, const t
 static void tea_expire_lines(struct tea_captions_source *ctx, uint64_t now)
 {
 	const struct tea_render_config *cfg = ctx->config;
-	if (!cfg->fade_out)
-		return;
 	for (int i = 0; i < TEA_MAX_LINES; i++) {
 		struct tea_rline *line = &ctx->lines[i];
 		if (!line->used || line->meta.persistent || !tea_display_line_has_visible_text(&line->meta))
 			continue;
+		if (!cfg->fade_out) {
+			/* no fading: a hidden line goes at once, the rest stays */
+			if (line->meta.hidden) {
+				tea_display_line_retire(&line->meta);
+				ctx->layout_dirty = true;
+			}
+			continue;
+		}
 		const uint64_t ref = tea_line_fade_ref(ctx, &line->meta);
 		if (tea_fade_out_done(true, now, ref, cfg->fade_delay_ms, cfg->fade_ms)) {
 			tea_display_line_retire(&line->meta);
@@ -1556,6 +1728,11 @@ static void tea_overlay_build(struct tea_captions_source *ctx, struct dstr *out)
 			  tea_text_or("TeaLiveSubtitle.Overlay.SecondsAgo", "s ago"));
 	else
 		dstr_cat(out, tea_text_or("TeaLiveSubtitle.Overlay.NoText", "no text yet"));
+	if (ctx->captions && tea_caption_state_paused(ctx->captions))
+		dstr_catf(out, " | %s", tea_text_or("TeaLiveSubtitle.Overlay.Paused", "captions paused"));
+	else if (ctx->captions && os_atomic_load_long(&ctx->singing_mode) == TEA_SINGING_AUTO &&
+		 tea_caption_state_singing_now(ctx->captions))
+		dstr_catf(out, " | ♪ %s", tea_text_or("TeaLiveSubtitle.Overlay.Singing", "singing: hidden"));
 }
 
 static void tea_overlay_tick(struct tea_captions_source *ctx, uint64_t now)
@@ -1582,6 +1759,29 @@ static void tea_overlay_tick(struct tea_captions_source *ctx, uint64_t now)
 	dstr_free(&text);
 }
 
+/* INFO when automatic singing hiding turns on / off (at most one line per
+ * 10 s; skipped changes are counted in the next one). */
+static void tea_singing_log_tick(struct tea_captions_source *ctx, uint64_t now)
+{
+	if (!ctx->captions)
+		return;
+	const bool singing = os_atomic_load_long(&ctx->singing_mode) == TEA_SINGING_AUTO &&
+			     tea_caption_state_singing_now(ctx->captions);
+	if (singing == ctx->singing_logged)
+		return;
+	if (ctx->singing_log_ns && now - ctx->singing_log_ns < TEA_HIDE_LOG_MIN_NS) {
+		ctx->singing_log_skipped++;
+		return; /* logged once the window has passed, if it still differs */
+	}
+	obs_log(LOG_INFO, "captions: %s (%llu singing segment(s) so far%s)",
+		singing ? "singing detected, hiding sung captions" : "speech again, captions shown",
+		(unsigned long long)tea_caption_state_singing_segments(ctx->captions),
+		ctx->singing_log_skipped ? "; quick changes in between not logged" : "");
+	ctx->singing_logged = singing;
+	ctx->singing_log_ns = now;
+	ctx->singing_log_skipped = 0;
+}
+
 static void tea_captions_source_video_tick(void *data, float seconds)
 {
 	(void)seconds;
@@ -1600,6 +1800,7 @@ static void tea_captions_source_video_tick(void *data, float seconds)
 		tea_layout(ctx);
 	else if (ctx->have_pending)
 		tea_stamp_frame(ctx, &ctx->pending);
+	tea_singing_log_tick(ctx, now);
 	tea_overlay_tick(ctx, now);
 	if (ctx->overlay_tex >= 0)
 		ctx->texes[ctx->overlay_tex].stamp = ctx->frame_no; /* rasterised by tea_dispatch_jobs() */
@@ -1764,6 +1965,11 @@ static void *tea_captions_source_create(obs_data_t *settings, obs_source_t *sour
 	ctx->overlay_shown_tex = -1;
 	pthread_mutex_init(&ctx->conn_lock, NULL);
 	pthread_mutex_init(&ctx->config_lock, NULL);
+	pthread_mutex_init(&ctx->hide_lock, NULL);
+	/* per source, saved with the scene collection by OBS */
+	ctx->pause_hotkey = obs_hotkey_register_source(
+		source, "tea_live_subtitle.pause",
+		tea_text_or("TeaLiveSubtitle.Hotkey.Pause", "TEA captions: pause / resume"), tea_pause_hotkey, ctx);
 	ctx->glyphs = bzalloc(sizeof(tea_glyph_cache_t));
 	for (int i = 0; i < TEA_TEX_CACHE_SIZE; i++)
 		ctx->texes[i].worker = -1;
@@ -1802,6 +2008,8 @@ static void tea_captions_source_destroy(void *data)
 	struct tea_captions_source *ctx = data;
 
 	tea_registry_remove(ctx);
+	if (ctx->pause_hotkey != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(ctx->pause_hotkey);
 
 	if (ctx->client) {
 		tea_asr_client_stop(ctx->client);
@@ -1838,6 +2046,8 @@ static void tea_captions_source_destroy(void *data)
 	bfree(ctx->glyphs);
 	pthread_mutex_destroy(&ctx->conn_lock);
 	pthread_mutex_destroy(&ctx->config_lock);
+	pthread_mutex_destroy(&ctx->hide_lock);
+	bfree(ctx->pause_scenes);
 
 	bfree(ctx->overlay_text);
 	bfree(ctx->applied_audio_source_name);
@@ -1891,6 +2101,10 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
 	obs_data_set_default_bool(settings, TEA_KEY_DIAG_OVERLAY, false);
 	obs_data_set_default_bool(settings, TEA_KEY_EVENT_TRACE, false);
+	/* Automatic for new and existing sources: it only acts on a server that
+	 * advertises singing detection, which is off unless turned on there. */
+	obs_data_set_default_int(settings, TEA_KEY_SINGING, TEA_SINGING_AUTO);
+	obs_data_set_default_string(settings, TEA_KEY_PAUSE_SCENES, "");
 	/* recognition hints: empty (off) for new and existing sources alike */
 	obs_data_set_default_string(settings, TEA_KEY_HINTS_PROFILE, "");
 	obs_data_set_default_string(settings, TEA_KEY_HINTS_DOMAIN, "");
@@ -2324,6 +2538,112 @@ static void tea_add_hints_group(struct tea_captions_source *ctx, obs_properties_
 	tea_maybe_fetch_dictionaries(ctx);
 }
 
+/* ---- hiding captions: Properties ---- */
+
+/* The status line of the "captions while singing / pause" group. */
+static void tea_hide_status_text(struct tea_captions_source *ctx, struct dstr *out)
+{
+	const bool auto_mode = !ctx || os_atomic_load_long(&ctx->singing_mode) == TEA_SINGING_AUTO;
+	const bool known = ctx && ctx->client && tea_asr_client_capabilities_known(ctx->client);
+	const bool supported = known && tea_asr_client_supports_singing_detection(ctx->client);
+	if (!auto_mode) {
+		dstr_copy(out, tea_text_or("TeaLiveSubtitle.Prop.Singing.StatusAlways",
+					   "Captions are shown while people sing."));
+	} else if (!known) {
+		dstr_copy(out, tea_text_or("TeaLiveSubtitle.Prop.Singing.StatusUnknown",
+					   "Not connected yet: whether the server detects singing is unknown."));
+	} else if (!supported) {
+		dstr_copy(out,
+			  tea_text_or("TeaLiveSubtitle.Prop.Singing.StatusOff",
+				      "The server does not detect singing (TEA_ASR_SINGING_DETECTION=1); captions are "
+				      "shown as with \"Always show\"."));
+	} else {
+		dstr_copy(out, tea_text_or("TeaLiveSubtitle.Prop.Singing.StatusOn",
+					   "The server detects singing: captions of sung parts are hidden."));
+		if (ctx->captions && tea_caption_state_singing_now(ctx->captions))
+			dstr_catf(out, " %s", tea_text_or("TeaLiveSubtitle.Prop.Singing.Now", "Now: singing (♪)."));
+	}
+	if (ctx && ctx->captions && tea_caption_state_paused(ctx->captions)) {
+		dstr_cat(out, "\n");
+		dstr_cat(out,
+			 os_atomic_load_long(&ctx->manual_paused)
+				 ? tea_text_or("TeaLiveSubtitle.Prop.Pause.StatusManual",
+					       "Captions are paused (hotkey or the button below resumes them).")
+				 : tea_text_or("TeaLiveSubtitle.Prop.Pause.StatusScene",
+					       "Captions are paused: the program scene is one of the scenes below."));
+	}
+}
+
+static void tea_hide_update_status(struct tea_captions_source *ctx, obs_properties_t *props)
+{
+	obs_property_t *status = obs_properties_get(props, "hide_status");
+	if (status) {
+		struct dstr text = {0};
+		tea_hide_status_text(ctx, &text);
+		obs_property_set_description(status, text.array ? text.array : "");
+		dstr_free(&text);
+	}
+	obs_property_t *button = obs_properties_get(props, "pause_toggle");
+	if (button && ctx)
+		obs_property_set_description(
+			button, os_atomic_load_long(&ctx->manual_paused)
+					? tea_text_or("TeaLiveSubtitle.Prop.Pause.Resume", "Resume captions")
+					: tea_text_or("TeaLiveSubtitle.Prop.Pause.Pause", "Pause captions"));
+}
+
+static bool tea_pause_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	(void)property;
+	struct tea_captions_source *ctx = data;
+	if (!ctx)
+		return false;
+	tea_set_manual_pause(ctx, !os_atomic_load_long(&ctx->manual_paused), "button");
+	tea_hide_update_status(ctx, props);
+	return true;
+}
+
+static void tea_add_hide_group(struct tea_captions_source *ctx, obs_properties_t *props, void *data)
+{
+	obs_properties_t *group = obs_properties_create();
+	obs_properties_add_text(group, "hide_status", "", OBS_TEXT_INFO);
+	obs_property_t *mode = obs_properties_add_list(
+		group, TEA_KEY_SINGING, tea_text_or("TeaLiveSubtitle.Prop.Singing", "Captions while people sing"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode,
+				  tea_text_or("TeaLiveSubtitle.Prop.Singing.Auto", "Automatic (server detection)"),
+				  TEA_SINGING_AUTO);
+	obs_property_list_add_int(mode, tea_text_or("TeaLiveSubtitle.Prop.Singing.Always", "Always show"),
+				  TEA_SINGING_SHOW);
+	obs_property_set_long_description(
+		mode, tea_text_or("TeaLiveSubtitle.Prop.Singing.Tooltip",
+				  "Automatic: when the server labels a sentence as singing, its captions are not "
+				  "shown (already shown text fades out). Needs a server with singing detection; "
+				  "otherwise captions are shown. Applies at once, without reconnecting."));
+	obs_properties_add_button2(group, "pause_toggle",
+				   tea_text_or("TeaLiveSubtitle.Prop.Pause.Pause", "Pause captions"), tea_pause_clicked,
+				   data);
+	obs_properties_add_text(
+		group, "pause_hint",
+		tea_text_or("TeaLiveSubtitle.Prop.Pause.Hint",
+			    "Pausing hides captions at once (shown lines fade out); recognition keeps "
+			    "running. Resuming shows only sentences that start after it. The pause always "
+			    "wins over Automatic, and is not kept when OBS restarts. A hotkey for it is "
+			    "in Settings > Hotkeys (\"TEA captions: pause / resume\")."),
+		OBS_TEXT_INFO);
+	obs_property_t *scenes = obs_properties_add_text(
+		group, TEA_KEY_PAUSE_SCENES,
+		tea_text_or("TeaLiveSubtitle.Prop.PauseScenes", "Pause captions in these scenes"), OBS_TEXT_MULTILINE);
+	obs_property_set_long_description(
+		scenes, tea_text_or("TeaLiveSubtitle.Prop.PauseScenes.Tooltip",
+				    "Scene names, one per line. While the program scene is one of them, captions "
+				    "are paused as with the button."));
+
+	obs_properties_add_group(props, "hide_group",
+				 tea_text_or("TeaLiveSubtitle.Prop.HideGroup", "Hiding captions (singing, pause)"),
+				 OBS_GROUP_NORMAL, group);
+	tea_hide_update_status(ctx, props);
+}
+
 static obs_properties_t *tea_captions_source_get_properties(void *data)
 {
 	struct tea_captions_source *ctx = data;
@@ -2513,6 +2833,8 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 				      tea_text_or("TeaLiveSubtitle.Prop.UnstableTailOpacity",
 						  "Not-yet-confirmed text opacity (%)"),
 				      10, 100, 5);
+
+	tea_add_hide_group(ctx, props, data);
 	return props;
 }
 

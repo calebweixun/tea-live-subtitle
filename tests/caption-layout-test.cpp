@@ -726,8 +726,39 @@ static void test_connection_policy()
 	       "the first update of a new source connects");
 }
 
+/* A line on screen that the caption state hides (classified singing after
+ * its first words showed, or a pause) fades out with the usual fade, from
+ * that moment, whatever the open-line rules say; shown again, the caller
+ * starts it over as a new line. */
+static void test_hidden_lines_fade()
+{
+	const uint32_t delay = 1500, fade = 200;
+	tea_display_line_t line;
+	tea_display_line_init(&line, 7, 6, 6, 0);
+	tea_display_line_note_activity(&line, 1, true, 0);
+	/* open and talking: would never fade */
+	const uint64_t talking =
+		tea_display_line_fade_ref(&line, 10900 * kMs, 10900 * kMs, delay, TEA_OPEN_LINE_TIMEOUT_MS);
+	expect(tea_fade_out_alpha(true, 11000 * kMs, talking, delay, fade) == 1.0f, "an open line is up");
+
+	expect(tea_display_line_note_hidden(&line, true, 11000 * kMs) == TEA_HIDE_STARTED, "hidden at 11.0 s");
+	expect(tea_display_line_note_hidden(&line, true, 11100 * kMs) == TEA_HIDE_KEEP, "hiding twice changes nothing");
+	const uint64_t ref =
+		tea_display_line_fade_ref(&line, 11150 * kMs, 11150 * kMs, delay, TEA_OPEN_LINE_TIMEOUT_MS);
+	expect(tea_fade_out_alpha(true, 11000 * kMs, ref, delay, fade) == 1.0f,
+	       "fully visible at the moment it is hidden");
+	const float half = tea_fade_out_alpha(true, 11100 * kMs, ref, delay, fade);
+	expect(half > 0.4f && half < 0.6f, "half way through the usual fade 100 ms later");
+	expect(tea_fade_out_done(true, 11200 * kMs, ref, delay, fade),
+	       "gone after the fade duration, although the segment is open and the session talking");
+	expect(tea_display_line_note_hidden(&line, false, 11300 * kMs) == TEA_HIDE_ENDED,
+	       "shown again: the caller starts it over");
+	expect(!line.hidden, "no longer hidden");
+}
+
 int main()
 {
+	test_hidden_lines_fade();
 	test_box_layout();
 	test_alignment();
 	test_utf8_and_breaks();

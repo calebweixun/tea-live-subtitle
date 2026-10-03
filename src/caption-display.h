@@ -395,6 +395,10 @@ typedef struct {
 	bool open;            /* the server segment may still grow */
 	bool used;
 	bool persistent; /* never fades out (the waiting placeholder) */
+	/* hidden by the caption state (singing / paused): its text is frozen
+	 * and it fades out from hidden_ns (tea_display_line_note_hidden()) */
+	bool hidden;
+	uint64_t hidden_ns;
 } tea_display_line_t;
 
 static inline void tea_display_line_init(tea_display_line_t *line, uint64_t key, size_t len, size_t locked_len,
@@ -507,6 +511,11 @@ static inline uint64_t tea_display_line_fade_ref(const tea_display_line_t *line,
 						 uint64_t server_progress_ns, uint32_t fade_delay_ms,
 						 uint32_t open_timeout_ms)
 {
+	if (line->hidden) {
+		/* hidden: the fade-out starts at once */
+		const uint64_t delay = (uint64_t)fade_delay_ms * 1000000ULL;
+		return line->hidden_ns > delay ? line->hidden_ns - delay : 0;
+	}
 	uint64_t ref = line->changed_ns > line->activity_ns ? line->changed_ns : line->activity_ns;
 	if (!line->open)
 		return ref;
@@ -524,6 +533,29 @@ static inline uint64_t tea_display_line_fade_ref(const tea_display_line_t *line,
 static inline void tea_display_line_retire(tea_display_line_t *line)
 {
 	line->visible_from = line->len;
+}
+
+#define TEA_HIDE_KEEP 0    /* nothing changed */
+#define TEA_HIDE_STARTED 1 /* just hidden: frozen, fading out from now */
+#define TEA_HIDE_ENDED 2   /* shown again: the caller starts it over as a new line */
+
+/*
+ * The caption state hides a line (its segment is singing, or captions are
+ * paused) or shows it again (a revision back to speech). A line hidden
+ * before any of it was on screen is retired at once, so it never appears;
+ * one on screen keeps its text and fades out with the usual fade (from
+ * now: see tea_display_line_fade_ref()). Text arriving for a hidden line is
+ * not applied by the caller.
+ */
+static inline int tea_display_line_note_hidden(tea_display_line_t *line, bool hidden, uint64_t now_ns)
+{
+	if (hidden == line->hidden)
+		return TEA_HIDE_KEEP;
+	line->hidden = hidden;
+	if (!hidden)
+		return TEA_HIDE_ENDED;
+	line->hidden_ns = now_ns;
+	return TEA_HIDE_STARTED;
 }
 
 static inline bool tea_display_line_has_visible_text(const tea_display_line_t *line)

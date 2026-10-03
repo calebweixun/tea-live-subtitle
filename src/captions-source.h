@@ -38,6 +38,13 @@ typedef struct {
  * (internally lock-protected); `cb` must not block. */
 void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *info, void *user), void *user);
 
+/* The program scene changed (OBS_FRONTEND_EVENT_SCENE_CHANGED, from
+ * plugin-main.c): sources whose "pause captions in these scenes" lists it
+ * pause, the others resume. */
+void tea_captions_source_program_scene_changed(const char *scene_name);
+/* Frees what the above keeps; call from obs_module_unload(). */
+void tea_captions_source_shutdown(void);
+
 /* Restarts every live instance's connection attempt, clearing any
  * "stopped, won't retry" state (e.g. after a server-reported
  * `retryable=false` error) so it tries fresh. */
