@@ -744,6 +744,143 @@ static void test_audio_ack_progress(void)
 	tea_caption_state_destroy(st);
 }
 
+/* ---------------- hiding: singing / manual pause ---------------- */
+
+/* The snapshot line of `text` (committed), or NULL. */
+static bool snapshot_hidden(tea_caption_state_t *st, const char *text, bool *found)
+{
+	tea_caption_snapshot_t snap;
+	tea_caption_state_snapshot(st, true, &snap);
+	bool hidden = false;
+	*found = false;
+	for (int i = 0; i < snap.count; i++) {
+		if (strcmp(snap.lines[i].text, text) == 0) {
+			*found = true;
+			hidden = snap.lines[i].hidden;
+		}
+	}
+	tea_caption_snapshot_free(&snap);
+	return hidden;
+}
+
+static void test_singing_hide(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_set_max_lines(st, 3);
+	tea_caption_state_set_hide_singing(st, true);
+	bool found = false;
+
+	/* speech: shown as always */
+	tea_caption_state_on_stable(st, "s", "a", 0, 1, "講道", "open");
+	tea_caption_state_on_audio_class(st, "s", "a", 0, "speech", 0);
+	expect_render(st, "講道", "a speech segment is shown");
+
+	/* singing decided before any text: never shown, never rendered */
+	tea_caption_state_on_audio_class(st, "s", "b", 1, "singing", 0);
+	tea_caption_state_on_stable(st, "s", "b", 1, 1, "奇異恩典", "open");
+	expect_render(st, "講道", "a singing segment is never rendered");
+	expect(snapshot_hidden(st, "奇異恩典", &found) && found, "it is in the snapshot, flagged hidden");
+	expect(tea_caption_state_singing_now(st), "the indicator says singing");
+	tea_caption_state_on_final_indexed(st, "s", "b", 1, 2, "奇異恩典何等甘甜");
+	expect_render(st, "講道", "its final is not rendered either");
+
+	/* a hidden line never takes a visible place: with 3 lines, two more
+	 * speech lines keep the first one */
+	tea_caption_state_on_stable(st, "s", "c", 2, 1, "第二句", "open");
+	tea_caption_state_on_audio_class(st, "s", "c", 2, "speech", 0);
+	tea_caption_state_on_stable(st, "s", "d", 3, 1, "第三句", "open");
+	expect_render(st, "講道\n第二句\n第三句", "hidden lines do not count against the line limit");
+	expect(!tea_caption_state_singing_now(st), "speech again: the indicator is off");
+
+	/* shown first, then classified singing (the first ~1.5 s): hidden from
+	 * then on, flagged so the display fades it out */
+	tea_caption_state_on_stable(st, "s", "e", 4, 1, "我們一起", "open");
+	expect(!snapshot_hidden(st, "我們一起", &found) && found, "not classified yet: shown");
+	tea_caption_state_on_audio_class(st, "s", "e", 4, "singing", 0);
+	expect(snapshot_hidden(st, "我們一起", &found) && found, "classified singing: flagged hidden");
+	expect_render(st, "第二句\n第三句",
+		      "and no longer rendered; the line it pushed out of the window does not come back");
+
+	/* revision back to speech: shown again */
+	tea_caption_state_on_audio_class(st, "s", "e", 4, "speech", 1);
+	expect(!snapshot_hidden(st, "我們一起", &found) && found, "a revision to speech shows it");
+	/* an older revision never undoes a newer one */
+	tea_caption_state_on_audio_class(st, "s", "e", 4, "singing", 0);
+	expect(!snapshot_hidden(st, "我們一起", &found), "an out-of-date revision is ignored");
+	/* the final's label is the last word */
+	tea_caption_state_on_audio_class(st, "s", "e", 4, "singing", TEA_AUDIO_CLASS_REVISION_FINAL);
+	expect(snapshot_hidden(st, "我們一起", &found), "transcript.final.audio_class wins");
+
+	/* "Always show": singing is shown, at once */
+	tea_caption_state_set_hide_singing(st, false);
+	expect(!snapshot_hidden(st, "我們一起", &found) && found, "Always show: singing segments are shown");
+	tea_caption_state_on_audio_class(st, "s", "e", 4, "chant", 2);
+	expect(!snapshot_hidden(st, "我們一起", &found), "an unknown class name is ignored");
+	expect(tea_caption_state_singing_segments(st) == 2, "two segments were classified singing");
+	tea_caption_state_destroy(st);
+}
+
+static void test_manual_pause(void)
+{
+	tea_caption_state_t *st = tea_caption_state_create();
+	tea_caption_state_set_stable_mode(st, true);
+	tea_caption_state_set_max_lines(st, 3);
+	tea_caption_state_set_hide_singing(st, true);
+	bool found = false;
+
+	tea_caption_state_on_stable(st, "s", "a", 0, 1, "第一句", "open");
+	const uint64_t before = tea_caption_state_revision(st);
+	tea_caption_state_set_paused(st, true);
+	expect(tea_caption_state_paused(st) && tea_caption_state_revision(st) != before, "pausing re-renders");
+	expect(snapshot_hidden(st, "第一句", &found) && found, "pausing hides what is on screen (it fades)");
+	expect_render(st, "", "nothing is rendered while paused");
+	/* the session goes on: text keeps arriving, hidden */
+	tea_caption_state_on_stable(st, "s", "a", 0, 2, "第一句還在說", "open");
+	tea_caption_state_on_stable(st, "s", "b", 1, 1, "暫停中的一句", "open");
+	tea_caption_state_on_audio_class(st, "s", "b", 1, "speech", 0);
+	expect_render(st, "", "new speech is not shown while paused, even when classified speech");
+	expect(snapshot_hidden(st, "暫停中的一句", &found) && found, "flagged hidden");
+
+	/* resume: only segments that start after it */
+	tea_caption_state_set_paused(st, false);
+	tea_caption_state_on_stable(st, "s", "a", 0, 3, "第一句還在說完了", "open");
+	tea_caption_state_on_stable(st, "s", "b", 1, 2, "暫停中的一句說完", "open");
+	expect_render(st, "", "segments that existed during the pause stay hidden after the resume");
+	tea_caption_state_on_stable(st, "s", "c", 2, 1, "恢復後", "open");
+	expect_render(st, "恢復後", "a segment that starts after the resume is shown");
+
+	/* a segment the client only heard of (audio_class) while paused, whose
+	 * text arrives after the resume, also stays hidden */
+	tea_caption_state_set_paused(st, true);
+	tea_caption_state_on_audio_class(st, "s", "d", 3, "speech", 0);
+	tea_caption_state_set_paused(st, false);
+	tea_caption_state_on_stable(st, "s", "d", 3, 1, "早就開始了", "open");
+	expect(snapshot_hidden(st, "早就開始了", &found) && found, "it started before the resume");
+
+	/* pause wins over Always show and over speech */
+	tea_caption_state_set_hide_singing(st, false);
+	tea_caption_state_on_stable(st, "s", "e", 4, 1, "之後", "open");
+	tea_caption_state_set_paused(st, true);
+	expect_render(st, "", "a pause hides everything, whatever the singing setting");
+	tea_caption_state_set_paused(st, false);
+	tea_caption_state_destroy(st);
+
+	/* partial mode: the preview and the finals follow the same rules */
+	st = tea_caption_state_create();
+	tea_caption_state_set_max_lines(st, 3);
+	tea_caption_state_set_hide_singing(st, true);
+	tea_caption_state_on_partial(st, "s", "p", 1, "唱的預覽");
+	tea_caption_state_on_audio_class(st, "s", "p", 0, "singing", 0);
+	expect_render(st, "", "partial mode: a singing preview is hidden");
+	tea_caption_state_on_final_indexed(st, "s", "p", 0, 2, "唱的結果");
+	tea_caption_state_on_partial(st, "s", "q", 1, "講的預覽");
+	expect_render(st, "講的預覽", "partial mode: its final too, a speech preview shows");
+	tea_caption_state_set_paused(st, true);
+	expect_render(st, "", "partial mode: paused");
+	tea_caption_state_destroy(st);
+}
+
 int main(void)
 {
 	tea_caption_state_t *state = tea_caption_state_create();
@@ -780,6 +917,8 @@ int main(void)
 	test_stable_append_only();
 	test_restatement_sequences();
 	test_audio_ack_progress();
+	test_singing_hide();
+	test_manual_pause();
 	test_stable_segment_isolation();
 	test_stable_closing_states();
 	test_stable_rejects_non_extension();

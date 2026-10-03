@@ -147,6 +147,11 @@ typedef struct {
 	char *tail;        /* unstable tail after `text`, or NULL; bfree()-able */
 	bool open;         /* stable mode: segment may still grow; partial mode: preview line */
 	uint64_t activity; /* changes on every transcript event of this line's segment */
+	/* not to be shown: its segment is singing (while singing hides) or
+	 * existed while captions were paused. A line already on screen fades
+	 * out; one that never was is never drawn. Never counts against the
+	 * visible-line budget and never appears in tea_caption_state_render(). */
+	bool hidden;
 } tea_caption_snapshot_line_t;
 
 typedef struct {
@@ -180,6 +185,33 @@ void tea_caption_state_set_stable_tail_lines(tea_caption_state_t *state, bool en
  * which makes the list exactly the lines of tea_caption_state_render(). */
 void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, tea_caption_snapshot_t *out);
 void tea_caption_snapshot_free(tea_caption_snapshot_t *snapshot);
+
+/* ---- hiding captions: singing, manual pause (docs/phase-b-rendering.md) ---- */
+
+#define TEA_AUDIO_CLASS_UNKNOWN 0
+#define TEA_AUDIO_CLASS_SPEECH 1
+#define TEA_AUDIO_CLASS_SINGING 2
+/* revision to pass for transcript.final.audio_class: the segment's last word */
+#define TEA_AUDIO_CLASS_REVISION_FINAL UINT64_MAX
+
+/* segment.audio_class (`class` "speech" / "singing", `revision` 0 first, 1 a
+ * change), or transcript.final.audio_class with
+ * TEA_AUDIO_CLASS_REVISION_FINAL. Older revisions are ignored; other class
+ * names are ignored. */
+void tea_caption_state_on_audio_class(tea_caption_state_t *state, const char *session_id, const char *segment_id,
+				      uint64_t segment_index, const char *audio_class, uint64_t revision);
+/* The "captions while singing" setting is automatic: singing segments are
+ * hidden. Off = shown like any other (default). Takes effect at once. */
+void tea_caption_state_set_hide_singing(tea_caption_state_t *state, bool enabled);
+/* Manual pause (hotkey / button / scene). Pausing hides every line that
+ * exists and every segment that starts while paused, for good; resuming
+ * shows only segments that start after it. The ASR session is unaffected. */
+void tea_caption_state_set_paused(tea_caption_state_t *state, bool paused);
+bool tea_caption_state_paused(tea_caption_state_t *state);
+/* The newest classified segment is singing (diagnostics indicator). */
+bool tea_caption_state_singing_now(tea_caption_state_t *state);
+uint64_t tea_caption_state_singing_segments(tea_caption_state_t *state);
+#define TEA_CAPTION_STATE_HAS_HIDING 1
 
 /* How the newest final closed its line (stable mode): 1 = the final continued
  * what was shown, 2 = the shown tail was kept (the final dropped a phrase),

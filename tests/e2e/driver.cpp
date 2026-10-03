@@ -13,13 +13,14 @@
  * tests/e2e/run_e2e.py parses these and asserts on them.
  *
  * Usage: asr-client-e2e --port N --token PATH [--host H] [--clients K]
- *                       [--duration-ms MS] [--audio speech|dead|none]
+ *                       [--duration-ms MS] [--audio speech|dead|silence|none|file:WAV]
  *                       [--restart-at-ms MS] [--stable on|off]
  *                       [--tail on|off] [--toggle-display-at-ms MS]
  *                       [--end-silence-ms MS] [--trace-dir DIR]
  *                       [--hints-profile S] [--hints-domain S]
  *                       [--hints-hotwords-file P] [--hints-replacements-file P]
  *                       [--hints-file P] [--fetch-dictionaries-at-ms MS]
+ *                       [--singing auto|show] [--pause-at-ms MS] [--resume-at-ms MS]
  *
  * --stable mirrors the source's "stable captions" setting (plugin default on).
  * --tail mirrors "show not-yet-confirmed text"; --toggle-display-at-ms flips
@@ -34,6 +35,10 @@
  * Properties window does, and prints
  *   {"t":ms,"client":i,"event":"dictionaries","state":n,"entries":[...],"error":"..."}
  * The done line also carries "hints": the client's hints status per client.
+ * --singing mirrors "captions while people sing" (plugin default auto);
+ * --pause-at-ms / --resume-at-ms press the pause hotkey / button, printing
+ *   {"t":ms,"event":"pause"} / {"t":ms,"event":"resume"}. Snapshot lines carry
+ * "hidden"; the done line "singing_supported" and "singing_segments".
  * Diagnostics (connection, heartbeat, WARN lines) go to stderr through the
  * obs_log stub, exactly as the plugin writes them to the OBS log.
  * The final {"event":"done"} line also carries "stable_mismatches",
@@ -165,6 +170,8 @@ int main(int argc, char **argv)
 	std::string traceDir;
 	std::string hintsProfile, hintsDomain, hintsHotwords, hintsReplacements, hintsFile;
 	int fetchDictionariesAtMs = -1;
+	bool singingAuto = true;
+	int pauseAtMs = -1, resumeAtMs = -1;
 
 	for (int i = 1; i < argc; i++) {
 		auto next = [&](const char *name) -> const char * {
@@ -210,6 +217,12 @@ int main(int argc, char **argv)
 			hintsFile = next("--hints-file");
 		else if (!std::strcmp(argv[i], "--fetch-dictionaries-at-ms"))
 			fetchDictionariesAtMs = std::atoi(next("--fetch-dictionaries-at-ms"));
+		else if (!std::strcmp(argv[i], "--singing"))
+			singingAuto = std::strcmp(next("--singing"), "show") != 0;
+		else if (!std::strcmp(argv[i], "--pause-at-ms"))
+			pauseAtMs = std::atoi(next("--pause-at-ms"));
+		else if (!std::strcmp(argv[i], "--resume-at-ms"))
+			resumeAtMs = std::atoi(next("--resume-at-ms"));
 		else {
 			std::fprintf(stderr, "unknown argument %s\n", argv[i]);
 			return 2;
@@ -228,6 +241,7 @@ int main(int argc, char **argv)
 		s.captions = tea_caption_state_create();
 		tea_caption_state_set_max_lines(s.captions, 3);
 		tea_caption_state_set_stable_tail_lines(s.captions, tail);
+		tea_caption_state_set_hide_singing(s.captions, singingAuto);
 		s.client = tea_asr_client_create(s.tap, s.captions);
 		tea_asr_client_set_server(s.client, host.c_str(), port);
 		tea_asr_client_set_token_path(s.client, token.c_str());
@@ -277,7 +291,8 @@ int main(int argc, char **argv)
 					{"key", QString::number(snap.lines[l].key)},
 					{"text", QString::fromUtf8(snap.lines[l].text)},
 					{"tail", snap.lines[l].tail ? QJsonValue(QString::fromUtf8(snap.lines[l].tail))
-								    : QJsonValue()}});
+								    : QJsonValue()},
+					{"hidden", snap.lines[l].hidden}});
 			}
 			tea_caption_snapshot_free(&snap);
 			std::string packed = QJsonDocument(lines).toJson(QJsonDocument::Compact).toStdString();
@@ -310,6 +325,19 @@ int main(int argc, char **argv)
 		});
 	}
 
+	/* the pause hotkey / button: the caption state only, never the client */
+	auto pauseAt = [&](int ms, bool paused) {
+		if (ms < 0)
+			return;
+		QTimer::singleShot(ms, [&, paused]() {
+			emitLine(QJsonObject{{"t", (double)clock.elapsed()}, {"event", paused ? "pause" : "resume"}});
+			for (auto &s : rigs)
+				tea_caption_state_set_paused(s.captions, paused);
+		});
+	};
+	pauseAt(pauseAtMs, true);
+	pauseAt(resumeAtMs, false);
+
 	if (fetchDictionariesAtMs >= 0) {
 		g_rigs = &rigs;
 		g_clock = &clock;
@@ -326,8 +354,12 @@ int main(int argc, char **argv)
 		QJsonArray segmentation;
 		QJsonArray effective;
 		QJsonArray hints;
+		QJsonArray singingSupported;
+		QJsonArray singingSegments;
 		for (auto &s : rigs) {
 			hints.append(hintsStatusJson(s.client));
+			singingSupported.append(tea_asr_client_supports_singing_detection(s.client));
+			singingSegments.append((double)tea_caption_state_singing_segments(s.captions));
 			mismatches.append((double)tea_caption_state_stable_mismatches(s.captions));
 			segmentation.append(tea_asr_client_supports_segmentation(s.client, nullptr, nullptr, nullptr));
 			effective.append(tea_asr_client_effective_end_silence_ms(s.client));
@@ -343,7 +375,9 @@ int main(int argc, char **argv)
 				     {"stable_mismatches", mismatches},
 				     {"segmentation_supported", segmentation},
 				     {"end_silence_effective", effective},
-				     {"hints", hints}});
+				     {"hints", hints},
+				     {"singing_supported", singingSupported},
+				     {"singing_segments", singingSegments}});
 		app.quit();
 	});
 

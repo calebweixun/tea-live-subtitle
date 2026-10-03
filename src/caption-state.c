@@ -62,6 +62,12 @@ typedef struct {
 	uint64_t stable_revision;
 	bool stable_closed; /* closing transcript.stable seen: line never changes again */
 	bool had_line;      /* a line was created for it (it may since have scrolled away) */
+	/* singing hide (segment.audio_class, docs/phase-b-rendering.md) */
+	int audio_class;         /* TEA_AUDIO_CLASS_* */
+	uint64_t class_revision; /* of the audio_class applied */
+	bool class_known;
+	bool pause_hidden; /* known while captions were paused: never shown */
+	bool was_singing;  /* counted in singing_segments */
 } tea_segment_track_t;
 
 /* One on-screen line. In partial mode these are finalized lines only (the
@@ -83,6 +89,11 @@ typedef struct {
 	 * may change it any more. Set when the segment closes. */
 	bool settled;
 	bool order_unknown; /* created before its segment_index was known */
+	int audio_class;    /* TEA_AUDIO_CLASS_* of its segment */
+	bool pause_hidden;  /* its segment existed while captions were paused */
+	/* Left the visible window (newer lines took its place): it never comes
+	 * back, even when a newer line is hidden later and frees a place. */
+	bool scrolled_out;
 } tea_caption_line_t;
 
 struct tea_caption_state {
@@ -119,6 +130,16 @@ struct tea_caption_state {
 	uint64_t last_ack_sample;
 	int last_close; /* TEA_CLOSE_* of the newest final (diagnostics / replay) */
 	bool stable_tail_lines;
+
+	/* Hiding captions (tea_caption_state_set_hide_singing() / _set_paused()).
+	 * A hidden line stays in the list (flagged in the snapshot, so a line
+	 * already on screen can fade out) but is never rendered and never
+	 * counts against the visible-line budget. */
+	bool hide_singing;
+	bool paused;
+	int newest_class;            /* audio class of the newest classified segment */
+	uint64_t newest_class_order; /* its order key + 1 (0 = none yet) */
+	uint64_t singing_segments;   /* segments ever classified singing (diagnostics) */
 };
 
 tea_caption_state_t *tea_caption_state_create(void)
@@ -532,6 +553,7 @@ static void tea_reset_locked(tea_caption_state_t *st)
 	memset(st->segments, 0, sizeof(st->segments));
 	st->next_segment_slot = 0;
 	st->carry_over = false;
+	st->newest_class = TEA_AUDIO_CLASS_UNKNOWN;
 	st->epoch++;
 	st->revision++;
 }
@@ -625,19 +647,76 @@ static tea_segment_track_t *tea_track_segment_locked(tea_caption_state_t *st, co
 	memset(slot, 0, sizeof(*slot));
 	snprintf(slot->segment_id, TEA_ID_BUF, "%s", segment_id);
 	slot->used = true;
+	/* A segment first heard of while paused stays hidden after the resume:
+	 * resuming shows only segments that start after it. */
+	slot->pause_hidden = st->paused;
 	return slot;
 }
 
-static void tea_push_finalized_locked(tea_caption_state_t *st, const char *text, uint64_t key)
+/* Must hold state->lock. The tracking slot of segment_id, or NULL. */
+static tea_segment_track_t *tea_find_segment_locked(tea_caption_state_t *st, const char *segment_id)
 {
-	int keep = tea_visible_lines_locked(st);
-	while (st->line_count >= keep || st->line_count >= TEA_MAX_FINALIZED_LINES)
+	for (size_t i = 0; i < TEA_MAX_TRACKED_SEGMENTS; i++) {
+		if (st->segments[i].used && strncmp(st->segments[i].segment_id, segment_id, TEA_ID_BUF) == 0)
+			return &st->segments[i];
+	}
+	return NULL;
+}
+
+/* Must hold state->lock. Whether a line (or the partial-mode preview, by
+ * its segment) is hidden: paused for it, or singing while singing hides. */
+static bool tea_hidden_locked(const tea_caption_state_t *st, int audio_class, bool pause_hidden)
+{
+	return pause_hidden || (st->hide_singing && audio_class == TEA_AUDIO_CLASS_SINGING);
+}
+
+static bool tea_line_hidden_locked(const tea_caption_state_t *st, const tea_caption_line_t *line)
+{
+	return tea_hidden_locked(st, line->audio_class, line->pause_hidden);
+}
+
+static bool tea_preview_hidden_locked(tea_caption_state_t *st)
+{
+	if (!st->preview_text)
+		return false;
+	const tea_segment_track_t *seg = tea_find_segment_locked(st, st->preview_segment_id);
+	return seg ? tea_hidden_locked(st, seg->audio_class, seg->pause_hidden) : st->paused;
+}
+
+/* Must hold state->lock. Whether line i takes a place in the visible-line
+ * budget: it has committed text (stable mode) and is not hidden. */
+static bool tea_line_counts_locked(const tea_caption_state_t *st, int i)
+{
+	const tea_caption_line_t *line = &st->lines[i];
+	if (st->stable_mode && line->text[0] == '\0')
+		return false;
+	return !tea_line_hidden_locked(st, line);
+}
+
+static void tea_push_finalized_locked(tea_caption_state_t *st, const char *text, uint64_t key,
+				      const tea_segment_track_t *seg)
+{
+	/* Hidden lines do not take a visible place: they never push a shown
+	 * line out. */
+	const int keep = tea_visible_lines_locked(st);
+	for (;;) {
+		int counted = 0;
+		for (int i = 0; i < st->line_count; i++)
+			counted += tea_line_counts_locked(st, i) ? 1 : 0;
+		if (st->line_count == 0 || (counted < keep && st->line_count < TEA_MAX_FINALIZED_LINES))
+			break;
 		tea_drop_oldest_line_locked(st);
+	}
 	tea_caption_line_t *line = &st->lines[st->line_count++];
 	memset(line, 0, sizeof(*line));
 	line->text = bstrdup(text ? text : "");
 	line->order = st->line_count > 1 ? st->lines[st->line_count - 2].order : 0;
 	line->key = key ? key : tea_new_key_locked(st);
+	if (seg) {
+		snprintf(line->segment_id, TEA_ID_BUF, "%s", seg->segment_id);
+		line->audio_class = seg->audio_class;
+		line->pause_hidden = seg->pause_hidden;
+	}
 }
 
 /* ---------------- stable mode ---------------- */
@@ -690,6 +769,8 @@ static tea_caption_line_t *tea_stable_line_locked(tea_caption_state_t *st, tea_s
 	line->order_unknown = segment_index == TEA_CAPTION_SEGMENT_INDEX_UNKNOWN;
 	line->key = tea_new_key_locked(st);
 	line->open = true;
+	line->audio_class = seg->audio_class;
+	line->pause_hidden = seg->pause_hidden;
 	seg->had_line = true;
 	return line;
 }
@@ -894,7 +975,7 @@ void tea_caption_state_on_final_indexed(tea_caption_state_t *state, const char *
 		tea_clear_preview_locked(state);
 	}
 
-	tea_push_finalized_locked(state, text, key);
+	tea_push_finalized_locked(state, text, key, seg);
 	tea_touch_locked(state, NULL);
 
 	pthread_mutex_unlock(&state->lock);
@@ -952,16 +1033,21 @@ void tea_caption_state_on_session_cancelled(tea_caption_state_t *state, const ch
 
 /* Must hold state->lock. Index of the first line to render. Stable mode
  * skips empty lines (a segment whose first event carried no text yet). */
-static int tea_first_visible_line_locked(const tea_caption_state_t *st)
+static int tea_first_visible_line_locked(tea_caption_state_t *st)
 {
 	int want = tea_visible_lines_locked(st);
 	int first = st->line_count;
 	int shown = 0;
-	while (first > 0 && shown < want) {
+	while (first > 0 && shown < want && !st->lines[first - 1].scrolled_out) {
 		first--;
-		if (!st->stable_mode || st->lines[first].text[0] != '\0')
+		if (tea_line_counts_locked(st, first))
 			shown++;
 	}
+	/* Lines before the window are out for good: a line hidden later (a
+	 * segment classified singing after it was shown) frees a place, and an
+	 * old sentence must not reappear in it. */
+	for (int i = 0; i < first; i++)
+		st->lines[i].scrolled_out = true;
 	return first;
 }
 
@@ -973,7 +1059,7 @@ char *tea_caption_state_render(tea_caption_state_t *state)
 	size_t total_len = 1;
 	for (int i = first; i < state->line_count; i++)
 		total_len += strlen(state->lines[i].text) + 1;
-	const char *preview = state->stable_mode ? NULL : state->preview_text;
+	const char *preview = state->stable_mode || tea_preview_hidden_locked(state) ? NULL : state->preview_text;
 	if (preview)
 		total_len += strlen(preview) + 1;
 
@@ -988,7 +1074,7 @@ char *tea_caption_state_render(tea_caption_state_t *state)
 	char *out = bmalloc(total_len);
 	out[0] = '\0';
 	for (int i = first; i < state->line_count; i++) {
-		if (state->stable_mode && state->lines[i].text[0] == '\0')
+		if (!tea_line_counts_locked(state, i))
 			continue;
 		strcat(out, state->lines[i].text);
 		strcat(out, "\n");
@@ -1010,11 +1096,11 @@ char *tea_caption_state_render(tea_caption_state_t *state)
 bool tea_caption_state_last_line_is_partial(tea_caption_state_t *state)
 {
 	pthread_mutex_lock(&state->lock);
-	bool result = state->preview_text != NULL;
+	bool result = state->preview_text != NULL && !tea_preview_hidden_locked(state);
 	if (state->stable_mode) {
 		result = false;
 		for (int i = state->line_count - 1; i >= 0; i--) {
-			if (state->lines[i].text[0] != '\0') {
+			if (tea_line_counts_locked(state, i)) {
 				result = state->lines[i].open;
 				break;
 			}
@@ -1079,14 +1165,7 @@ void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, t
 	 * with committed text. Tail-only lines (no committed text yet) never
 	 * count against that budget, so showing a tail never pushes an older
 	 * committed line off the list (which would bring it back later). */
-	int want = tea_visible_lines_locked(state);
-	int first = state->line_count;
-	int shown = 0;
-	while (first > 0 && shown < want) {
-		first--;
-		if (!state->stable_mode || state->lines[first].text[0] != '\0')
-			shown++;
-	}
+	const int first = tea_first_visible_line_locked(state);
 	const int cap = TEA_CAPTION_SNAPSHOT_MAX_LINES - 1; /* room for the preview */
 	for (int i = first; i < state->line_count && out->count < cap; i++) {
 		const tea_caption_line_t *line = &state->lines[i];
@@ -1099,6 +1178,7 @@ void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, t
 		dst->tail = tail ? bstrdup(tail) : NULL;
 		dst->open = line->open;
 		dst->activity = line->activity;
+		dst->hidden = tea_line_hidden_locked(state, line);
 	}
 	if (!state->stable_mode && state->preview_text) {
 		tea_caption_snapshot_line_t *dst = &out->lines[out->count++];
@@ -1107,6 +1187,7 @@ void tea_caption_state_snapshot(tea_caption_state_t *state, bool include_tail, t
 		dst->tail = NULL;
 		dst->open = true;
 		dst->activity = state->activity;
+		dst->hidden = tea_preview_hidden_locked(state);
 	}
 	pthread_mutex_unlock(&state->lock);
 }
@@ -1126,6 +1207,114 @@ int tea_caption_state_last_close(tea_caption_state_t *state)
 {
 	pthread_mutex_lock(&state->lock);
 	int result = state->last_close;
+	pthread_mutex_unlock(&state->lock);
+	return result;
+}
+
+/* ---------------- hiding: singing / pause ---------------- */
+
+static int tea_audio_class_from_text(const char *cls)
+{
+	if (cls && strcmp(cls, "singing") == 0)
+		return TEA_AUDIO_CLASS_SINGING;
+	if (cls && strcmp(cls, "speech") == 0)
+		return TEA_AUDIO_CLASS_SPEECH;
+	return TEA_AUDIO_CLASS_UNKNOWN;
+}
+
+void tea_caption_state_on_audio_class(tea_caption_state_t *state, const char *session_id, const char *segment_id,
+				      uint64_t segment_index, const char *audio_class, uint64_t revision)
+{
+	const int cls = tea_audio_class_from_text(audio_class);
+	if (!segment_id || cls == TEA_AUDIO_CLASS_UNKNOWN)
+		return;
+	pthread_mutex_lock(&state->lock);
+	if (!tea_ensure_session_locked(state, session_id)) {
+		pthread_mutex_unlock(&state->lock);
+		return;
+	}
+	tea_segment_track_t *seg = tea_track_segment_locked(state, segment_id);
+	/* the first label, then only newer revisions (the final's label is
+	 * TEA_AUDIO_CLASS_REVISION_FINAL, the newest of all) */
+	if (seg->class_known && revision < seg->class_revision) {
+		pthread_mutex_unlock(&state->lock);
+		return;
+	}
+	const bool changed = !seg->class_known || seg->audio_class != cls;
+	if (cls == TEA_AUDIO_CLASS_SINGING && !seg->was_singing) {
+		seg->was_singing = true;
+		state->singing_segments++;
+	}
+	seg->class_known = true;
+	seg->audio_class = cls;
+	seg->class_revision = revision;
+	tea_caption_line_t *line = tea_find_line_locked(state, segment_id);
+	if (line)
+		line->audio_class = cls;
+	const uint64_t order =
+		segment_index == TEA_CAPTION_SEGMENT_INDEX_UNKNOWN
+			? 0
+			: ((state->epoch << TEA_ORDER_EPOCH_SHIFT) | (segment_index & TEA_ORDER_INDEX_MASK)) + 1;
+	if (order == 0 || order >= state->newest_class_order) {
+		if (order)
+			state->newest_class_order = order;
+		state->newest_class = cls;
+	}
+	if (changed)
+		state->revision++;
+	pthread_mutex_unlock(&state->lock);
+}
+
+void tea_caption_state_set_hide_singing(tea_caption_state_t *state, bool enabled)
+{
+	pthread_mutex_lock(&state->lock);
+	if (state->hide_singing != enabled) {
+		state->hide_singing = enabled;
+		state->revision++;
+	}
+	pthread_mutex_unlock(&state->lock);
+}
+
+void tea_caption_state_set_paused(tea_caption_state_t *state, bool paused)
+{
+	pthread_mutex_lock(&state->lock);
+	if (state->paused != paused) {
+		state->paused = paused;
+		if (paused) {
+			/* Everything that exists now stays hidden for good; new
+			 * segments are hidden while the pause lasts (see
+			 * tea_track_segment_locked()). */
+			for (int i = 0; i < state->line_count; i++)
+				state->lines[i].pause_hidden = true;
+			for (size_t i = 0; i < TEA_MAX_TRACKED_SEGMENTS; i++)
+				if (state->segments[i].used)
+					state->segments[i].pause_hidden = true;
+		}
+		state->revision++;
+	}
+	pthread_mutex_unlock(&state->lock);
+}
+
+bool tea_caption_state_paused(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	const bool result = state->paused;
+	pthread_mutex_unlock(&state->lock);
+	return result;
+}
+
+bool tea_caption_state_singing_now(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	const bool result = state->newest_class == TEA_AUDIO_CLASS_SINGING;
+	pthread_mutex_unlock(&state->lock);
+	return result;
+}
+
+uint64_t tea_caption_state_singing_segments(tea_caption_state_t *state)
+{
+	pthread_mutex_lock(&state->lock);
+	const uint64_t result = state->singing_segments;
 	pthread_mutex_unlock(&state->lock);
 	return result;
 }

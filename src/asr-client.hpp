@@ -75,6 +75,8 @@ public:
 	bool capabilitiesKnown() const;
 	bool supportsPartialTranscripts() const;
 	bool supportsStableTranscripts() const;
+	/* capabilities.features.singing_detection (segment.audio_class events). */
+	bool supportsSingingDetection() const;
 	bool stableCaptionsActive() const;
 	/* capabilities.features.segmentation_control.end_silence_ms, if any. */
 	bool supportsSegmentationControl(int *min_ms, int *max_ms, int *default_ms) const;
@@ -217,6 +219,7 @@ private:
 	std::atomic<bool> capabilitiesKnown_{false};
 	std::atomic<bool> serverSupportsPartial_{false};
 	std::atomic<bool> serverSupportsStable_{false};
+	std::atomic<bool> serverSupportsSinging_{false};
 
 	/* Stable captions (transcript.stable). stablePreferred_ is the source
 	 * setting; stableRejected_ is set when a server that advertised the

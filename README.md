@@ -118,6 +118,12 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   觸發不了換句偵測時間的快語速；標點留在行尾，畫面上已出現的字不會移動。新來源預設句末＋逗號（最短 8 字）。
 * 離線重播工具 `tests/replay/`：把真實 server 事件 trace 餵進字幕狀態機與排版政策，檢查畫面上的字是否倒退或消失。
 
+## 唱詩歌時隱藏字幕、暫停字幕
+
+「唱詩歌時的字幕」：自動（預設；server 宣告 `singing_detection` 時，判定為唱歌的句子不顯示，已顯示的淡出）或永遠顯示。
+另有每個來源的快速鍵「TEA 字幕：暫停／恢復」與屬性視窗的暫停按鈕（辨識不中斷，恢復後只顯示新的句子），以及
+「在這些場景自動暫停」。細節見 [`docs/phase-b-rendering.md`](docs/phase-b-rendering.md#隱藏字幕唱詩歌與暫停)。
+
 ## 診斷：字幕沒有出來的時候
 
 見 [`docs/diagnostics.md`](docs/diagnostics.md)。外掛在 OBS 記錄檔寫出：

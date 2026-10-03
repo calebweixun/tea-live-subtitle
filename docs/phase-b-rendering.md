@@ -188,6 +188,43 @@ partial 就重複了它（`tea_norm_has_new_repeat()`）。
 不是折行或行數上限：行數上限只捲掉最上面的列，不移動任何一列的字（版面移動仍為 0），而重播工具的「一次冒出
 多少字」只計實際新增的字（最長共同子序列以外），捲動不算。
 
+## 隱藏字幕：唱詩歌與暫停
+
+唱詩歌的歌詞辨識出來大多是錯字（使用者校正過的參考稿上 CER 20–38%），所以唱歌時不顯示字幕。兩種方式，可以同時用：
+
+* **「唱詩歌時的字幕」**（`singing_captions`，外觀類設定：立即生效、不重連）：
+  * **自動（依伺服器偵測）**，新來源與舊來源的預設值。server 的 `capabilities.features.singing_detection` 為
+    `true` 時，每一句會收到 `segment.audio_class`（`speech`／`singing`，約在 `speech.started` 後 1.5 秒決定，類別改變時
+    最多再送一次 `revision=1`；`transcript.final` 也可能帶 `audio_class`，以它為最後的結果）。判定為 `singing` 的句子
+    不顯示；如果在判定之前已經顯示了一部分（前 ~1.5 秒的尾巴），就用一般的淡出時間淡掉；之後改判為 `speech` 時，
+    像新的一行一樣重新出現。server 不宣告這個能力時沒有任何事件，字幕照常顯示，屬性視窗的狀態列提示
+    「伺服器未開啟歌唱偵測（TEA_ASR_SINGING_DETECTION=1）」。舊來源也預設自動：使用者要的主要就是自動；server 的
+    YAMNet 偵測（有模型資產時預設開啟）以「不誤藏講道」為優先（held-out 講道 0 次誤判、29 分鐘講道 0 次），隱藏只作用在
+    被標成 `singing` 的句子；萬一誤藏，改成「永遠顯示」立即生效，狀態列與 OBS 記錄檔也會說明目前在隱藏。
+  * **永遠顯示**：和以前一樣。
+* **手動暫停**：每個來源一個 OBS 快速鍵「TEA 字幕：暫停／恢復」（`obs_hotkey_register_source`，綁定隨場景集合儲存），
+  屬性視窗裡也有同樣作用的按鈕。暫停時畫面上的字淡出、新的字不顯示，**辨識照常進行、不斷線**（重連會重建 session）。
+  恢復後只顯示恢復之後才開始的句子：暫停期間存在或開始的句子（包括還沒說完的那一句）不會在恢復時突然冒出來。
+  暫停永遠優先於「自動」。暫停狀態**不跨 OBS 重新啟動保存**：忘了恢復的暫停會讓下一場聚會整場沒有字幕，而且不容易
+  發現。
+* **在這些場景自動暫停**（`pause_scenes`，一行一個場景名稱，也接受逗號與「、」）：節目畫面切到清單裡的場景時就像按了
+  暫停，切走時恢復（`OBS_FRONTEND_EVENT_SCENE_CHANGED`，外掛本來就連結 obs-frontend-api）。手動暫停與場景暫停任一成立
+  就是暫停。
+
+判定在句子開出後約 1.5 秒才到，所以唱歌的句子前 ~1.5 秒的字通常會先出現、隨即淡出（重播 trace 時，加上合成標記的
+唱歌句子幾乎每一句都是如此，開不開「顯示未確定文字」都一樣）。要完全不出現，得讓每一句都等判定才顯示，所有字幕都會晚
+1.5 秒，目前沒有這樣做。
+
+實作：`caption-state.c` 記住每一句的類別與「暫停期間存在過」，snapshot 的每一行帶 `hidden`。隱藏的行不算在行數上限裡、
+`tea_caption_state_render()` 也不輸出；已經離開畫面視窗的舊行不會因為後面的行被隱藏而回來（`scrolled_out`）。
+`captions-source.c` 對還沒出現過的隱藏行什麼都不畫，對已經在畫面上的行凍結文字、從隱藏的那一刻開始淡出
+（`tea_display_line_note_hidden()`、`tea_display_line_fade_ref()`；淡出關閉時立即移除）；改判為 speech 時重新建立這一行。
+等待提示在暫停或只有隱藏行時不出現。
+
+狀態：屬性視窗的狀態列與診斷列（「字幕已暫停」、「♪ 唱詩歌中：字幕隱藏」）；OBS 記錄檔在狀態改變時寫 INFO
+（`captions paused (hotkey|button|scene)`／`captions resumed (...)`，最多每秒一行；`captions: singing detected,
+hiding sung captions`／`speech again, captions shown`，最多每 10 秒一行，中間略過的改變會註明）。
+
 ## 診斷列
 
 「在畫面上顯示診斷列」開啟時，字幕下方多一行小字（字級的一半），顯示連線狀態、語音狀態、輸入音量與距離上次出字的
@@ -199,7 +236,9 @@ partial 就重複了它（`tea_norm_has_new_repeat()`）。
 `tests/replay/caption-replay.cpp` 把真實 server 事件 trace（JSONL：`{"t_ms", "event"}`）餵進外掛真正的
 `caption-state.c` 與 `caption-display.h`，照 `captions-source.c` 的流程模擬畫面，印出每次畫面變化，並標出
 「段落還開著時畫面上的字變少或消失」的每一刻（淡出、行數上限、尾巴收回、尾巴修正）、每一句結束時畫面與
-server 文字的關係，以及一個 frame 內最多冒出多少字。建置方式見 `tests/replay/README.md`。
+server 文字的關係，以及一個 frame 內最多冒出多少字。trace 裡的 `segment.audio_class`（與 final 的 `audio_class`）也照
+外掛的預設「自動」處理（`--singing show` 改為永遠顯示），隱藏造成的變化另外標成 `HIDDEN (singing)`，不算在說話中淡出裡。
+建置方式見 `tests/replay/README.md`。
 
 ## 設定套用
 

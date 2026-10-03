@@ -29,6 +29,10 @@ normalising away punctuation and spaces) when that segment's final does not repe
 tails kept over a different final, and finals whose remainder replaced the tail, with examples. The largest burst
 counts only characters that are new in a frame (outside the longest common subsequence with the previous frame), so
 scrolling a row away does not count.
+`segment.audio_class` events (and a final's `audio_class`) hide singing like the plugin's default "Automatic";
+`--singing show` replays as "Always show". The `# singing` line counts the singing labels, the lines hidden while on
+screen (and whether they had text that faded out), the lines shown again after a revision, and the open-line changes
+caused by hiding, which are printed as `HIDDEN (singing)` and not counted as mid-speech fades.
 `audio.ack` events feed the server-progress signal that keeps a still-open line up (the plugin's 10 s open-line
 timeout); `--ignore-acks` replays as if the server sent none, so only the timeout applies.
 `--selftest-width-change W MS` switches the box width at MS as a real reflow, to check that the detector notices moves.
