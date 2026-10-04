@@ -12,6 +12,9 @@
  *   "silence": a source that delivers audio at real time, all zeros (a muted
  *             or silent source).
  *   "none":   no audio source selected at all.
+ *   "gap:ON_MS:OFF_MS": "speech" for ON_MS, then no audio at all for OFF_MS
+ *             (a media source that finished: the capture delivers nothing),
+ *             then "speech" again. Exercises the lazy reconnect.
  *   "file:PATH": a 16 kHz mono s16le WAV file, looped, paced at real time
  *             (a real recording, e.g. congregational singing, so the
  *             server's real singing detector has something to label).
@@ -29,7 +32,7 @@
 #define FAKE_SPEECH_SAMPLES (3 * FAKE_RATE)
 #define FAKE_CYCLE_SAMPLES (FAKE_SPEECH_SAMPLES + FAKE_RATE * 3 / 2)
 
-enum fake_mode { FAKE_SPEECH, FAKE_DEAD, FAKE_SILENCE, FAKE_NONE, FAKE_FILE };
+enum fake_mode { FAKE_SPEECH, FAKE_DEAD, FAKE_SILENCE, FAKE_NONE, FAKE_FILE, FAKE_GAP };
 
 struct tea_audio_tap {
 	enum fake_mode mode;
@@ -38,7 +41,8 @@ struct tea_audio_tap {
 };
 
 static enum fake_mode g_default_mode = FAKE_SPEECH;
-static int16_t *g_file_pcm = NULL; /* FAKE_FILE: the WAV's samples */
+static uint64_t g_gap_from = 0, g_gap_to = 0; /* FAKE_GAP: samples [from, to) never arrive */
+static int16_t *g_file_pcm = NULL;            /* FAKE_FILE: the WAV's samples */
 static size_t g_file_samples = 0;
 
 /* The samples of a 16 kHz mono 16-bit PCM WAV, or false. */
@@ -91,7 +95,14 @@ void fake_audio_tap_set_default_mode(const char *mode)
 		g_default_mode = FAKE_NONE;
 	else if (strcmp(mode, "silence") == 0)
 		g_default_mode = FAKE_SILENCE;
-	else if (strncmp(mode, "file:", 5) == 0) {
+	else if (strncmp(mode, "gap:", 4) == 0) {
+		const long on_ms = strtol(mode + 4, NULL, 10);
+		const char *off = strchr(mode + 4, ':');
+		const long off_ms = off ? strtol(off + 1, NULL, 10) : 0;
+		g_gap_from = (uint64_t)on_ms * FAKE_RATE / 1000;
+		g_gap_to = g_gap_from + (uint64_t)off_ms * FAKE_RATE / 1000;
+		g_default_mode = FAKE_GAP;
+	} else if (strncmp(mode, "file:", 5) == 0) {
 		if (!load_wav(mode + 5)) {
 			fprintf(stderr, "cannot read %s as 16 kHz mono 16-bit PCM WAV\n", mode + 5);
 			exit(2);
@@ -127,9 +138,20 @@ bool tea_audio_tap_has_source(tea_audio_tap_t *tap)
 
 size_t tea_audio_tap_pull_pcm16(tea_audio_tap_t *tap, int16_t *out, size_t max_samples)
 {
-	if (tap->mode != FAKE_SPEECH && tap->mode != FAKE_SILENCE && tap->mode != FAKE_FILE)
+	if (tap->mode != FAKE_SPEECH && tap->mode != FAKE_SILENCE && tap->mode != FAKE_FILE && tap->mode != FAKE_GAP)
 		return 0;
 	uint64_t due = (uint64_t)((now_s() - tap->start_s) * FAKE_RATE);
+	if (tap->mode == FAKE_GAP && due > g_gap_from && tap->produced < g_gap_to) {
+		/* inside the gap nothing arrives; afterwards audio resumes at real
+		 * time, without the gap's backlog */
+		if (tap->produced < g_gap_from) {
+			due = g_gap_from;
+		} else if (due < g_gap_to) {
+			return 0;
+		} else {
+			tap->produced = g_gap_to;
+		}
+	}
 	if (due <= tap->produced)
 		return 0;
 	size_t n = (size_t)(due - tap->produced);
@@ -143,7 +165,7 @@ size_t tea_audio_tap_pull_pcm16(tea_audio_tap_t *tap, int16_t *out, size_t max_s
 		}
 		uint64_t phase = s % FAKE_CYCLE_SAMPLES;
 		double v = 0.0;
-		if (tap->mode == FAKE_SPEECH && phase < FAKE_SPEECH_SAMPLES)
+		if ((tap->mode == FAKE_SPEECH || tap->mode == FAKE_GAP) && phase < FAKE_SPEECH_SAMPLES)
 			v = 0.3 * sin(2.0 * M_PI * 440.0 * (double)s / FAKE_RATE);
 		out[i] = (int16_t)(v * 32767.0);
 	}

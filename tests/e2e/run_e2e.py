@@ -354,15 +354,81 @@ def sc_host_rejected(ctx) -> Checker:
 
 
 def sc_idle_timeout(ctx) -> Checker:
+    """A source that stops producing audio: the server ends the session with
+    idle_timeout (4408) once, and the client then waits for audio instead of
+    reconnecting into another session that idles out again."""
     c = Checker("idle_timeout_4408")
     srv = ctx.server(["--idle-timeout-s", "3"])
     run = ctx.drive(srv, srv.token_file, 30000, audio="dead")
     closes = [r for r in run.requests if r["event"] == "ws_close" and r.get("close_code") == 4408]
-    c.check(bool(closes), f"server closed with 4408 ({len(closes)} times)")
+    c.check(len(closes) == 1, f"server closed with 4408 once ({len(closes)} times)")
     c.check(run.any_status("idle_timeout"), "status names idle_timeout")
-    accepts = sorted(r["t"] for r in run.requests if r["event"] == "ws_accept")
-    g = gaps(accepts)
-    c.check(len(g) >= 2 and g[-1] > g[0] + 1.5, f"reconnect interval grows between idle sessions (gaps={g})")
+    c.check(run.any_status("waiting for audio (idle)"), "and says it waits for audio")
+    accepts = [r for r in run.requests if r["event"] == "ws_accept"]
+    preflights = [r for r in run.requests if r["event"] == "http" and r["path"] == "/v1/capabilities"]
+    c.check(len(accepts) == 1 and len(preflights) == 1,
+            f"no reconnect in the ~27 s without audio after the close ({len(preflights)} preflights, "
+            f"{len(accepts)} sessions)")
+    c.check(len(run.log_lines("no audio: waiting for the audio source")) == 1, "one INFO line on entering the wait")
+    return c, run
+
+
+def sc_idle_resume(ctx) -> Checker:
+    """Audio stops (the media source ended), the server idles the session
+    out, nothing is attempted while there is no audio, and when audio comes
+    back the client connects at once, keeps that audio, and shows text soon.
+    No trace file for a session without speech."""
+    import shutil
+    c = Checker("idle_resume")
+    trace_dir = ctx.work / "traces"
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    srv = ctx.server(["--revisable", "--growing-text", "--idle-timeout-s", "3"])
+    on_ms, off_ms = 4000, 14000
+    run = ctx.drive(srv, srv.token_file, 26000, audio=f"gap:{on_ms}:{off_ms}",
+                    extra_args=("--trace-dir", str(trace_dir)))
+    closes = [r for r in run.requests if r["event"] == "ws_close" and r.get("close_code") == 4408]
+    c.check(len(closes) == 1, f"the session idles out once when the audio stops ({len(closes)})")
+    preflights = sorted(r["t"] for r in run.requests if r["event"] == "http" and r["path"] == "/v1/capabilities")
+    accepts = [r for r in run.requests if r["event"] == "ws_accept"]
+    c.check(len(preflights) == 2 and len(accepts) == 2,
+            f"exactly one reconnect, when the audio is back ({len(preflights)} preflights, {len(accepts)} sessions)")
+    if closes and len(preflights) == 2:
+        c.check(preflights[1] - closes[0]["t"] > (on_ms + off_ms) / 1000 - closes[0]["t"] - 0.5,
+                f"nothing between the idle close ({closes[0]['t']} s) and the audio's return "
+                f"(next attempt at {preflights[1]} s)")
+    c.check(run.any_status("waiting for audio (idle)"), "the status shows the idle wait")
+    resume_ms = on_ms + off_ms
+    after = [l for l in run.captions() if l["t"] >= resume_ms and l.get("caption")]
+    shown = [l for l in after if l["caption"] != (run.captions()[0]["caption"] if run.captions() else "")]
+    first = shown[0]["t"] - resume_ms if shown else None
+    run.notes.append(f"first new text {first} ms after the audio resumed")
+    c.check(first is not None and first <= 2500, f"text within 2.5 s of the audio resuming ({first} ms)")
+    delay = (done_field(run, "resume_delay_ms") or [-1])[0]
+    run.notes.append(f"first resumed audio reached the server {delay} ms after it arrived")
+    c.check(0 <= delay <= 1500, f"the resumed audio reaches the server quickly ({delay} ms)")
+    c.check(len(run.log_lines("audio is back: reconnecting")) == 1, "one INFO line on resuming")
+    kept = run.log_lines("after the idle wait the first audio reached the server")
+    queued = re.search(r"(\d+) ms of audio from the connect", kept[0]) if kept else None
+    c.check(bool(queued) and int(queued.group(1)) > 0,
+            f"the audio that arrived while connecting was kept and sent ({kept[:1]})")
+    if kept:
+        run.notes.append(kept[0].split("] ", 1)[-1])
+    files = sorted(trace_dir.glob("tea-trace-*.jsonl")) if trace_dir.exists() else []
+    c.check(len(files) == 2, f"one trace file per session that had speech ({[f.name for f in files]})")
+    return c, run
+
+
+def sc_idle_no_trace(ctx) -> Checker:
+    """A session that never sees speech (digital silence) leaves no trace file."""
+    import shutil
+    c = Checker("idle_no_trace")
+    trace_dir = ctx.work / "traces"
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    srv = ctx.server(["--revisable"])
+    run = ctx.drive(srv, srv.token_file, 8000, audio="silence", extra_args=("--trace-dir", str(trace_dir)))
+    c.check(run.any_status("session active"), "the session ran")
+    files = sorted(trace_dir.glob("tea-trace-*.jsonl")) if trace_dir.exists() else []
+    c.check(not files, f"no trace file without speech ({[f.name for f in files]})")
     return c, run
 
 
@@ -1336,6 +1402,8 @@ SCENARIOS = {
     "rotation": sc_rotation_mid_session,
     "reconnect_all": sc_reconnect_all_then_server_restart,
     "idle": sc_idle_timeout,
+    "idle_resume": sc_idle_resume,
+    "idle_no_trace": sc_idle_no_trace,
     "cap": sc_connection_cap,
     "concurrent": sc_concurrent_limit,
     "bad_token": sc_bad_token,

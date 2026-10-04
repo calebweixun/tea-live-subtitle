@@ -100,6 +100,9 @@ public:
 	/* Diagnostics snapshot, safe from any thread. */
 	void diagnostics(int *connection, int *speech, double *input_dbfs, bool *input_recent,
 			 int64_t *ms_since_text) const;
+	/* After the last lazy reconnect: from the audio that ended the idle wait
+	 * arriving to its first frame being sent, -1 if none yet. */
+	qint64 lastResumeDelayMs() const { return lastResumeDelayMs_.load(); }
 
 public slots:
 	void doStart();
@@ -197,7 +200,29 @@ private:
 	qint64 tokenSize_ = -1;
 	bool tokenStampValid_ = false;
 
-	enum class WaitMode { None, AudioSource, TokenFile };
+	enum class WaitMode { None, AudioSource, TokenFile, AudioIdle };
+
+	/* Lazy reconnect (tea_asr::AudioIdleGate): after an idle_timeout, or a
+	 * transient failure while the source produced no audio, wait for audio
+	 * instead of the backoff timer. The audio that ends the wait is kept
+	 * across the new attempt (keepPendingAudio_) and sent first. */
+	tea_asr::AudioIdleGate idleGate_;
+	bool keepPendingAudio_ = false;
+	qint64 resumeAudioMs_ = -1; /* when the audio that ended the wait arrived, until it is sent */
+	qint64 resumeConnectMs_ = -1;
+	std::atomic<qint64> lastResumeDelayMs_{-1};
+	/* INFO lines, each kind at most once a minute ([0] entering, [1] resuming) */
+	qint64 idleLogMs_[2] = {-1, -1};
+	int idleLogSkipped_[2] = {0, 0};
+	void enterAudioIdleWait();
+	void resumeFromAudioIdle();
+	void logIdle(int kind, const QString &line);
+
+	/* the event trace opens on the session's first speech / transcript event */
+	bool tracePending_ = false;
+	QJsonObject traceStarted_;
+	static bool traceOpensOn(const QString &type);
+	void cleanupEmptyTraces(const QString &dir);
 	WaitMode waitMode_ = WaitMode::None;
 
 	int maxTotalConnections_ = 0;

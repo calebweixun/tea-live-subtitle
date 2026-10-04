@@ -44,7 +44,8 @@ OBS 原始碼下載到 `.deps/`，污染這個 repo 的 git 歷史與工作目�
 `asr-client.cpp`＋`caption-state.c`，連到**目前版本**的 server app（server repo 的測試用
 `FakeSupervisor`／`FakeVad`，不載入模型、不用 8327 port、不寫使用者的 `~/Library` 目錄），
 驗證握手、授權、partial／final，以及 Host 被拒、token revoke／rotate、`rate_limited`、
-連線上限（pre-accept 403）、`concurrent_session_limit`（4029）、`idle_timeout`（4408）、
+連線上限（pre-accept 403）、`concurrent_session_limit`（4029）、`idle_timeout`（4408，之後等音訊回來才重連：
+`idle*` 情境）、
 server 重啟與 70 秒心跳，以及穩定字幕（`stable*` 情境：要求與收到 `transcript.stable`、畫面只增不改、
 server 不宣告或拒絕 `stable` 時退回 partial、斷線重連不清空畫面），以及辨識提示（`hints*` 情境：送出的
 `context` 符合設定與上限、server 拒絕時不帶提示重連、功能關閉時不送、字典清單）。這個建置只用 Qt，不需要 OBS SDK：
@@ -65,6 +66,10 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
   （每個字幕來源每 60 秒最多 2 次認證失敗，低於 server 的 10 次）；`rate_limited` 等 65 秒；
   Host 被拒 60 秒。token 檔為空或不存在時完全不連線，檔案一變動就立刻重試。沒選音訊來源時不佔用
   server 連線名額。
+* **沒有音訊時不重連（lazy reconnect）**：server 因為沒有音訊以 `idle_timeout`（4408）結束 session，或音訊來源已經
+  10 秒以上沒有送出任何音訊時的其他暫時性斷線，外掛不再照退避重連（以前會每 2.5 分鐘開一個新 session），而是
+  「等待音訊（閒置）」；音訊一回來就立刻連線，連線期間收到的音訊留在既有的有限佇列裡、session 開始時第一個送出，
+  開頭的話不會掉。認證、rate limit、Host 被拒與致命錯誤照舊；有音訊時的斷線照舊退避。
 * 所有錯誤與斷線只出現在 Tools 對話框的狀態欄，不進字幕畫布。
 
 ### 穩定字幕（只增不改，`transcript.stable`）
