@@ -873,8 +873,11 @@ def sc_hints_on(ctx) -> Checker:
     c.check(run.any_status("recognition hints: 3 hotwords, 5 replacements"), "the Tools status shows it")
     dl = dictionary_lines(run)
     names = [e["name"] for e in (dl[0]["entries"] if dl else [])]
-    c.check(bool(dl) and dl[0]["state"] == 2 and names == ["church", "youth"],
+    broken = [e for e in (dl[0]["entries"] if dl else []) if e["name"] == "broken"]
+    c.check(bool(dl) and dl[0]["state"] == 2 and names == ["church", "youth", "broken"],
             f"GET /v1/dictionaries is fetched and parsed ({dl[:1]})")
+    c.check(bool(broken) and broken[0]["unavailable"] and broken[0]["error"] == "invalid TOML",
+            f"an entry with an error is listed as unavailable, with its reason ({broken})")
     got = [r for r in run.requests if r["event"] == "http" and r["path"] == "/v1/dictionaries"]
     c.check(bool(got) and got[0]["has_auth"] and got[0]["status"] == 200, f"with the bearer token ({got[:1]})")
     c.check(run.log_lines("sending recognition hints: profile=yes domain=13 chars hotwords=3 replacements=5") != [],
@@ -982,6 +985,7 @@ def real_hints_server(ctx, prompt: bool = False) -> FakeServer:
     dictionaries = ctx.work / "state" / "dictionaries"
     dictionaries.mkdir(parents=True, exist_ok=True)
     (dictionaries / "church.toml").write_text(REAL_DICTIONARY, encoding="utf-8")
+    (dictionaries / "broken.toml").write_text("domain = \"unterminated\n", encoding="utf-8")
     env = {"TEA_ASR_CONTEXT_HINTS": "1", "TEA_ASR_CONTEXT_PROMPT": "1" if prompt else "0"}
     return ctx.server(["--revisable", "--growing-text"], env=env)
 
@@ -1015,9 +1019,13 @@ def sc_hints_real(ctx) -> Checker:
     h = hints_done(run)
     c.check(h.get("max_hotwords") == 200, f"the advertised limits are read ({h})")
     dl = dictionary_lines(run)
-    c.check(bool(dl) and dl[0]["state"] == 2 and
-            dl[0]["entries"] == [{"name": "church", "hotwords_count": 2, "replacements_count": 1}],
+    entries = {e["name"]: e for e in (dl[0]["entries"] if dl else [])}
+    church, broken = entries.get("church", {}), entries.get("broken", {})
+    c.check(bool(dl) and dl[0]["state"] == 2 and church.get("hotwords_count") == 2
+            and church.get("replacements_count") == 1 and not church.get("unavailable"),
             f"the real /v1/dictionaries answer is parsed ({dl[:1]})")
+    c.check(broken.get("unavailable") is True and bool(broken.get("error")),
+            f"the server's invalid dictionary is listed as unavailable with its reason ({broken})")
     starts = session_starts(run)
     c.check(len(starts) == 1 and starts[0].get("context") == {
         "profile": "church", "domain": "主日講道：以弗所書", "hotwords": ["聖靈"],
@@ -1043,6 +1051,25 @@ def sc_hints_real(ctx) -> Checker:
             "the plugin shows the replaced text, never the heard one")
     c.check(done_field(run, "stable_mismatches") == [0], "replaced previews keep the stable contract")
     c.check(no_hint_text_logged(run), "no hint text in the OBS log")
+    return c, run
+
+
+def sc_hints_real_profile_only(ctx) -> Checker:
+    """What the simplified Properties window sends: only the picked dictionary."""
+    c = Checker("hints_real_profile_only")
+    srv = real_hints_server(ctx)
+    run = ctx.drive(srv, srv.token_file, 10000, extra_args=("--hints-profile", "church"))
+    if skip_without_real_hints(c, run):
+        return c, run
+    starts = session_starts(run)
+    c.check(len(starts) == 1 and starts[0].get("context") == {"profile": "church"},
+            f"session.start carries only the dictionary ({starts[:1]})")
+    h = hints_done(run)
+    c.check(h.get("applied") is True and h.get("applied_profile") == "church" and h.get("applied_replacements") == 1,
+            f"applied: dictionary church, 1 replacement ({h})")
+    finals = [r for r in run.requests if r["event"] == "ws_final"]
+    c.check(any("花園" in (r.get("text") or "") for r in finals) and not any("公園" in (r.get("text") or "") for r in finals),
+            f"its replacement is applied to the finals ({[r.get('text') for r in finals][:2]})")
     return c, run
 
 
@@ -1423,6 +1450,7 @@ SCENARIOS = {
     "hints_off": sc_hints_off,
     "hints_absent": sc_hints_absent,
     "hints_real": sc_hints_real,
+    "hints_real_profile_only": sc_hints_real_profile_only,
     "hints_real_prompt": sc_hints_real_prompt,
     "hints_real_unknown_profile": sc_hints_real_unknown_profile,
     "singing_auto": sc_singing_auto,

@@ -902,6 +902,12 @@ static void tea_captions_source_update(void *data, obs_data_t *settings)
 		obs_data_erase(settings, TEA_KEY_LEGACY_PAUSE_MS);
 	}
 
+	/* The dictionary list used to be editable, so its "(none)" entry could be
+	 * saved as text; it is now the empty value. */
+	const char *profile = obs_data_get_string(settings, TEA_KEY_HINTS_PROFILE);
+	if (profile[0] && tea_hints_profile_is_none(profile))
+		obs_data_set_string(settings, TEA_KEY_HINTS_PROFILE, "");
+
 	/* --- server connection: see tea_apply_connection() --- */
 	tea_apply_connection(ctx, settings, false);
 
@@ -2294,46 +2300,22 @@ static void tea_cat_list(struct dstr *out, const char *list)
 	}
 }
 
-/*
- * The hints status line: what the server offers, what the settings as typed
- * amount to under its limits (checked locally, so it is right before any
- * connection), what the running session applied, and the dictionaries.
- * Translations never carry format specifiers: numbers are appended here.
- */
-static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *settings, struct dstr *out)
+/* The old inline hint fields: no longer in the Properties window (pick a
+ * dictionary; dictionaries are edited in the TEA ASR app), still sent when a
+ * source has them. */
+static bool tea_hints_legacy_set(obs_data_t *settings)
 {
-	tea_asr_client_hints_status_t hs;
-	tea_asr_client_get_hints_status(ctx ? ctx->client : NULL, &hs);
-	const tea_hints_limits_t *lim = &hs.limits;
+	return tea_hints_has_legacy(obs_data_get_string(settings, TEA_KEY_HINTS_DOMAIN),
+				    obs_data_get_string(settings, TEA_KEY_HINTS_HOTWORDS),
+				    obs_data_get_string(settings, TEA_KEY_HINTS_REPLACEMENTS),
+				    obs_data_get_string(settings, TEA_KEY_HINTS_FILE));
+}
 
-	switch (hs.capability) {
-	case TEA_HINTS_CAP_ON:
-		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Supported",
-						 "The server supports recognition hints. Limits:"));
-		dstr_catf(out, " %d / %d (%d) / %d (%d)", lim->max_domain_chars, lim->max_hotwords,
-			  lim->max_hotword_chars, lim->max_replacements, lim->max_replacement_chars);
-		dstr_cat(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.LimitsLegend",
-					  " (description chars / hotwords (chars each) / replacements (chars each))"));
-		break;
-	case TEA_HINTS_CAP_OFF:
-		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Off",
-						 "The server has recognition hints turned off, so these settings are "
-						 "not sent. A server that supports them enables them with the server "
-						 "setting TEA_ASR_CONTEXT_HINTS=1."));
-		break;
-	case TEA_HINTS_CAP_ABSENT:
-		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Unsupported",
-						 "This server does not support recognition hints; these settings are "
-						 "not sent."));
-		break;
-	default:
-		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Unknown",
-						 "Not connected yet: the server's support for recognition hints is "
-						 "unknown."));
-		break;
-	}
-
-	/* the settings as typed, checked against the limits */
+/* What the old inline fields of this source amount to under the server's
+ * limits (checked locally, so it is right before any connection). */
+static void tea_hints_legacy_status(const tea_asr_client_hints_status_t *hs, obs_data_t *settings, struct dstr *out)
+{
+	const tea_hints_limits_t *lim = &hs->limits;
 	char *file_text = NULL;
 	const char *file_path = obs_data_get_string(settings, TEA_KEY_HINTS_FILE);
 	bool file_error = false;
@@ -2350,16 +2332,14 @@ static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *s
 	tea_hints_limits_t none;
 	memset(&none, 0, sizeof(none));
 	tea_hints_report_t report;
-	tea_hints_apply_limits(&hints, domain, domain_len, hs.capability == TEA_HINTS_CAP_ON ? lim : &none, &keep,
+	tea_hints_apply_limits(&hints, domain, domain_len, hs->capability == TEA_HINTS_CAP_ON ? lim : &none, &keep,
 			       &report);
 
-	tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Counts",
-					 "To send (file + fields): description chars / hotwords / replacements:"));
-	if (hs.capability == TEA_HINTS_CAP_ON && lim->max_domain_chars > 0)
-		dstr_catf(out, " %d/%d / %d / %d", report.domain_chars, lim->max_domain_chars, hints.hotword_count,
-			  hints.pair_count);
-	else
-		dstr_catf(out, " %d / %d / %d", report.domain_chars, hints.hotword_count, hints.pair_count);
+	tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Legacy",
+					 "This source also has old custom hints (description, hotwords, replacements "
+					 "or hints file); they are still sent with the dictionary. Description chars / "
+					 "hotwords / replacements:"));
+	dstr_catf(out, " %d / %d / %d", report.domain_chars, hints.hotword_count, hints.pair_count);
 	if (file_error)
 		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.FileError",
 						 "Warning: the hints file cannot be read."));
@@ -2382,35 +2362,67 @@ static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *s
 		tea_cat_list(out, hints.invalid);
 	}
 	tea_hints_free(&hints);
+}
+
+/*
+ * The hints status line: what the server offers, what the running session
+ * applied (or why the server refused), the server's dictionaries (and the
+ * ones it cannot use), and any old inline hints this source still sends.
+ * Translations never carry format specifiers: numbers are appended here.
+ */
+static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *settings, struct dstr *out)
+{
+	tea_asr_client_hints_status_t hs;
+	tea_asr_client_get_hints_status(ctx ? ctx->client : NULL, &hs);
+
+	switch (hs.capability) {
+	case TEA_HINTS_CAP_ON:
+		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Supported",
+						 "The server supports recognition hints (dictionaries)."));
+		break;
+	case TEA_HINTS_CAP_OFF:
+		tea_status_line(out,
+				tea_text_or("TeaLiveSubtitle.Prop.Hints.Off",
+					    "The server has recognition hints turned off, so the dictionary is not "
+					    "sent. A server that supports them enables them with the server setting "
+					    "TEA_ASR_CONTEXT_HINTS=1."));
+		break;
+	case TEA_HINTS_CAP_ABSENT:
+		tea_status_line(out,
+				tea_text_or("TeaLiveSubtitle.Prop.Hints.Unsupported",
+					    "This server does not support recognition hints; the dictionary is not "
+					    "sent."));
+		break;
+	default:
+		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Unknown",
+						 "Not connected yet: the server's support for recognition hints is "
+						 "unknown."));
+		break;
+	}
 
 	/* the running session */
 	if (hs.rejected) {
 		tea_status_line(out,
 				tea_text_or("TeaLiveSubtitle.Prop.Hints.Rejected",
-					    "The server rejected the recognition hints; the session runs without "
-					    "them (change them and press Apply connection settings, or use Reconnect "
-					    "All in the Tools dialog, to try again). Reason:"));
+					    "The server rejected the dictionary; the session runs without it (pick "
+					    "another and press Apply connection settings, or use Reconnect All in the "
+					    "Tools dialog, to try again). Reason:"));
 		dstr_catf(out, " %s", hs.reject_reason);
 	} else if (hs.applied) {
-		/* e.g. "已套用：設定檔 church，專有詞 42，對照 7" */
+		/* "已套用：字典 church，對照 116" */
 		const char *sep = tea_text_or("TeaLiveSubtitle.Prop.Hints.Separator", ", ");
 		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Applied", "Applied: "));
 		if (hs.applied_profile[0])
-			dstr_catf(out, "%s %s%s", tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedProfile", "profile"),
+			dstr_catf(out, "%s %s%s",
+				  tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedProfile", "dictionary"),
 				  hs.applied_profile, sep);
-		dstr_catf(out, "%s %d%s%s %d", tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedHotwords", "hotwords"),
-			  hs.applied_hotwords, sep,
-			  tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedReplacements", "replacements"),
+		dstr_catf(out, "%s %d", tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedReplacements", "replacements"),
 			  hs.applied_replacements);
-		if (hs.applied_prompt_tokens >= 0)
+		if (hs.prompt_applied)
 			dstr_catf(out, "%s%s %d", sep,
-				  tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedTokens", "prompt tokens"),
-				  hs.applied_prompt_tokens);
-		if (!hs.prompt_applied)
-			tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.PromptOff",
-							 "The description and hotwords are not given to the model now "
-							 "(the server does not have TEA_ASR_CONTEXT_PROMPT on); the "
-							 "replacement table applies as usual."));
+				  tea_text_or("TeaLiveSubtitle.Prop.Hints.AppliedHotwords",
+					      "hotwords given to the model"),
+				  hs.applied_hotwords);
 	} else if (hs.unconfirmed) {
 		tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Unconfirmed",
 						 "Sent, but the server did not report what it applied."));
@@ -2428,16 +2440,27 @@ static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *s
 							      error, sizeof(error), NULL);
 		if (state == TEA_DICT_OK) {
 			tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.Dictionaries",
-							 "Server dictionaries (hotwords / replacements):"));
-			if (count == 0)
+							 "Server dictionaries (replacements):"));
+			int usable = 0;
+			for (int i = 0; i < count; i++) {
+				if (entries[i].unavailable)
+					continue;
+				dstr_catf(out, "%s %s (%d)", usable++ ? "," : "", entries[i].name,
+					  entries[i].replacements_count);
+			}
+			if (usable == 0)
 				dstr_cat(out, " -");
-			for (int i = 0; i < count; i++)
-				dstr_catf(out, "%s %s (%d / %d)", i ? "," : "", entries[i].name,
-					  entries[i].hotwords_count, entries[i].replacements_count);
+			for (int i = 0; i < count; i++) {
+				if (!entries[i].unavailable)
+					continue;
+				tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.DictionaryUnavailable",
+								 "Unavailable dictionary:"));
+				dstr_catf(out, " %s (%s)", entries[i].name, entries[i].error);
+			}
 		} else if (state == TEA_DICT_FAILED) {
 			tea_status_line(out, tea_text_or("TeaLiveSubtitle.Prop.Hints.DictionariesFailed",
-							 "Server dictionaries: unavailable (type a profile name by "
-							 "hand)."));
+							 "Server dictionaries: unavailable (press Refresh to try "
+							 "again)."));
 			if (error[0])
 				dstr_catf(out, " (%s)", error);
 		} else if (state == TEA_DICT_FETCHING) {
@@ -2445,6 +2468,9 @@ static void tea_hints_status_text(struct tea_captions_source *ctx, obs_data_t *s
 							 "Server dictionaries: loading..."));
 		}
 	}
+
+	if (settings && tea_hints_legacy_set(settings))
+		tea_hints_legacy_status(&hs, settings, out);
 }
 
 static void tea_hints_update_status(struct tea_captions_source *ctx, obs_properties_t *props)
@@ -2473,78 +2499,90 @@ static bool tea_hints_refresh_clicked(obs_properties_t *props, obs_property_t *p
 	return true;
 }
 
-/* The profile combobox: "(none)", then the server's dictionaries; editable,
- * so any name can be typed when the list is unavailable. */
-static void tea_fill_profile_list(struct tea_captions_source *ctx, obs_property_t *list)
+/* The dictionary list: "(none)", then the server's dictionaries (the ones
+ * it cannot use are shown disabled). The saved choice stays listed even when
+ * the list is not available (not connected yet, an older server). */
+static void tea_fill_profile_list(struct tea_captions_source *ctx, obs_property_t *list, const char *current)
 {
-	const char *none = tea_text_or("TeaLiveSubtitle.Prop.Hints.ProfileNone", "(none)");
-	obs_property_list_add_string(list, none, none);
+	obs_property_list_add_string(list, tea_text_or("TeaLiveSubtitle.Prop.Hints.ProfileNone", "(none)"), "");
 	tea_dictionary_entry_t entries[TEA_DICT_MAX];
 	int count = 0;
 	if (ctx && ctx->client &&
-	    tea_asr_client_dictionaries(ctx->client, entries, TEA_DICT_MAX, &count, NULL, 0, NULL) == TEA_DICT_OK) {
-		for (int i = 0; i < count; i++)
-			obs_property_list_add_string(list, entries[i].name, entries[i].name);
+	    tea_asr_client_dictionaries(ctx->client, entries, TEA_DICT_MAX, &count, NULL, 0, NULL) != TEA_DICT_OK)
+		count = 0;
+	bool listed = !current || !current[0];
+	struct dstr label = {0};
+	for (int i = 0; i < count; i++) {
+		if (entries[i].unavailable) {
+			dstr_printf(&label, "%s %s", entries[i].name,
+				    tea_text_or("TeaLiveSubtitle.Prop.Hints.ProfileUnavailable", "(unavailable)"));
+		} else {
+			dstr_printf(&label, "%s (%s %d)", entries[i].name,
+				    tea_text_or("TeaLiveSubtitle.Prop.Hints.ProfileReplacements", "replacements"),
+				    entries[i].replacements_count);
+		}
+		const size_t idx = obs_property_list_add_string(list, label.array, entries[i].name);
+		if (entries[i].unavailable)
+			obs_property_list_item_disable(list, idx, true);
+		listed = listed || (current && strcmp(current, entries[i].name) == 0);
 	}
+	dstr_free(&label);
+	if (!listed)
+		obs_property_list_add_string(list, current, current);
+}
+
+/* "Clear old custom hints": removes the old inline fields from this source
+ * (they are no longer in the window) and applies the connection at once. */
+static bool tea_hints_clear_legacy_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	(void)property;
+	struct tea_captions_source *ctx = data;
+	if (!ctx || !ctx->source)
+		return false;
+	obs_data_t *settings = obs_source_get_settings(ctx->source);
+	obs_data_erase(settings, TEA_KEY_HINTS_DOMAIN);
+	obs_data_erase(settings, TEA_KEY_HINTS_HOTWORDS);
+	obs_data_erase(settings, TEA_KEY_HINTS_REPLACEMENTS);
+	obs_data_erase(settings, TEA_KEY_HINTS_FILE);
+	tea_apply_connection(ctx, settings, true);
+	obs_data_release(settings);
+	obs_log(LOG_INFO, "recognition hints: old custom hints cleared from this source");
+	obs_property_set_visible(obs_properties_get(props, "hints_clear_legacy"), false);
+	tea_hints_update_status(ctx, props);
+	return true;
 }
 
 static void tea_add_hints_group(struct tea_captions_source *ctx, obs_properties_t *props, void *data)
 {
+	obs_data_t *settings = ctx && ctx->source ? obs_source_get_settings(ctx->source) : NULL;
 	obs_properties_t *group = obs_properties_create();
 	obs_properties_add_text(group, "hints_status", "", OBS_TEXT_INFO);
 
 	obs_property_t *profile = obs_properties_add_list(
-		group, TEA_KEY_HINTS_PROFILE, tea_text_or("TeaLiveSubtitle.Prop.Hints.Profile", "Dictionary profile"),
-		OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+		group, TEA_KEY_HINTS_PROFILE, tea_text_or("TeaLiveSubtitle.Prop.Hints.Profile", "Dictionary"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_set_long_description(
 		profile, tea_text_or("TeaLiveSubtitle.Prop.Hints.Profile.Tooltip",
-				     "A dictionary file kept on the server (its hotwords and replacements are used "
-				     "first, then the fields below). Pick one, type a name, or choose (none)."));
-	tea_fill_profile_list(ctx, profile);
+				     "A dictionary kept on the server: its replacement table fixes known "
+				     "mis-hearings in the captions. Edit dictionaries in the TEA ASR app's "
+				     "Dictionaries page."));
+	tea_fill_profile_list(ctx, profile, settings ? obs_data_get_string(settings, TEA_KEY_HINTS_PROFILE) : "");
 
-	obs_property_t *domain = obs_properties_add_text(
-		group, TEA_KEY_HINTS_DOMAIN, tea_text_or("TeaLiveSubtitle.Prop.Hints.Domain", "Setting description"),
-		OBS_TEXT_MULTILINE);
-	obs_property_set_long_description(
-		domain, tea_text_or("TeaLiveSubtitle.Prop.Hints.Domain.Tooltip",
-				    "A few sentences about what is being said, e.g. a Sunday sermon on Ephesians. "
-				    "Overrides the profile's description. The character count against the "
-				    "server's limit is in the status line."));
-	obs_property_t *hotwords = obs_properties_add_text(
-		group, TEA_KEY_HINTS_HOTWORDS, tea_text_or("TeaLiveSubtitle.Prop.Hints.Hotwords", "Hotwords"),
-		OBS_TEXT_MULTILINE);
-	obs_property_set_long_description(
-		hotwords, tea_text_or("TeaLiveSubtitle.Prop.Hints.Hotwords.Tooltip",
-				      "One word or name per line. Blank lines and lines starting with # are "
-				      "ignored. Added to the profile's and the file's hotwords."));
-	obs_property_t *replacements = obs_properties_add_text(
-		group, TEA_KEY_HINTS_REPLACEMENTS,
-		tea_text_or("TeaLiveSubtitle.Prop.Hints.Replacements", "Replacement table"), OBS_TEXT_MULTILINE);
-	obs_property_set_long_description(
-		replacements,
-		tea_text_or("TeaLiveSubtitle.Prop.Hints.Replacements.Tooltip",
-			    "One pair per line: wrong => right (also wrong=>right, or separated by a tab). "
-			    "# starts a comment. Nothing after => deletes the wrong text. Overrides the "
-			    "profile's and the file's pair for the same wrong text."));
-	obs_property_t *file = obs_properties_add_path(group, TEA_KEY_HINTS_FILE,
-						       tea_text_or("TeaLiveSubtitle.Prop.Hints.File", "Load from file"),
-						       OBS_PATH_FILE, "Text (*.txt);;All files (*.*)", NULL);
-	obs_property_set_long_description(
-		file, tea_text_or("TeaLiveSubtitle.Prop.Hints.File.Tooltip",
-				  "Optional UTF-8 text file with a [專有詞] section (one hotword per line) and a "
-				  "[對照表] section (wrong => right). It is read again at every connection and "
-				  "merged before the fields above, so you can keep growing it outside OBS."));
-	obs_properties_add_text(
-		group, "hints_hint",
-		tea_text_or("TeaLiveSubtitle.Prop.Hints.Hint",
-			    "Experimental. Sent to the server when the session starts: changes apply "
-			    "with Apply connection settings or when this window closes, never live. The "
-			    "file is re-read at every connection, so you can keep and grow it outside "
-			    "OBS."),
-		OBS_TEXT_INFO);
+	obs_properties_add_text(group, "hints_hint",
+				tea_text_or("TeaLiveSubtitle.Prop.Hints.Hint",
+					    "To edit a dictionary, use the Dictionaries page of the TEA ASR app. The "
+					    "choice is sent when the session starts: it applies with Apply connection "
+					    "settings or when this window closes."),
+				OBS_TEXT_INFO);
 	obs_properties_add_button2(group, "hints_refresh",
-				   tea_text_or("TeaLiveSubtitle.Prop.Hints.Refresh", "Refresh status"),
+				   tea_text_or("TeaLiveSubtitle.Prop.Hints.Refresh", "Refresh list and status"),
 				   tea_hints_refresh_clicked, data);
+	obs_property_t *clear = obs_properties_add_button2(group, "hints_clear_legacy",
+							   tea_text_or("TeaLiveSubtitle.Prop.Hints.ClearLegacy",
+								       "Clear old custom hints"),
+							   tea_hints_clear_legacy_clicked, data);
+	obs_property_set_visible(clear, settings && tea_hints_legacy_set(settings));
+	obs_data_release(settings);
 
 	obs_properties_add_group(props, "hints_group",
 				 tea_text_or("TeaLiveSubtitle.Prop.Hints.Group", "Recognition hints (experimental)"),

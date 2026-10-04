@@ -116,7 +116,9 @@ void dictionariesDone(void *param)
 			for (int i = 0; i < count; i++)
 				list.append(QJsonObject{{"name", QString::fromUtf8(entries[i].name)},
 							{"hotwords_count", entries[i].hotwords_count},
-							{"replacements_count", entries[i].replacements_count}});
+							{"replacements_count", entries[i].replacements_count},
+							{"unavailable", entries[i].unavailable},
+							{"error", QString::fromUtf8(entries[i].error)}});
 			emitLine(QJsonObject{{"t", (double)g_clock->elapsed()},
 					     {"client", index},
 					     {"event", "dictionaries"},

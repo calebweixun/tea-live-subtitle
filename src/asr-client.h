@@ -184,6 +184,10 @@ typedef struct {
 	char name[TEA_HINTS_NAME_MAX];
 	int hotwords_count;
 	int replacements_count;
+	/* the server lists a file it cannot use (bad format, unreadable, too
+	 * big, a symlink) with an `error` and no counts */
+	bool unavailable;
+	char error[96];
 } tea_dictionary_entry_t;
 
 /* `done(param)` runs on the client's thread once the request finished
