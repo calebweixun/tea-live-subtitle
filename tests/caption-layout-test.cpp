@@ -477,10 +477,12 @@ std::vector<std::string> soft_layout(tea_display_line_t *line, const std::string
 	tea_wrap_row_t ordered[32];
 	tea_soft_wrap_t soft;
 	soft.cfg = cfg;
+	tea_display_line_wrap_begin(line, tea_wrap_sig(width, 0, true, punct, cfg, 1));
 	int total = tea_wrap_line_soft(line, text.c_str(), width, 0, true, punct, &soft, cache, ring, 32);
 	expect(total >= 0, "soft wrap: no missing glyphs");
 	tea_display_line_soft_commit(line, &soft);
 	int kept = tea_wrap_rows_in_order(ring, total, 32, ordered);
+	tea_display_line_wrap_commit(line, ordered, kept);
 	std::vector<std::string> out;
 	for (int i = 0; i < kept; i++) {
 		out.push_back(row_text(text, ordered[i]));
@@ -641,10 +643,10 @@ static void test_soft_breaks()
 		auto rows = soft_feed(pieces, 0, &punct, &off, &soft);
 		expect(rows.size() == 1 && soft == 0, "off: no soft breaks");
 	}
-	/* growing with pauses, punctuation, words, numbers and a narrow box: rows
-	 * already shown never change (checked in soft_feed). Three characters
-	 * per update keeps the line under TEA_DISPLAY_MAX_CHUNKS: merging chunks
-	 * can move a width-wrapped row whether soft breaks are on or not. */
+	/* growing one character per update (far more than TEA_DISPLAY_MAX_CHUNKS
+	 * changes, so the oldest chunks get merged) with pauses, punctuation,
+	 * words, numbers and a narrow box: rows already shown never change
+	 * (checked in soft_feed), with soft breaks on and off */
 	{
 		const std::string full =
 			"今天我們要討論字幕的顯示方式還有換行對齊與淡出的效果價格是3500元Smith said hi "
@@ -656,12 +658,16 @@ static void test_soft_breaks()
 		int k = 0;
 		while (pos < full.size()) {
 			size_t start = pos;
-			for (int c = 0; c < 3 && pos < full.size(); c++)
-				tea_utf8_decode(full.data(), full.size(), &pos);
+			tea_utf8_decode(full.data(), full.size(), &pos);
 			pieces.push_back({full.substr(start, pos - start), t});
-			t += (++k % 4 == 0) ? 700 : 300;
+			t += (++k % 7 == 0) ? 700 : 120;
 		}
-		expect(pieces.size() < TEA_DISPLAY_MAX_CHUNKS, "the test stays under the chunk limit");
+		expect(pieces.size() > 2 * TEA_DISPLAY_MAX_CHUNKS, "the oldest chunks really are merged");
+		tea_soft_break_t off;
+		tea_soft_break_defaults(&off, false, 16);
+		(void)soft_feed(pieces, 300, &punct, &off, &soft);
+		for (uint32_t narrow : {120u, 200u, 260u})
+			(void)soft_feed(pieces, narrow, &punct, &off, &soft);
 		auto rows = soft_feed(pieces, 300, &punct, &cfg, &soft);
 		expect(rows.size() >= 6, "the mixed text was broken into rows");
 		(void)soft_feed(pieces, 0, &punct, &cfg, &soft);

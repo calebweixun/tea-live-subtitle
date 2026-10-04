@@ -1588,13 +1588,17 @@ static void tea_layout(struct tea_captions_source *ctx)
 		tea_wrap_row_t ordered[TEA_WRAP_RING];
 		tea_soft_wrap_t soft;
 		soft.cfg = &cfg->soft;
+		tea_display_line_wrap_begin(&line->meta, tea_wrap_sig(geo.wrap_width, ctx->outline_extra, geo.word_wrap,
+								      &cfg->punct, &cfg->soft, ctx->metrics_rev));
 		int total = tea_wrap_line_soft(&line->meta, line->text, geo.wrap_width, ctx->outline_extra,
 					       geo.word_wrap, &cfg->punct, &soft, ctx->glyphs, ring, TEA_WRAP_RING);
 		if (total == TEA_WRAP_MISSING_GLYPH)
 			return;
-		/* this text may be on screen from now on: its soft breaks stay */
+		/* this text may be on screen from now on: its soft breaks and the
+		 * rows it ended at the box edge stay */
 		tea_display_line_soft_commit(&line->meta, &soft);
 		int kept = tea_wrap_rows_in_order(ring, total, TEA_WRAP_RING, ordered);
+		tea_display_line_wrap_commit(&line->meta, ordered, kept);
 		if (total > kept && kept > 0)
 			tea_display_line_evict_through(&line->meta, ordered[0].start);
 		for (int r = 0; r < kept; r++) {
