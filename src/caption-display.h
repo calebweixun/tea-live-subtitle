@@ -373,6 +373,7 @@ static inline bool tea_text_advance(const tea_glyph_cache_t *cache, const char *
 /* ------------------------------------------------------------------------ */
 
 #define TEA_DISPLAY_MAX_CHUNKS 48
+#define TEA_DISPLAY_MAX_SOFT 64
 #define TEA_NS_PER_MS UINT64_C(1000000)
 
 /* A run of text that appeared at one time. Chunk i covers
@@ -399,6 +400,12 @@ typedef struct {
 	 * and it fades out from hidden_ns (tea_display_line_note_hidden()) */
 	bool hidden;
 	uint64_t hidden_ns;
+	/* soft breaks (tea_soft_break_t): row ends decided for runs without
+	 * punctuation, kept so they never move; decided for text before
+	 * soft_decided (see tea_display_line_soft_commit()) */
+	size_t soft_breaks[TEA_DISPLAY_MAX_SOFT];
+	int soft_count;
+	size_t soft_decided;
 } tea_display_line_t;
 
 static inline void tea_display_line_init(tea_display_line_t *line, uint64_t key, size_t len, size_t locked_len,
@@ -457,6 +464,11 @@ static inline bool tea_display_line_observe(tea_display_line_t *line, const char
 	}
 	if (line->visible_from > common)
 		line->visible_from = common;
+	/* soft breaks in text that just changed are decided again */
+	while (line->soft_count > 0 && line->soft_breaks[line->soft_count - 1] > common)
+		line->soft_count--;
+	if (line->soft_decided > common)
+		line->soft_decided = common;
 	line->len = new_len;
 	line->changed_ns = now_ns;
 	if (line->activity_ns < now_ns)
@@ -586,6 +598,7 @@ typedef struct {
 	size_t next;      /* where the following row starts; everything before it belongs to this row or earlier */
 	uint32_t width;   /* sum of advances of [start, end) + outline extra: text_ft2's width for the row */
 	bool punct_break; /* the row ends because of a punctuation line break */
+	bool soft_break;  /* the row ends because of a soft break (a run without punctuation) */
 } tea_wrap_row_t;
 
 #define TEA_WRAP_MISSING_GLYPH (-1)
@@ -772,6 +785,100 @@ static inline size_t tea_trim_trailing_spaces(const char *text, size_t start, si
 	return end;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Soft breaks: rows for runs without punctuation                            */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Fast speakers produce long runs with no punctuation at all, so punctuation
+ * breaks never fire and only the box width breaks rows. A soft break ends a
+ * row once it holds min_chars visible characters (since the last break of
+ * any kind), at the next natural point:
+ *
+ *   - a pause: the boundary where text arrived more than gap_ms after the
+ *     text before it (chunk birth times), the closest thing to a word or
+ *     phrase boundary the plugin can see; or
+ *   - at min_chars + hard_extra characters, any boundary where a row may end
+ *     (between CJK characters or at a space; never inside an ASCII word or a
+ *     number, never before closing punctuation).
+ *
+ * Nothing on screen moves because of it: a soft break is only decided for
+ * text that is not on screen yet (at or after the line's soft_decided
+ * offset, which is the text length at the previous layout) and then kept in
+ * the line (tea_display_line_soft_commit()). Text that is rewritten (an
+ * unconfirmed tail corrected) has its breaks decided again, like any other
+ * change of that text.
+ */
+#define TEA_SOFT_MIN_DEFAULT 16
+#define TEA_SOFT_MIN_MIN 8
+#define TEA_SOFT_MIN_MAX 60
+#define TEA_SOFT_HARD_EXTRA 8
+#define TEA_SOFT_GAP_MS 500
+
+typedef struct {
+	bool enabled;
+	int min_chars;   /* N: a row holds at least this many characters before a soft break */
+	int hard_extra;  /* break at the first legal point from N + hard_extra on */
+	uint32_t gap_ms; /* a pause: text arrived more than this after the text before it */
+} tea_soft_break_t;
+
+static inline void tea_soft_break_defaults(tea_soft_break_t *soft, bool enabled, int min_chars)
+{
+	soft->enabled = enabled;
+	soft->min_chars = min_chars < TEA_SOFT_MIN_MIN   ? TEA_SOFT_MIN_MIN
+			  : min_chars > TEA_SOFT_MIN_MAX ? TEA_SOFT_MIN_MAX
+							 : min_chars;
+	soft->hard_extra = TEA_SOFT_HARD_EXTRA;
+	soft->gap_ms = TEA_SOFT_GAP_MS;
+}
+
+/* What a wrap needs for soft breaks; new decisions go to `out`. */
+typedef struct {
+	const tea_soft_break_t *cfg;
+	const tea_display_line_t *line; /* stored breaks, decided offset, chunk times */
+	size_t out[TEA_DISPLAY_MAX_SOFT];
+	int out_count;
+} tea_soft_wrap_t;
+
+static inline bool tea_soft_stored(const tea_display_line_t *line, size_t at)
+{
+	for (int i = 0; i < line->soft_count; i++)
+		if (line->soft_breaks[i] == at)
+			return true;
+	return false;
+}
+
+/* Text starting at `at` arrived more than gap_ms after the text before it. */
+static inline bool tea_soft_pause_at(const tea_display_line_t *line, size_t at, uint32_t gap_ms)
+{
+	for (int i = 1; i < line->chunk_count; i++) {
+		if (line->chunks[i].start == at)
+			return line->chunks[i].born_ns > line->chunks[i - 1].born_ns &&
+			       line->chunks[i].born_ns - line->chunks[i - 1].born_ns > (uint64_t)gap_ms * TEA_NS_PER_MS;
+	}
+	return false;
+}
+
+/* After a successful layout: keep the soft breaks it decided, and mark the
+ * line's text so far as decided (it may be on screen from now on). */
+static inline void tea_display_line_soft_commit(tea_display_line_t *line, const tea_soft_wrap_t *soft)
+{
+	if (soft) {
+		for (int i = 0; i < soft->out_count; i++) {
+			if (line->soft_count == TEA_DISPLAY_MAX_SOFT) {
+				/* drop the oldest one that has left the screen, if any */
+				if (line->soft_breaks[0] > line->visible_from)
+					break;
+				memmove(&line->soft_breaks[0], &line->soft_breaks[1],
+					sizeof(line->soft_breaks[0]) * (TEA_DISPLAY_MAX_SOFT - 1));
+				line->soft_count--;
+			}
+			line->soft_breaks[line->soft_count++] = soft->out[i];
+		}
+	}
+	line->soft_decided = line->len;
+}
+
 /*
  * Greedy wrap of text[from, to) into rows no wider than max_width
  * (0 = unlimited). A row "fits" when its text_ft2 width (advances +
@@ -790,8 +897,8 @@ static inline size_t tea_trim_trailing_spaces(const char *text, size_t start, si
  */
 static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, const size_t *chunk_starts,
 				     int chunk_count, uint32_t max_width, uint32_t outline_extra, bool word_wrap,
-				     const tea_punct_break_t *punct, const tea_glyph_cache_t *cache,
-				     tea_wrap_row_t *rows, int cap, int total)
+				     const tea_punct_break_t *punct, tea_soft_wrap_t *soft,
+				     const tea_glyph_cache_t *cache, tea_wrap_row_t *rows, int cap, int total)
 {
 	size_t pos = tea_skip_spaces(text, from, to);
 	while (pos < to) {
@@ -804,6 +911,8 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 		size_t last_opportunity = 0;
 		bool have_opportunity = false;
 		bool punct_break = false;
+		bool soft_break = false;
+		int row_chars = 0; /* visible characters on the row so far */
 		size_t i = pos;
 		while (i < to) {
 			size_t here = i;
@@ -811,6 +920,27 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 			uint32_t cp = tea_utf8_decode(text, to, &i);
 			if (!tea_glyph_cache_lookup(cache, cp, &adv))
 				return TEA_WRAP_MISSING_GLYPH;
+			if (soft && have_prev && here > row_start) {
+				/* a soft break before `cp`: kept from an earlier layout,
+				 * or decided now for text that is not on screen yet */
+				const tea_soft_break_t *sc = soft->cfg;
+				bool brk = sc && sc->enabled && tea_soft_stored(soft->line, here);
+				if (!brk && sc && sc->enabled && here >= soft->line->soft_decided &&
+				    row_chars >= sc->min_chars && tea_can_break_between(prev, cp) &&
+				    !tea_cp_is_space(cp) &&
+				    (tea_soft_pause_at(soft->line, here, sc->gap_ms) ||
+				     row_chars >= sc->min_chars + sc->hard_extra) &&
+				    soft->out_count < TEA_DISPLAY_MAX_SOFT) {
+					soft->out[soft->out_count++] = here;
+					brk = true;
+				}
+				if (brk) {
+					cut = here;
+					resume = here;
+					soft_break = true;
+					break;
+				}
+			}
 			if (have_prev && tea_can_break_between(prev, cp)) {
 				last_opportunity = here;
 				have_opportunity = true;
@@ -852,6 +982,8 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 				break;
 			}
 			width += adv;
+			if (!tea_cp_is_space(cp) && !tea_cp_is_extend(cp))
+				row_chars++;
 			const size_t stop = tea_punct_break_end(text, to, row_start, here, i, cp, punct);
 			if (stop > 0) {
 				cut = stop;
@@ -875,6 +1007,7 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
 		row->next = resume;
 		row->width = row_width;
 		row->punct_break = punct_break;
+		row->soft_break = soft_break;
 		total++;
 		pos = resume;
 	}
@@ -886,9 +1019,10 @@ static inline int tea_wrap_paragraph(const char *text, size_t from, size_t to, c
  * count (the last `cap` rows are in `rows`, oldest first after
  * tea_wrap_rows_in_order()) or TEA_WRAP_MISSING_GLYPH.
  */
-static inline int tea_wrap_line_ex(const tea_display_line_t *line, const char *text, uint32_t max_width,
-				   uint32_t outline_extra, bool word_wrap, const tea_punct_break_t *punct,
-				   const tea_glyph_cache_t *cache, tea_wrap_row_t *rows, int cap)
+static inline int tea_wrap_line_soft(const tea_display_line_t *line, const char *text, uint32_t max_width,
+				     uint32_t outline_extra, bool word_wrap, const tea_punct_break_t *punct,
+				     tea_soft_wrap_t *soft, const tea_glyph_cache_t *cache, tea_wrap_row_t *rows,
+				     int cap)
 {
 	size_t starts[TEA_DISPLAY_MAX_CHUNKS + 1];
 	int n = 0;
@@ -897,10 +1031,22 @@ static inline int tea_wrap_line_ex(const tea_display_line_t *line, const char *t
 	if (line->locked_len > 0 && line->locked_len < line->len)
 		starts[n++] = line->locked_len; /* the tail never pushes committed text around */
 
+	if (soft) {
+		soft->line = line;
+		soft->out_count = 0;
+	}
 	if (line->visible_from >= line->len)
 		return 0;
 	return tea_wrap_paragraph(text, line->visible_from, line->len, starts, n, max_width, outline_extra, word_wrap,
-				  punct, cache, rows, cap, 0);
+				  punct, soft, cache, rows, cap, 0);
+}
+
+/* tea_wrap_line_soft() without soft breaks. */
+static inline int tea_wrap_line_ex(const tea_display_line_t *line, const char *text, uint32_t max_width,
+				   uint32_t outline_extra, bool word_wrap, const tea_punct_break_t *punct,
+				   const tea_glyph_cache_t *cache, tea_wrap_row_t *rows, int cap)
+{
+	return tea_wrap_line_soft(line, text, max_width, outline_extra, word_wrap, punct, NULL, cache, rows, cap);
 }
 
 /* tea_wrap_line_ex() without punctuation breaks. */

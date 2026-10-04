@@ -18,7 +18,10 @@ c++ -std=c++17 -Itests/stubs -Isrc tests/replay/caption-replay.cpp /tmp/caption-
 
 The defaults are the settings of the live report: fade-out after 1500 ms, 200 ms fades, 2 rows, 3 sentences,
 1800 px, a 48 px font, black outline and shadow, and unconfirmed text shown. `--quiet` prints only the flags and the
-summary. `--punct off|sentence|comma` and `--comma-min N` select punctuation line breaks.
+summary. `--punct off|sentence|comma` and `--comma-min N` select punctuation line breaks;
+`--soft on|off` and `--soft-min N` select soft breaks for runs without punctuation (off by default here). The
+`# soft breaks` line counts the soft breaks shown and the longest run of characters between punctuation / soft
+breaks (rows joined across width wraps).
 
 The `# rows` line reports visible characters per row, rows per segment, and punctuation breaks: how many happened, whether
 the mark was committed or still in the tail, and how long after the mark first showed. It also counts layout moves:

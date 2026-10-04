@@ -103,6 +103,11 @@ static const char *const k_text_ft2_ids[] = {
 /* Punctuation line breaks: TEA_PUNCT_BREAK_* and the comma minimum. */
 #define TEA_KEY_PUNCT_BREAK "punct_break_mode"
 #define TEA_KEY_PUNCT_COMMA_MIN "punct_break_comma_min_chars"
+/* Soft breaks for runs without punctuation (appearance). When a source has
+ * never set it, it follows the punctuation-break setting: sources that break
+ * at punctuation get it, sources that kept the old look do not. */
+#define TEA_KEY_SOFT_BREAK "soft_break_enabled"
+#define TEA_KEY_SOFT_BREAK_MIN "soft_break_min_chars"
 /* Diagnostics (docs/diagnostics.md): an on-screen status line (appearance)
  * and a per-session event trace file (connection: applies per session). */
 #define TEA_KEY_DIAG_OVERLAY "diag_overlay"
@@ -205,6 +210,7 @@ struct tea_render_config {
 	bool tail;
 	float tail_opacity;
 	tea_punct_break_t punct;
+	tea_soft_break_t soft;
 	bool diag_overlay;
 	int font_size;
 	obs_data_t *child; /* text_ft2 appearance settings (no "text") */
@@ -809,6 +815,8 @@ static struct tea_render_config *tea_config_build(struct tea_captions_source *ct
 	cfg->diag_overlay = obs_data_get_bool(settings, TEA_KEY_DIAG_OVERLAY);
 	cfg->punct.comma_min_chars =
 		tea_clamp_setting(obs_data_get_int(settings, TEA_KEY_PUNCT_COMMA_MIN), 0, TEA_PUNCT_COMMA_MIN_MAX);
+	tea_soft_break_defaults(&cfg->soft, obs_data_get_bool(settings, TEA_KEY_SOFT_BREAK),
+				(int)obs_data_get_int(settings, TEA_KEY_SOFT_BREAK_MIN));
 
 	/* obs_data_apply() copies user values only. Start with the effective
 	 * defaults so a platform CJK font (and all other plugin defaults) actually
@@ -845,6 +853,13 @@ static struct tea_render_config *tea_config_build(struct tea_captions_source *ct
 static void tea_captions_source_update(void *data, obs_data_t *settings)
 {
 	struct tea_captions_source *ctx = data;
+
+	/* Soft breaks, once per source that never set them: on where rows already
+	 * break at punctuation (every source created since punctuation breaks
+	 * exist, and anyone who turned them on), off for the old look. */
+	if (!obs_data_has_user_value(settings, TEA_KEY_SOFT_BREAK))
+		obs_data_set_bool(settings, TEA_KEY_SOFT_BREAK,
+				  obs_data_get_int(settings, TEA_KEY_PUNCT_BREAK) != TEA_PUNCT_BREAK_OFF);
 
 	ctx->max_lines = (int)obs_data_get_int(settings, "max_lines");
 	ctx->caption_align = (int)obs_data_get_int(settings, "caption_align");
@@ -1571,10 +1586,14 @@ static void tea_layout(struct tea_captions_source *ctx)
 		struct tea_rline *line = &ctx->lines[ctx->order[o]];
 		tea_wrap_row_t ring[TEA_WRAP_RING];
 		tea_wrap_row_t ordered[TEA_WRAP_RING];
-		int total = tea_wrap_line_ex(&line->meta, line->text, geo.wrap_width, ctx->outline_extra, geo.word_wrap,
-					     &cfg->punct, ctx->glyphs, ring, TEA_WRAP_RING);
+		tea_soft_wrap_t soft;
+		soft.cfg = &cfg->soft;
+		int total = tea_wrap_line_soft(&line->meta, line->text, geo.wrap_width, ctx->outline_extra,
+					       geo.word_wrap, &cfg->punct, &soft, ctx->glyphs, ring, TEA_WRAP_RING);
 		if (total == TEA_WRAP_MISSING_GLYPH)
 			return;
+		/* this text may be on screen from now on: its soft breaks stay */
+		tea_display_line_soft_commit(&line->meta, &soft);
 		int kept = tea_wrap_rows_in_order(ring, total, TEA_WRAP_RING, ordered);
 		if (total > kept && kept > 0)
 			tea_display_line_evict_through(&line->meta, ordered[0].start);
@@ -2120,6 +2139,8 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, TEA_KEY_TAIL_OPACITY, TEA_DEFAULT_TAIL_OPACITY);
 	obs_data_set_default_int(settings, TEA_KEY_PUNCT_BREAK, TEA_PUNCT_BREAK_OFF);
 	obs_data_set_default_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
+	obs_data_set_default_bool(settings, TEA_KEY_SOFT_BREAK, false);
+	obs_data_set_default_int(settings, TEA_KEY_SOFT_BREAK_MIN, TEA_SOFT_MIN_DEFAULT);
 	obs_data_set_default_bool(settings, TEA_KEY_DIAG_OVERLAY, false);
 	obs_data_set_default_bool(settings, TEA_KEY_EVENT_TRACE, false);
 	/* Automatic for new and existing sources: it only acts on a server that
@@ -2155,6 +2176,7 @@ static void tea_captions_source_get_defaults(obs_data_t *settings)
 		obs_data_set_bool(settings, TEA_KEY_TAIL, true);
 		obs_data_set_int(settings, TEA_KEY_PUNCT_BREAK, TEA_NEW_SOURCE_PUNCT_BREAK);
 		obs_data_set_int(settings, TEA_KEY_PUNCT_COMMA_MIN, TEA_PUNCT_COMMA_MIN_DEFAULT);
+		obs_data_set_bool(settings, TEA_KEY_SOFT_BREAK, true);
 	}
 
 	obs_data_set_default_string(settings, "audio_source_name", "");
@@ -2851,6 +2873,18 @@ static obs_properties_t *tea_captions_source_get_properties(void *data)
 			       tea_text_or("TeaLiveSubtitle.Prop.PunctCommaMin",
 					   "Minimum characters on a row before a comma breaks"),
 			       0, TEA_PUNCT_COMMA_MIN_MAX, 1);
+	obs_property_t *soft_prop = obs_properties_add_bool(props, TEA_KEY_SOFT_BREAK,
+							    tea_text_or("TeaLiveSubtitle.Prop.SoftBreak",
+									"Break long runs without punctuation"));
+	obs_property_set_long_description(
+		soft_prop, tea_text_or("TeaLiveSubtitle.Prop.SoftBreak.Tooltip",
+				       "When a row has the number of characters below and still no punctuation, "
+				       "start a new row at the next pause in the speech (or a few characters later "
+				       "at the latest; never inside an English word or a number). Text already on "
+				       "screen never moves."));
+	obs_properties_add_int(props, TEA_KEY_SOFT_BREAK_MIN,
+			       tea_text_or("TeaLiveSubtitle.Prop.SoftBreakMin", "Break after this many characters"),
+			       TEA_SOFT_MIN_MIN, TEA_SOFT_MIN_MAX, 1);
 	obs_properties_add_bool(props, "show_placeholder", obs_module_text("TeaLiveSubtitle.Prop.ShowPlaceholder"));
 	obs_property_t *overlay_prop = obs_properties_add_bool(
 		props, TEA_KEY_DIAG_OVERLAY,
