@@ -425,9 +425,18 @@ void TeaAsrClient::onDictionariesReply()
 		snprintf(e.name, sizeof(e.name), "%s", name.constData());
 		e.hotwords_count = o.value(QStringLiteral("hotwords_count")).toInt(0);
 		e.replacements_count = o.value(QStringLiteral("replacements_count")).toInt(0);
+		const QJsonValue error = o.value(QStringLiteral("error"));
+		if (error.isString() && !error.toString().isEmpty()) {
+			e.unavailable = true;
+			snprintf(e.error, sizeof(e.error), "%s", error.toString().toUtf8().constData());
+		}
 		entries.push_back(e);
 	}
-	obs_log(LOG_INFO, "asr-client: the server offers %d recognition hint dictionaries", (int)entries.size());
+	int unavailable = 0;
+	for (const tea_dictionary_entry_t &e : entries)
+		unavailable += e.unavailable ? 1 : 0;
+	obs_log(LOG_INFO, "asr-client: the server offers %d recognition hint dictionaries (%d unavailable)",
+		(int)entries.size(), unavailable);
 	finishDictionaries(TEA_DICT_OK, entries, QString());
 }
 

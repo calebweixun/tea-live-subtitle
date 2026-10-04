@@ -146,7 +146,8 @@ def main() -> int:
     parser.add_argument(
         "--dictionaries",
         default='[{"name":"church","domain":"主日講道","hotwords_count":42,"replacements_count":7},'
-                '{"name":"youth","domain":"青年聚會","hotwords_count":5,"replacements_count":0}]',
+                '{"name":"youth","domain":"青年聚會","hotwords_count":5,"replacements_count":0},'
+                '{"name":"broken","error":"invalid TOML"}]',
     )
     args = parser.parse_args()
 

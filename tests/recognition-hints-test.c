@@ -210,8 +210,19 @@ static void test_error_attribution(void)
 	expect(!tea_hints_error_is_context(NULL, NULL), "nothing is nothing");
 }
 
+static void test_legacy_fields(void)
+{
+	expect(!tea_hints_has_legacy(NULL, NULL, NULL, NULL), "nothing set: no old fields");
+	expect(!tea_hints_has_legacy("", "  \n", "\r\n", "　"), "blank ones do not count");
+	expect(tea_hints_has_legacy("", "聖經", "", ""), "a hotword counts");
+	expect(tea_hints_has_legacy("", "", "盛家 => 聖經", ""), "a replacement counts");
+	expect(tea_hints_has_legacy("主日講道", "", "", ""), "a description counts");
+	expect(tea_hints_has_legacy("", "", "", "/tmp/hints.txt"), "a hints file counts");
+}
+
 int main(void)
 {
+	test_legacy_fields();
 	test_error_attribution();
 	test_hotwords();
 	test_replacements();

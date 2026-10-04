@@ -510,3 +510,21 @@ static inline bool tea_hints_error_is_context(const char *code, const char *mess
 	const bool generic = code && (strcmp(code, "unsupported_option") == 0 || strcmp(code, "protocol_error") == 0);
 	return generic && !tea_hints_contains_ci(message, "segmentation") && !tea_hints_contains_ci(message, "stable");
 }
+
+/* Whether any of the old inline hint settings (the setting description,
+ * hotwords, replacement table, hints file) holds something. The Properties
+ * window no longer shows them -- dictionaries are edited centrally in the
+ * TEA ASR app -- but a source that has them still sends them. */
+static inline bool tea_hints_has_legacy(const char *domain, const char *hotwords, const char *replacements,
+					const char *file_path)
+{
+	const char *fields[] = {domain, hotwords, replacements, file_path};
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		const char *s = fields[i] ? fields[i] : "";
+		size_t len = strlen(s);
+		tea_hints_trim(&s, &len);
+		if (len > 0)
+			return true;
+	}
+	return false;
+}

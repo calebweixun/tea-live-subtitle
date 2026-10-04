@@ -99,10 +99,10 @@ python3 tests/e2e/run_e2e.py --driver /tmp/tea-e2e-build/asr-client-e2e \
 
 ### 辨識提示（實驗，`session.start.context`）
 
-屬性視窗的「辨識提示（實驗）」群組：字典設定檔（server 上的字典，清單來自 `GET /v1/dictionaries`）、講道情境說明、
-專有詞（一行一個）、對照表（一行一組 `錯字 => 正字`）與選用的提示檔（`[專有詞]`／`[對照表]` 兩段，每次連線重新讀取，
-可以在 OBS 之外持續增補）。只在 server 的 capabilities 宣告 `context_biasing`（server 設定 `TEA_ASR_CONTEXT_HINTS=1`）
-時送出，並先依 `context_limits` 截斷；server 拒絕時自動改為不帶提示重連，其他設定保留。全部是連線類設定，預設為空。
+屬性視窗的「辨識提示（實驗）」群組：從清單選一個 server 上的字典（清單來自 `GET /v1/dictionaries`；字典內容在
+TEA ASR app 的「字典」頁編輯），它的對照表會修正字幕裡常聽錯的字。只在 server 的 capabilities 宣告 `context_biasing`
+（server 設定 `TEA_ASR_CONTEXT_HINTS=1`）時送出；server 拒絕時自動改為不帶字典重連，其他設定保留。連線類設定，預設不選。
+早期版本的情境說明／專有詞／對照表／提示檔欄位已從屬性視窗移除，已存值的來源照舊送出，並可一鍵清除。
 細節見 [`docs/recognition-hints.md`](docs/recognition-hints.md)。
 
 ## 畫面呈現（逐行渲染）
