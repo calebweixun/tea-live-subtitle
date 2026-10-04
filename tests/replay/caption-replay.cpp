@@ -436,10 +436,20 @@ struct Sim {
 		tea_soft_break_defaults(&soft_cfg, cfg.soft, cfg.soft_min);
 		tea_soft_wrap_t soft;
 		soft.cfg = &soft_cfg;
+#ifdef TEA_DISPLAY_MAX_WRAP
+		tea_display_line_wrap_begin(&meta, tea_wrap_sig(geo.wrap_width, cfg.outline_extra, geo.word_wrap,
+								&punct, &soft_cfg, (uint64_t)cfg.font_px));
+#endif
 		int total = tea_wrap_line_soft(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap,
 					       &punct, &soft, cache.get(), ring, 32);
-		if (total >= 0)
+		if (total >= 0) {
 			tea_display_line_soft_commit(&meta, &soft);
+#ifdef TEA_DISPLAY_MAX_WRAP
+			tea_wrap_row_t ordered[32];
+			int kept = tea_wrap_rows_in_order(ring, total, 32, ordered);
+			tea_display_line_wrap_commit(&meta, ordered, kept);
+#endif
+		}
 		return total;
 #else
 		return tea_wrap_line_ex(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap, &punct,
