@@ -314,4 +314,64 @@ private:
 	int authAttempts_ = 0;
 };
 
+/*
+ * Lazy reconnect when there is no audio (real OBS: a media source that
+ * finished leaves the capture silent -- no samples at all -- the server ends
+ * the session with idle_timeout after its idle window, and reconnecting at
+ * once only starts another session that idles out again; each one also wrote
+ * an empty event trace).
+ *
+ * After an attempt ends, the client waits for audio instead of arming the
+ * backoff timer when
+ *   - the server ended it with idle_timeout (4408), or
+ *   - it is any other transient failure (server restart, network, admission)
+ *     while the audio source has produced nothing for kNoAudioMs.
+ * Auth, rate-limit, Host and fatal failures keep their own handling, and a
+ * transient failure while audio flows keeps the backoff. Audio arriving
+ * while waiting starts an attempt at once; that audio is kept (the client's
+ * bounded queue) and sent when the session starts.
+ */
+class AudioIdleGate {
+public:
+	/* The source counts as idle after this long without a single sample. */
+	static constexpr int64_t kNoAudioMs = 10000;
+
+	void reset()
+	{
+		waiting_ = false;
+		lastAudioMs_ = -1;
+	}
+
+	/* Samples arrived from the audio source (any, digital silence included:
+	 * the server does not idle out a session that receives them). */
+	void onAudio(int64_t nowMs) { lastAudioMs_ = nowMs; }
+
+	/* An attempt ended; true = wait for audio (no timer, no attempt). */
+	bool shouldWait(FailureClass cls, const std::string &lastServerErrorCode, int64_t nowMs)
+	{
+		waiting_ = false;
+		if (cls != FailureClass::Transient)
+			return false;
+		const bool noAudio = lastAudioMs_ < 0 || nowMs - lastAudioMs_ >= kNoAudioMs;
+		waiting_ = lastServerErrorCode == "idle_timeout" || noAudio;
+		return waiting_;
+	}
+
+	/* Polled while waiting: true once audio is there -- connect now. */
+	bool resumeDue(bool audioPending)
+	{
+		if (!waiting_ || !audioPending)
+			return false;
+		waiting_ = false;
+		return true;
+	}
+
+	bool waiting() const { return waiting_; }
+	int64_t lastAudioMs() const { return lastAudioMs_; }
+
+private:
+	bool waiting_ = false;
+	int64_t lastAudioMs_ = -1;
+};
+
 } // namespace tea_asr

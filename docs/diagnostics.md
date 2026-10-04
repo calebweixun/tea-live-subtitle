@@ -23,7 +23,22 @@ asr-client: connection connected: WebSocket open to 127.0.0.1:8327
 asr-client: connection session active: 127.0.0.1:8327 sent {"audio":{...},"segmentation":{"end_silence_ms":870},"stable":{"agreement":2},...}; server: transcript_mode=revisable endpoint_silence_ms=870 min_interval_ms=300
 asr-client: connection reconnecting: connection closed; retry in 1.0 s (last close code 1011)
 asr-client: connection waiting for an audio source: no audio source selected for this caption source
+asr-client: connection waiting for audio (idle): no audio from the source; reconnects when it comes back (last: idle_timeout: ...)
 ```
+
+**沒有音訊時（lazy reconnect）**：音訊來源停了（例如媒體來源播完），server 在它的閒置時間（預設 120 秒）後以
+`idle_timeout`（close 4408）結束 session；外掛不再立刻重連，而是等到音訊回來。音訊來源 10 秒以上沒有送出任何音訊時的
+其他暫時性斷線（server 重啟、網路）也一樣；認證、rate limit、Host 被拒照舊。等待中狀態是「等待音訊（閒置）」
+（診斷列與 Tools 對話框），不連 server、不開 session、不寫事件記錄檔。記錄檔各一行 INFO（每種最多每分鐘一行）：
+
+```
+asr-client: no audio: waiting for the audio source instead of reconnecting (idle_timeout: ...)
+asr-client: audio is back: reconnecting
+asr-client: after the idle wait the first audio reached the server 7 ms after it arrived (session started 7 ms after it; 35 ms of audio from the connect were queued and sent, none lost)
+```
+
+最後一行量的是「外掛從音訊來源拿到恢復後的第一段音訊」到「它送到新 session」之間的時間；連線期間收到的音訊放在既有的
+有限佇列（約 25 秒）裡，session 一開始就送出。
 
 `session active` 那一行是實際送出的 `session.start`，以及 server 回報實際生效的切段靜音與預覽間隔。
 
@@ -81,7 +96,7 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 診斷: 辨識中 | 聆聽中 | 輸入 -23 dBFS | 上次出字 4 秒前
 ```
 
-依序是連線狀態、語音狀態、目前輸入音量（最近約 0.5 秒從音訊來源取到的音訊；沒有音訊時顯示「沒有音訊輸入」）、
+依序是連線狀態（沒有音訊、等它回來時是「等待音訊（閒置）」）、語音狀態、目前輸入音量（最近約 0.5 秒從音訊來源取到的音訊；沒有音訊時顯示「沒有音訊輸入」）、
 距離上次出字的秒數。字幕暫停時最後多一段「字幕已暫停」；「唱詩歌時的字幕」是自動、而 server 判定目前在唱歌時多一段
 「♪ 唱詩歌中：字幕隱藏」。這一行不淡出、不在文字底色裡，也不算在行數上限裡。建議在預覽用的場景打開，直播場景關閉。
 
@@ -93,10 +108,15 @@ asr-client: heartbeat 10.0s: sent 10026 ms audio in 286 frames, max gap 53 ms, l
 * 位置：OBS 的外掛設定資料夾下的 `traces/`（macOS：
   `~/Library/Application Support/obs-studio/plugin_config/tea-live-subtitle/traces/`），檔名
   `tea-trace-<日期時間>-<session 前 8 碼>.jsonl`；開始時會在 OBS 記錄檔寫出完整路徑：
-  `asr-client: event trace for session ...: <path> (up to 32 MB)`。
+  `asr-client: event trace for session ...: <path> (up to 32 MB)`（在第一個語音事件時）。
 * 格式：每行一個 `{"t_ms": <距 hello 的毫秒>, "event": {...server 事件...}}`，第一行是
   `{"t_ms": 0, "meta": {...送出的 session.start...}}`。和 `tests/replay` 讀的格式相同。
 * 每個檔案最多 32 MB，到上限就停止寫入並在記錄檔說明。檔案裡有辨識出的文字，不含音訊、不含 token。
+* 檔案在 session 第一次出現語音或文字事件（`speech.started`、`segment.*`、`transcript.*`）時才建立，之前的
+  `audio.ack` 等事件不記；完全沒有語音的 session（例如音訊來源停了、只送數位靜音）不會留下檔案。
+* 啟用時（每次 OBS 執行一次）會清掉超過一天、而且**沒有任何語音或文字事件**的舊記錄檔（舊版每次閒置重連都會留下
+  一個），記錄檔寫一行 `asr-client: removed N event trace file(s) older than a day with no speech ...`。有內容的檔案、
+  以及大於 4 MB 的檔案一律不動。
 
 字幕不見時，把那段時間的記錄檔和 OBS 記錄檔一起傳給我們，就能用重播工具（`tests/replay/README.md`）還原當時畫面上每一刻顯示了什麼。
 

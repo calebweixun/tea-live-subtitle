@@ -111,6 +111,7 @@ int tea_asr_client_effective_end_silence_ms(tea_asr_client_t *client);
 #define TEA_CONN_CONNECTED 4 /* WebSocket up, no session yet */
 #define TEA_CONN_ACTIVE 5    /* session running, audio flowing */
 #define TEA_CONN_RECONNECTING 6
+#define TEA_CONN_IDLE 7 /* waiting for audio (idle): reconnects when the source produces audio */
 
 typedef struct {
 	int connection;        /* TEA_CONN_* */
@@ -118,6 +119,9 @@ typedef struct {
 	double input_dbfs;     /* RMS of the last ~0.5 s pulled from the audio source, -120 = silence */
 	bool input_recent;     /* audio arrived from the source in the last second */
 	int64_t ms_since_text; /* since the last partial / stable / final, -1 = none this session */
+	/* last lazy reconnect: audio arriving after the idle wait -> its first
+	 * frame sent to the new session, -1 = none yet */
+	int64_t resume_delay_ms;
 } tea_asr_client_diag_t;
 
 /* Safe from any thread. */

@@ -199,8 +199,13 @@ void TeaAsrClient::setEndSilenceMs(int ms)
 
 void TeaAsrClient::setTraceDir(const QString &dir)
 {
-	QMutexLocker lock(&traceMutex_);
-	traceDir_ = dir;
+	{
+		QMutexLocker lock(&traceMutex_);
+		traceDir_ = dir;
+	}
+	static std::atomic<bool> cleaned{false};
+	if (!dir.isEmpty() && !cleaned.exchange(true))
+		QMetaObject::invokeMethod(this, [this, dir]() { cleanupEmptyTraces(dir); }, Qt::QueuedConnection);
 }
 
 void TeaAsrClient::setHints(const QString &profile, const QString &domain, const QString &hotwords,
@@ -475,6 +480,86 @@ void TeaAsrClient::diagnostics(int *connection, int *speech, double *input_dbfs,
 	*ms_since_text = lastText >= 0 ? now - lastText : -1;
 }
 
+/* ---------------- lazy reconnect: waiting for audio ---------------- */
+
+void TeaAsrClient::logIdle(int kind, const QString &line)
+{
+	/* INFO, each kind at most one line a minute; skipped ones are counted */
+	const qint64 now = nowMs();
+	if (idleLogMs_[kind] >= 0 && now - idleLogMs_[kind] < 60000) {
+		idleLogSkipped_[kind]++;
+		return;
+	}
+	const QByteArray skipped =
+		idleLogSkipped_[kind]
+			? QStringLiteral(" (%1 more since the last such line)").arg(idleLogSkipped_[kind]).toUtf8()
+			: QByteArray();
+	obs_log(LOG_INFO, "asr-client: %s%s", line.toUtf8().constData(), skipped.constData());
+	idleLogMs_[kind] = now;
+	idleLogSkipped_[kind] = 0;
+}
+
+void TeaAsrClient::enterAudioIdleWait()
+{
+	const QString reason = QString::fromStdString(errorPolicy_.lastErrorSummary());
+	waitMode_ = WaitMode::AudioIdle;
+	lastCloseCode_ = 0;
+	setStatus(QStringLiteral("waiting for audio (idle): reconnects as soon as the audio source produces audio "
+				 "again (last: %1)")
+			  .arg(reason));
+	setConnState(TEA_CONN_IDLE,
+		     QStringLiteral("no audio from the source; reconnects when it comes back (last: %1)").arg(reason));
+	logIdle(0, QStringLiteral("no audio: waiting for the audio source instead of reconnecting (%1)").arg(reason));
+}
+
+void TeaAsrClient::resumeFromAudioIdle()
+{
+	/* the queue holds what just arrived: keep it for the new session */
+	resumeAudioMs_ = nowMs();
+	resumeConnectMs_ = resumeAudioMs_;
+	logIdle(1, QStringLiteral("audio is back: reconnecting"));
+	backoff_.reset();
+	keepPendingAudio_ = true;
+	beginAttempt();
+	keepPendingAudio_ = false;
+}
+
+bool TeaAsrClient::traceOpensOn(const QString &type)
+{
+	return type.startsWith(QLatin1String("transcript.")) || type == QLatin1String("speech.started") ||
+	       type.startsWith(QLatin1String("segment."));
+}
+
+/* Event traces from older runs that never saw speech (one per idle session,
+ * written by earlier plugin versions): removed once per process when older
+ * than a day. A file that has any transcript or speech event is never
+ * touched; files too big to check are kept. */
+void TeaAsrClient::cleanupEmptyTraces(const QString &dir)
+{
+	QDir traces(dir);
+	const QDateTime cutoff = QDateTime::currentDateTime().addDays(-1);
+	int removed = 0;
+	const QFileInfoList files =
+		traces.entryInfoList(QStringList{QStringLiteral("tea-trace-*.jsonl")}, QDir::Files, QDir::Time);
+	for (const QFileInfo &info : files) {
+		if (info.lastModified() > cutoff || info.size() > 4 * 1024 * 1024)
+			continue;
+		QFile f(info.absoluteFilePath());
+		if (!f.open(QIODevice::ReadOnly))
+			continue;
+		const QByteArray content = f.readAll();
+		f.close();
+		if (content.contains("\"transcript.") || content.contains("\"speech.started\"") ||
+		    content.contains("\"segment."))
+			continue;
+		if (QFile::remove(info.absoluteFilePath()))
+			removed++;
+	}
+	if (removed > 0)
+		obs_log(LOG_INFO, "asr-client: removed %d event trace file(s) older than a day with no speech in %s",
+			removed, dir.toUtf8().constData());
+}
+
 /* ---------------- diagnostics (docs/diagnostics.md) ---------------- */
 
 static const char *tea_conn_name(int state)
@@ -492,6 +577,8 @@ static const char *tea_conn_name(int state)
 		return "session active";
 	case TEA_CONN_RECONNECTING:
 		return "reconnecting";
+	case TEA_CONN_IDLE:
+		return "waiting for audio (idle)";
 	default:
 		return "stopped";
 	}
@@ -775,7 +862,8 @@ void TeaAsrClient::resetProtocolStateLocked()
 	nextSeq_ = 0;
 	nextSample_ = 0;
 	sendUntilSample_ = 0;
-	pendingPcm_.clear();
+	if (!keepPendingAudio_)
+		pendingPcm_.clear();
 }
 
 void TeaAsrClient::doStart()
@@ -878,6 +966,7 @@ void TeaAsrClient::teardownSocket(bool sendClose)
 	lastRxMs_ = -1;
 	sessionStartedMs_ = -1;
 	traceClose();
+	tracePending_ = false;
 	tea_warn_session_end(&warn_);
 	tea_speech_reset(&speech_);
 	speechStateAtomic_ = TEA_SPEECH_LISTENING;
@@ -959,6 +1048,13 @@ void TeaAsrClient::scheduleReconnect()
 	const tea_asr::FailureClass cls = errorPolicy_.failureClass();
 	if (errorPolicy_.lastErrorSummary().empty())
 		errorPolicy_.observeTransport("connection lost");
+	resumeAudioMs_ = -1;
+	if (idleGate_.shouldWait(cls, errorPolicy_.lastServerErrorCode(), nowMs())) {
+		/* no audio: reconnecting now would only start a session that idles
+		 * out again (and costs a server session each time) */
+		enterAudioIdleWait();
+		return;
+	}
 	int delayMs = backoff_.nextDelayMs(cls);
 
 	if (delayMs < 0) {
@@ -1025,6 +1121,7 @@ void TeaAsrClient::onWatchTimer()
 			beginAttempt();
 		}
 		break;
+	case WaitMode::AudioIdle: /* the pump timer watches the audio */
 	case WaitMode::None:
 		watchTimer_->stop();
 		break;
@@ -1518,8 +1615,15 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 {
 	QString type = obj.value(QStringLiteral("type")).toString();
 	diagOnEvent(type);
-	if (type != QLatin1String("hello") && type != QLatin1String("session.started"))
+	if (type != QLatin1String("hello") && type != QLatin1String("session.started")) {
+		/* a session's trace starts with its first speech: idle sessions
+		 * leave no file */
+		if (tracePending_ && traceOpensOn(type)) {
+			tracePending_ = false;
+			traceOpen(traceStarted_);
+		}
 		traceWrite(obj);
+	}
 
 	if (type == QLatin1String("hello")) {
 		lastHello_ = obj;
@@ -1596,7 +1700,11 @@ void TeaAsrClient::handleJsonMessage(const QJsonObject &obj)
 				" -- WARNING: server is in unencrypted LAN mode; token travels in cleartext");
 		setStatus(status);
 		diagOnSessionStarted(obj);
-		traceOpen(obj);
+		traceStarted_ = obj;
+		tracePending_ = true;
+		/* audio queued while connecting (e.g. after the idle wait) goes out
+		 * now, not on the next pump tick */
+		pumpAudio();
 		return;
 	}
 
@@ -1942,6 +2050,10 @@ void TeaAsrClient::onPumpTimer()
 {
 	pumpAudio();
 	diagTick();
+	if (waitMode_ == WaitMode::AudioIdle && wantRunning_ && idleGate_.resumeDue(!pendingPcm_.empty())) {
+		resumeFromAudioIdle();
+		return;
+	}
 
 	if (!socket_)
 		return;
@@ -1978,6 +2090,7 @@ void TeaAsrClient::pumpAudio()
 			break;
 		tea_pcm_level_add(&inputLevel_, chunkBuf, got);
 		lastInputMs_ = nowMs();
+		idleGate_.onAudio(lastInputMs_);
 
 		QByteArray chunk((const char *)chunkBuf, (int)(got * sizeof(int16_t)));
 		if (pendingPcm_.size() >= kMaxPendingPcmChunks) {
@@ -2017,6 +2130,22 @@ void TeaAsrClient::pumpAudio()
 		nextSeq_++;
 		nextSample_ = endSample;
 		pendingPcm_.pop_front();
+		if (resumeAudioMs_ >= 0) {
+			/* the first audio after the idle wait reached the server; what
+			 * arrived while connecting is still queued right behind it */
+			uint64_t queuedSamples = frameSamples;
+			for (const QByteArray &queued : pendingPcm_)
+				queuedSamples += (uint64_t)queued.size() / sizeof(int16_t);
+			lastResumeDelayMs_ = now - resumeAudioMs_;
+			obs_log(LOG_INFO,
+				"asr-client: after the idle wait the first audio reached the server %lld ms after it "
+				"arrived (session started %lld ms after it; %llu ms of audio from the connect were "
+				"queued and sent, none lost)",
+				(long long)(now - resumeAudioMs_),
+				(long long)(sessionStartedMs_ >= 0 ? sessionStartedMs_ - resumeConnectMs_ : -1),
+				(unsigned long long)(queuedSamples / 16));
+			resumeAudioMs_ = -1;
+		}
 	}
 }
 
@@ -2175,10 +2304,12 @@ extern "C" void tea_asr_client_get_diag(tea_asr_client_t *client, tea_asr_client
 	memset(out, 0, sizeof(*out));
 	out->input_dbfs = TEA_DBFS_FLOOR;
 	out->ms_since_text = -1;
+	out->resume_delay_ms = -1;
 	if (!client)
 		return;
 	client->impl->diagnostics(&out->connection, &out->speech, &out->input_dbfs, &out->input_recent,
 				  &out->ms_since_text);
+	out->resume_delay_ms = client->impl->lastResumeDelayMs();
 }
 
 extern "C" void tea_asr_client_set_trace_dir(tea_asr_client_t *client, const char *dir)

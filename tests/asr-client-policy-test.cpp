@@ -164,8 +164,57 @@ static void test_heartbeat()
 	expect(near_db(tea_pcm_level_rms_dbfs(&h.level), 20.0 * std::log10(1000.0 / 32768.0)), "window level");
 }
 
+/* Lazy reconnect: no attempts while the audio source is idle. */
+static void test_audio_idle_gate()
+{
+	using tea_asr::AudioIdleGate;
+	using tea_asr::FailureClass;
+	AudioIdleGate gate;
+	gate.onAudio(1000); /* the WAV plays ... */
+
+	/* ... and ends; 120 s later the server ends the session: idle_timeout */
+	expect(gate.shouldWait(FailureClass::Transient, "idle_timeout", 121000), "idle_timeout waits for audio");
+	int attempts = 0;
+	for (int64_t t = 121000; t < 3 * 3600 * 1000; t += 50)
+		attempts += gate.resumeDue(false) ? 1 : 0;
+	expect(attempts == 0 && gate.waiting(), "no connection attempt in three hours without audio");
+	gate.onAudio(3 * 3600 * 1000);
+	expect(gate.resumeDue(true), "audio again: connect at once");
+	expect(!gate.waiting() && !gate.resumeDue(true), "only once");
+
+	/* idle_timeout even when the last audio was recent (the server's idle
+	 * window is the authority) */
+	gate.onAudio(500000);
+	expect(gate.shouldWait(FailureClass::Transient, "idle_timeout", 501000), "idle_timeout always waits");
+
+	/* other transient closes: backoff while audio flows ... */
+	gate.onAudio(600000);
+	expect(!gate.shouldWait(FailureClass::Transient, "", 601000),
+	       "a network error / server restart while audio flows keeps the backoff");
+	expect(!gate.shouldWait(FailureClass::Transient, "concurrent_session_limit", 602000),
+	       "admission limits with audio flowing keep the backoff");
+	/* ... wait for audio when the source has been silent for a while */
+	expect(gate.shouldWait(FailureClass::Transient, "", 600000 + AudioIdleGate::kNoAudioMs),
+	       "any transient close with no audio for a while waits for audio");
+	expect(!gate.shouldWait(FailureClass::Transient, "", 600000 + AudioIdleGate::kNoAudioMs - 1),
+	       "but not before kNoAudioMs");
+
+	/* never had audio (OBS started with a silent source): no retries either */
+	AudioIdleGate fresh;
+	expect(fresh.shouldWait(FailureClass::Transient, "", 5000), "no audio ever: wait for it");
+
+	/* the other failure classes keep their own handling, audio or not */
+	expect(!fresh.shouldWait(FailureClass::Auth, "unauthenticated", 5000), "auth keeps its schedule");
+	expect(!fresh.shouldWait(FailureClass::RateLimited, "rate_limited", 5000), "rate_limited keeps its wait");
+	expect(!fresh.shouldWait(FailureClass::Config, "forbidden_origin", 5000), "Host rejection keeps its retries");
+	expect(!fresh.shouldWait(FailureClass::Fatal, "x", 5000), "fatal stays stopped");
+	expect(!fresh.shouldWait(FailureClass::NoToken, "", 5000), "no token keeps watching the token file");
+	expect(!fresh.waiting(), "and is not left waiting");
+}
+
 int main()
 {
+	test_audio_idle_gate();
 	using tea_asr::ErrorPolicy;
 	using tea_asr::FailureClass;
 	using tea_asr::ReconnectBackoff;

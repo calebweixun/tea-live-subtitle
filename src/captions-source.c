@@ -418,6 +418,8 @@ static const char k_fade_effect[] = "uniform float4x4 ViewProj;\n"
 				    "	}\n"
 				    "}\n";
 
+static const char *tea_text_or(const char *key, const char *fallback);
+
 /* --- registry of live instances, for the Tools-menu settings dialog --- */
 
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -452,6 +454,17 @@ void tea_captions_source_for_each(void (*cb)(const tea_captions_source_info_t *i
 		if (!ctx->client)
 			continue;
 		char *status_text = tea_asr_client_status_text(ctx->client);
+		tea_asr_client_diag_t diag;
+		tea_asr_client_get_diag(ctx->client, &diag);
+		if (diag.connection == TEA_CONN_IDLE) {
+			/* lazy reconnect: say it in the user's language first */
+			struct dstr idle = {0};
+			dstr_printf(&idle, "%s -- %s",
+				    tea_text_or("TeaLiveSubtitle.Overlay.Conn.Idle", "waiting for audio (idle)"),
+				    status_text ? status_text : "");
+			bfree(status_text);
+			status_text = idle.array;
+		}
 		tea_captions_source_info_t info = {
 			.source_name = ctx->source ? obs_source_get_name(ctx->source) : NULL,
 			.status_text = status_text,
@@ -1691,6 +1704,8 @@ static const char *tea_overlay_connection(int state)
 		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Active", "recognising");
 	case TEA_CONN_RECONNECTING:
 		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Reconnecting", "reconnecting");
+	case TEA_CONN_IDLE:
+		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Idle", "waiting for audio (idle)");
 	default:
 		return tea_text_or("TeaLiveSubtitle.Overlay.Conn.Stopped", "stopped");
 	}

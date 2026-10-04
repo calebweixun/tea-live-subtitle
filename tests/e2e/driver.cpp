@@ -13,7 +13,7 @@
  * tests/e2e/run_e2e.py parses these and asserts on them.
  *
  * Usage: asr-client-e2e --port N --token PATH [--host H] [--clients K]
- *                       [--duration-ms MS] [--audio speech|dead|silence|none|file:WAV]
+ *                       [--duration-ms MS] [--audio speech|dead|silence|none|gap:ON:OFF|file:WAV]
  *                       [--restart-at-ms MS] [--stable on|off]
  *                       [--tail on|off] [--toggle-display-at-ms MS]
  *                       [--end-silence-ms MS] [--trace-dir DIR]
@@ -355,10 +355,14 @@ int main(int argc, char **argv)
 		QJsonArray effective;
 		QJsonArray hints;
 		QJsonArray singingSupported;
+		QJsonArray resumeDelay;
 		QJsonArray singingSegments;
 		for (auto &s : rigs) {
 			hints.append(hintsStatusJson(s.client));
 			singingSupported.append(tea_asr_client_supports_singing_detection(s.client));
+			tea_asr_client_diag_t diag;
+			tea_asr_client_get_diag(s.client, &diag);
+			resumeDelay.append((double)diag.resume_delay_ms);
 			singingSegments.append((double)tea_caption_state_singing_segments(s.captions));
 			mismatches.append((double)tea_caption_state_stable_mismatches(s.captions));
 			segmentation.append(tea_asr_client_supports_segmentation(s.client, nullptr, nullptr, nullptr));
@@ -377,6 +381,7 @@ int main(int argc, char **argv)
 				     {"end_silence_effective", effective},
 				     {"hints", hints},
 				     {"singing_supported", singingSupported},
+				     {"resume_delay_ms", resumeDelay},
 				     {"singing_segments", singingSegments}});
 		app.quit();
 	});
