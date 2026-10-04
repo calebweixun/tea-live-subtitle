@@ -230,6 +230,8 @@ struct Settings {
 	uint32_t pause_ms = 870; /* legacy build only: the old client-side gap line break */
 	int punct_mode = 0;      /* TEA_PUNCT_BREAK_* (not in the legacy build) */
 	int comma_min = 8;
+	bool soft = false; /* --soft on: soft breaks for runs without punctuation */
+	int soft_min = 16; /* --soft-min N */
 	/* detector self-test: switch the box width mid-run (a real reflow) */
 	int width2 = 0;
 	uint64_t width_change_ns = 0;
@@ -255,6 +257,14 @@ struct Line {
 	bool open = false;
 };
 
+#ifdef TEA_SOFT_MIN_DEFAULT
+#define TEA_SOFT_GAP_MS_OR_0 TEA_SOFT_GAP_MS
+#define TEA_SOFT_HARD_EXTRA_OR_0 TEA_SOFT_HARD_EXTRA
+#else
+#define TEA_SOFT_GAP_MS_OR_0 0
+#define TEA_SOFT_HARD_EXTRA_OR_0 0
+#endif
+
 struct RowView {
 	uint64_t key;
 	std::string text;
@@ -262,6 +272,7 @@ struct RowView {
 	float alpha;
 	size_t start = 0, end = 0;
 	bool punct_break = false;
+	bool soft_break = false;
 };
 
 struct Sim {
@@ -409,7 +420,8 @@ struct Sim {
 						 cfg.outline_extra, (uint32_t)cfg.font_px, true, 0);
 	}
 
-	int wrap(const tea_display_line_t &meta, const std::string &text, tea_wrap_row_t *ring) const
+	/* tea_layout()'s wrap; like the plugin, keeps the soft breaks it decided */
+	int wrap(tea_display_line_t &meta, const std::string &text, tea_wrap_row_t *ring) const
 	{
 		tea_caption_frame_t geo = geometry();
 #ifdef TEA_REPLAY_LEGACY
@@ -419,8 +431,20 @@ struct Sim {
 		tea_punct_break_t punct;
 		punct.mode = cfg.punct_mode;
 		punct.comma_min_chars = cfg.comma_min;
+#ifdef TEA_SOFT_MIN_DEFAULT
+		tea_soft_break_t soft_cfg;
+		tea_soft_break_defaults(&soft_cfg, cfg.soft, cfg.soft_min);
+		tea_soft_wrap_t soft;
+		soft.cfg = &soft_cfg;
+		int total = tea_wrap_line_soft(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap,
+					       &punct, &soft, cache.get(), ring, 32);
+		if (total >= 0)
+			tea_display_line_soft_commit(&meta, &soft);
+		return total;
+#else
 		return tea_wrap_line_ex(&meta, text.c_str(), geo.wrap_width, cfg.outline_extra, geo.word_wrap, &punct,
 					cache.get(), ring, 32);
+#endif
 #endif
 	}
 
@@ -464,6 +488,9 @@ struct Sim {
 			v.end = r.end;
 #ifndef TEA_REPLAY_LEGACY
 			v.punct_break = r.punct_break;
+#endif
+#ifdef TEA_SOFT_MIN_DEFAULT
+			v.soft_break = r.soft_break;
 #endif
 			out.push_back(v);
 		}
@@ -592,6 +619,10 @@ int main(int argc, char **argv)
 		else if (a == "--punct") {
 			std::string m = next();
 			cfg.punct_mode = m == "comma" ? 2 : m == "sentence" ? 1 : 0;
+		} else if (a == "--soft") {
+			cfg.soft = std::strcmp(next(), "on") == 0;
+		} else if (a == "--soft-min") {
+			cfg.soft_min = std::atoi(next());
 		} else if (a == "--comma-min")
 			cfg.comma_min = std::atoi(next());
 		else if (a == "--selftest-width-change") {
@@ -664,6 +695,8 @@ int main(int argc, char **argv)
 	};
 	std::map<uint64_t, std::vector<PrevRow>> prev_rows;
 	int layout_moves = 0;
+	size_t span_max = 0; /* the longest run of characters between punctuation / soft breaks */
+	std::map<std::string, bool> soft_seen;
 	double row_chars_sum = 0;
 	uint64_t row_samples = 0;
 	size_t row_chars_max = 0;
@@ -948,11 +981,21 @@ int main(int argc, char **argv)
 			prev_rows.swap(cur_rows);
 		}
 		/* row statistics, punctuation first shown, breaks first shown */
+		size_t span = 0;
 		for (size_t i = 0; i < rows.size(); i++) {
 			const RowView &r = rows[i];
 			if (r.alpha <= 0.05f)
 				continue;
 			size_t chars = utf8_chars(r.text);
+			/* a run that continues from the previous row of the same line
+			 * across a width wrap */
+			const bool continues = i > 0 && rows[i - 1].key == r.key && !rows[i - 1].punct_break &&
+					       !rows[i - 1].soft_break && rows[i - 1].alpha > 0.05f;
+			span = continues ? span + chars : chars;
+			if (span > span_max)
+				span_max = span;
+			if (r.soft_break && i + 1 < rows.size() && rows[i + 1].key == r.key)
+				soft_seen[std::to_string(r.key) + ":" + std::to_string(r.end)] = true;
 			row_chars_sum += (double)chars;
 			row_samples++;
 			if (chars > row_chars_max)
@@ -1028,6 +1071,11 @@ int main(int argc, char **argv)
 			latency_max = latency;
 	}
 	std::sort(latencies.begin(), latencies.end());
+	std::printf(
+		"# soft breaks: %s (after %d characters, a pause > %d ms or at %d) | soft breaks shown=%zu | longest "
+		"run between punctuation/soft breaks=%zu chars\n",
+		cfg.soft ? "on" : "off", cfg.soft_min, TEA_SOFT_GAP_MS_OR_0, cfg.soft_min + TEA_SOFT_HARD_EXTRA_OR_0,
+		soft_seen.size(), span_max);
 	std::printf("# rows: avg visible chars/row=%.1f max=%zu | rows per segment avg=%.2f max=%d (%d segments) | "
 		    "punctuation breaks=%d (mark already committed=%d, still in the tail=%d), shown within 1 s of the "
 		    "mark=%d, median %.0f ms, max %.0f ms | layout moves=%d\n",

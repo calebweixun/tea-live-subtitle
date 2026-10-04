@@ -1,6 +1,7 @@
 #include "caption-layout.h"
 #include "caption-display.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -464,6 +465,230 @@ static void test_punctuation_breaks_never_move_shown_text()
 	expect(breaks >= 6, "the text really was broken at punctuation");
 }
 
+/* ---- soft breaks: runs without punctuation ---- */
+
+/* One layout, as captions-source.c does it: wrap with soft breaks, then keep
+ * what was decided. */
+std::vector<std::string> soft_layout(tea_display_line_t *line, const std::string &text, uint32_t width,
+				     const tea_glyph_cache_t *cache, const tea_punct_break_t *punct,
+				     const tea_soft_break_t *cfg, std::vector<tea_wrap_row_t> *raw = nullptr)
+{
+	tea_wrap_row_t ring[32];
+	tea_wrap_row_t ordered[32];
+	tea_soft_wrap_t soft;
+	soft.cfg = cfg;
+	int total = tea_wrap_line_soft(line, text.c_str(), width, 0, true, punct, &soft, cache, ring, 32);
+	expect(total >= 0, "soft wrap: no missing glyphs");
+	tea_display_line_soft_commit(line, &soft);
+	int kept = tea_wrap_rows_in_order(ring, total, 32, ordered);
+	std::vector<std::string> out;
+	for (int i = 0; i < kept; i++) {
+		out.push_back(row_text(text, ordered[i]));
+		if (raw)
+			raw->push_back(ordered[i]);
+	}
+	return out;
+}
+
+size_t count_chars(const std::string &s)
+{
+	size_t n = 0, pos = 0;
+	while (pos < s.size()) {
+		tea_utf8_decode(s.data(), s.size(), &pos);
+		n++;
+	}
+	return n;
+}
+
+/* Feeds `pieces` (text, arrival time in ms) one by one, laying out after
+ * each like the source does every tick. Checks on every step that rows
+ * already on screen never change (only the last one may grow). */
+std::vector<std::string> soft_feed(const std::vector<std::pair<std::string, uint64_t>> &pieces, uint32_t width,
+				   const tea_punct_break_t *punct, const tea_soft_break_t *cfg, int *soft_breaks)
+{
+	static tea_glyph_cache_t cache;
+	tea_glyph_cache_clear(&cache);
+	std::string all;
+	for (const auto &p : pieces)
+		all += p.first;
+	learn(&cache, all);
+	tea_display_line_t line;
+	std::string text = pieces[0].first;
+	tea_display_line_init(&line, 9, text.size(), text.size(), pieces[0].second * kMs);
+	std::vector<std::string> prev = soft_layout(&line, text, width, &cache, punct, cfg);
+	std::vector<tea_wrap_row_t> raw;
+	for (size_t i = 1; i < pieces.size(); i++) {
+		std::string next = text + pieces[i].first;
+		tea_display_line_observe(&line, text.c_str(), text.size(), next.c_str(), next.size(), next.size(),
+					 pieces[i].second * kMs);
+		text = next;
+		raw.clear();
+		std::vector<std::string> now = soft_layout(&line, text, width, &cache, punct, cfg, &raw);
+		expect(now.size() >= prev.size(), "soft breaks: appending never removes a row");
+		for (size_t r = 0; r + 1 < prev.size(); r++)
+			expect(now[r] == prev[r], "soft breaks: a finished row never changes");
+		if (!prev.empty())
+			expect(now[prev.size() - 1].compare(0, prev.back().size(), prev.back()) == 0,
+			       "soft breaks: the growing row only gains characters at its end");
+		prev = now;
+	}
+	*soft_breaks = 0;
+	for (const auto &r : raw)
+		*soft_breaks += r.soft_break ? 1 : 0;
+	return prev;
+}
+
+static void test_soft_breaks()
+{
+	tea_soft_break_t cfg;
+	tea_soft_break_defaults(&cfg, true, 16);
+	tea_punct_break_t punct;
+	punct.mode = TEA_PUNCT_BREAK_COMMA;
+	punct.comma_min_chars = 8;
+	const std::string cjk = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥";
+	auto cjk_at = [&](size_t i) {
+		size_t pos = 0, n = 0, start = 0;
+		while (pos < cjk.size()) {
+			start = pos;
+			tea_utf8_decode(cjk.data(), cjk.size(), &pos);
+			if (n++ == i % 32)
+				return cjk.substr(start, pos - start);
+		}
+		return std::string();
+	};
+	int soft = 0;
+
+	/* a pause after 18 characters: the row ends there */
+	{
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		uint64_t t = 1000;
+		for (int i = 0; i < 9; i++, t += 300)
+			pieces.push_back({cjk_at(2 * i) + cjk_at(2 * i + 1), t});
+		t += 500; /* 800 ms since the last text: a pause */
+		for (int i = 9; i < 13; i++, t += 300)
+			pieces.push_back({cjk_at(2 * i) + cjk_at(2 * i + 1), t});
+		auto rows = soft_feed(pieces, 0, &punct, &cfg, &soft);
+		expect(rows.size() == 2 && count_chars(rows[0]) == 18 && count_chars(rows[1]) == 8 && soft == 1,
+		       "a soft break at the first pause after 16 characters");
+	}
+	/* a pause before 16 characters does not break */
+	{
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		uint64_t t = 1000;
+		for (int i = 0; i < 10; i++) {
+			pieces.push_back({cjk_at(2 * i) + cjk_at(2 * i + 1), t});
+			t += i == 4 ? 900 : 300; /* a pause after 10 characters */
+		}
+		auto rows = soft_feed(pieces, 0, &punct, &cfg, &soft);
+		expect(rows.size() == 1 && soft == 0, "no soft break before 16 characters, pause or not");
+	}
+	/* no pause: the hard limit at 16 + 8 */
+	{
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		for (int i = 0; i < 20; i++)
+			pieces.push_back({cjk_at(2 * i) + cjk_at(2 * i + 1), 1000 + 300 * (uint64_t)i});
+		auto rows = soft_feed(pieces, 0, &punct, &cfg, &soft);
+		expect(rows.size() == 2 && count_chars(rows[0]) == 24 && count_chars(rows[1]) == 16,
+		       "without a pause the row ends at 24 characters");
+	}
+	/* never inside an ASCII word or a number */
+	{
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		uint64_t t = 1000;
+		for (int i = 0; i < 22; i++, t += 300)
+			pieces.push_back({cjk_at(i), t});
+		const std::string rest = "Hello世界一二三四五六七八九十一二三四五六七八九十12345678九十";
+		size_t pos = 0;
+		while (pos < rest.size()) {
+			size_t start = pos;
+			tea_utf8_decode(rest.data(), rest.size(), &pos);
+			pieces.push_back({rest.substr(start, pos - start), t});
+			t += 300;
+		}
+		auto rows = soft_feed(pieces, 0, &punct, &cfg, &soft);
+		bool whole = false;
+		for (const auto &r : rows)
+			whole = whole || r.find("Hello") != std::string::npos;
+		for (size_t r = 0; r + 1 < rows.size(); r++) {
+			const char last = rows[r].back(), first = rows[r + 1].front();
+			const bool ascii_split = std::isalnum((unsigned char)last) &&
+						 std::isalnum((unsigned char)first);
+			expect(!ascii_split, "a soft break never splits an ASCII word or a number");
+		}
+		expect(rows.size() >= 3 && soft >= 2 && whole, "the long run was broken, around the word and number");
+	}
+	/* a punctuation break resets the count */
+	{
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		uint64_t t = 1000;
+		for (int i = 0; i < 10; i++, t += 300)
+			pieces.push_back({cjk_at(i), t});
+		pieces.push_back({"，", t});
+		t += 300;
+		for (int i = 10; i < 30; i++, t += 300)
+			pieces.push_back({cjk_at(i), t});
+		auto rows = soft_feed(pieces, 0, &punct, &cfg, &soft);
+		expect(rows.size() == 2 && count_chars(rows[0]) == 11 && count_chars(rows[1]) == 20 && soft == 0,
+		       "after a comma break the next row counts from zero (20 < 24, no pause: no soft break)");
+	}
+	/* off: no soft breaks */
+	{
+		tea_soft_break_t off;
+		tea_soft_break_defaults(&off, false, 16);
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		for (int i = 0; i < 20; i++)
+			pieces.push_back({cjk_at(2 * i) + cjk_at(2 * i + 1), 1000 + 900 * (uint64_t)i});
+		auto rows = soft_feed(pieces, 0, &punct, &off, &soft);
+		expect(rows.size() == 1 && soft == 0, "off: no soft breaks");
+	}
+	/* growing with pauses, punctuation, words, numbers and a narrow box: rows
+	 * already shown never change (checked in soft_feed). Three characters
+	 * per update keeps the line under TEA_DISPLAY_MAX_CHUNKS: merging chunks
+	 * can move a width-wrapped row whether soft breaks are on or not. */
+	{
+		const std::string full =
+			"今天我們要討論字幕的顯示方式還有換行對齊與淡出的效果價格是3500元Smith said hi "
+			"then 1000 people came真的嗎好我們繼續看下一段沒有標點的長句子會怎麼換行呢，"
+			"然後這裡有逗號。再來一段很長很長很長很長很長很長很長的句子看看";
+		std::vector<std::pair<std::string, uint64_t>> pieces;
+		size_t pos = 0;
+		uint64_t t = 1000;
+		int k = 0;
+		while (pos < full.size()) {
+			size_t start = pos;
+			for (int c = 0; c < 3 && pos < full.size(); c++)
+				tea_utf8_decode(full.data(), full.size(), &pos);
+			pieces.push_back({full.substr(start, pos - start), t});
+			t += (++k % 4 == 0) ? 700 : 300;
+		}
+		expect(pieces.size() < TEA_DISPLAY_MAX_CHUNKS, "the test stays under the chunk limit");
+		auto rows = soft_feed(pieces, 300, &punct, &cfg, &soft);
+		expect(rows.size() >= 6, "the mixed text was broken into rows");
+		(void)soft_feed(pieces, 0, &punct, &cfg, &soft);
+		expect(soft >= 3, "with no width limit, soft breaks did the work");
+	}
+	/* a rewritten tail drops the soft breaks decided in it */
+	{
+		static tea_glyph_cache_t cache;
+		tea_glyph_cache_clear(&cache);
+		std::string a = cjk.substr(0, 3 * 20); /* 20 characters */
+		std::string b = a + cjk.substr(3 * 20, 3 * 6);
+		learn(&cache, cjk);
+		tea_display_line_t line;
+		tea_display_line_init(&line, 4, a.size(), 3 * 10, 0);
+		soft_layout(&line, a, 0, &cache, &punct, &cfg);
+		tea_display_line_observe(&line, a.c_str(), a.size(), b.c_str(), b.size(), 3 * 10, 1000 * kMs);
+		std::vector<tea_wrap_row_t> raw;
+		soft_layout(&line, b, 0, &cache, &punct, &cfg, &raw);
+		expect(line.soft_count == 1 && line.soft_breaks[0] == a.size(), "the pause after 20 characters broke");
+		std::string c = cjk.substr(0, 3 * 12) + "改";
+		learn(&cache, c);
+		tea_display_line_observe(&line, b.c_str(), b.size(), c.c_str(), c.size(), 3 * 10, 1300 * kMs);
+		expect(line.soft_count == 0 && line.soft_decided <= 3 * 12,
+		       "a tail rewritten before the break forgets it and decides again");
+	}
+}
+
 static void test_chunks()
 {
 	static tea_glyph_cache_t cache;
@@ -758,6 +983,7 @@ static void test_hidden_lines_fade()
 
 int main()
 {
+	test_soft_breaks();
 	test_hidden_lines_fade();
 	test_box_layout();
 	test_alignment();
